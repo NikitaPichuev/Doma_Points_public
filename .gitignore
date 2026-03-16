@@ -1,0 +1,12 @@
+.env
+keys.txt
+api_keys.txt
+proxies.txt
+wallets.txt
+state.json
+*.csv
+bot.log
+__pycache__/
+*.pyc
+env/
+venv/

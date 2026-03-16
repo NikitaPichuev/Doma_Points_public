@@ -1,0 +1,1 @@
+﻿# optional pool addresses (one per line)
