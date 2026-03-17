@@ -1,0 +1,4 @@
+# Optional: one pool address per line.
+# If file has entries, bot trades only these pools.
+# Example:
+# 0xe8e9ca039b1a9467ed32e8b2337f657c8c794754

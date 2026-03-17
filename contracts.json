@@ -1,0 +1,19 @@
+﻿{
+    "router_address":  "0x50cdfe221f0b478b7f58319d7b42cf61e5d904a9",
+    "quoter_address":  "0x2023adf9ff50219c34989baabd76a0f5cfe432f4",
+    "position_manager_address":  "0xce126ca6acebbdce95d7b8a3ce637951640811e0",
+    "router_variant":  "no_deadline",
+    "default_fee_tier":  500,
+    "tokens":  {
+                   "WETH":  "0x4200000000000000000000000000000000000006",
+                   "ETH":  "0x4200000000000000000000000000000000000006",
+                   "USDC.E":  "0x31eef89d5215c305304a2fa5376a1f1b6c5dc477"
+               },
+    "allowlist_pools":  [
+
+                        ],
+    "bootstrap_swaps":  [
+                            "ETH\u003eUSDC.E",
+                            "USDC.E\u003eETH"
+                        ]
+}
