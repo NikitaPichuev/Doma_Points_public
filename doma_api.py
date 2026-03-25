@@ -11,6 +11,16 @@ from web3 import Web3
 
 getcontext().prec = 50
 
+PUBLIC_DOMA_API_KEY = "v1.c6e3f41019fb97237b7f192d49adb2ae464f2ba7ca6c0737fd6eab71ee01d1d4"
+DOMA_INTERFACE_QUOTE_URL = "https://pqzyj9pnj7.execute-api.us-west-1.amazonaws.com/prod/quote"
+DOMA_NATIVE_TOKEN_SENTINEL = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+DOMA_INTERFACE_PORTION_BIPS = 10
+DOMA_INTERFACE_PORTION_RECIPIENT = "0x582366f5f9C5ae5C658c30758dd24d57Ce4F111a"
+PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+MAX_UINT256 = (1 << 256) - 1
+MAX_UINT160 = (1 << 160) - 1
+MAX_UINT48 = (1 << 48) - 1
+
 
 ERC20_ABI = [
     {
@@ -49,6 +59,29 @@ ERC20_ABI = [
     },
 ]
 
+LAUNCHPAD_ABI = [
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {"internalType": "uint256", "name": "minAmountOut", "type": "uint256"},
+        ],
+        "name": "buy",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {"internalType": "uint256", "name": "minAmountOut", "type": "uint256"},
+        ],
+        "name": "sell",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
 WETH_ABI = [
     {
         "constant": False,
@@ -57,6 +90,14 @@ WETH_ABI = [
         "outputs": [],
         "payable": True,
         "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "constant": False,
+        "inputs": [{"name": "wad", "type": "uint256"}],
+        "name": "withdraw",
+        "outputs": [],
+        "stateMutability": "nonpayable",
         "type": "function",
     }
 ]
@@ -75,6 +116,36 @@ QUOTER_ABI = [
         "stateMutability": "nonpayable",
         "type": "function",
     }
+]
+
+PERMIT2_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "owner", "type": "address"},
+            {"internalType": "address", "name": "token", "type": "address"},
+            {"internalType": "address", "name": "spender", "type": "address"},
+        ],
+        "name": "allowance",
+        "outputs": [
+            {"internalType": "uint160", "name": "amount", "type": "uint160"},
+            {"internalType": "uint48", "name": "expiration", "type": "uint48"},
+            {"internalType": "uint48", "name": "nonce", "type": "uint48"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "token", "type": "address"},
+            {"internalType": "address", "name": "spender", "type": "address"},
+            {"internalType": "uint160", "name": "amount", "type": "uint160"},
+            {"internalType": "uint48", "name": "expiration", "type": "uint48"},
+        ],
+        "name": "approve",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
 ]
 
 ROUTER_ABI_WITH_DEADLINE = [
@@ -200,6 +271,40 @@ class PointsSnapshot:
     snapshot_date: str
 
 
+@dataclass
+class LaunchpadTokenInfo:
+    token_id: int
+    name: str
+    address: str
+    launchpad_address: str
+    pool_address: Optional[str]
+    status: str
+    price_usd: Decimal
+    tvl_usd: Decimal
+    volume_usd: Decimal
+    symbol: str
+    decimals: int
+    quote_token_address: str
+    pool_fee_bps: int
+    bonding_curve_model_impl: str
+    initial_price: Decimal
+    final_price: Decimal
+
+
+@dataclass
+class UniversalRouterQuote:
+    to: str
+    calldata: str
+    value_raw: int
+    quote_raw: int
+    quote_decimals: Decimal
+    gas_use_estimate: int
+    gas_use_estimate_usd: Decimal
+    price_impact_pct: Decimal
+    route_string: str
+    quote_id: str
+
+
 class DomaSubgraphClient:
     def __init__(self, subgraph_url: str, proxies: Optional[Dict[str, str]] = None) -> None:
         self.subgraph_url = subgraph_url
@@ -304,6 +409,8 @@ class DomaApiClient:
         for key in extra:
             if key not in merged:
                 merged.append(key)
+        if PUBLIC_DOMA_API_KEY not in merged:
+            merged.append(PUBLIC_DOMA_API_KEY)
         self.api_keys = merged
         self.proxies = proxies or None
 
@@ -359,37 +466,266 @@ class DomaApiClient:
         raise RuntimeError("Doma API request failed")
 
     def fetch_points(self, wallet_address: str, rank_by: str = "POINTS") -> Optional[PointsSnapshot]:
-        # walletAddress filter accepts plain 0x... string.
+        order_by = str(rank_by or "POINTS").strip().upper()
+        if order_by not in {"POINTS", "TRADING_VOLUME_USD"}:
+            order_by = "POINTS"
+        caip_wallet = f"eip155:97477:{wallet_address}"
         query = """
-        query Points($walletAddress: String, $rankBy: LeaderboardRankBy) {
-          leaderboards(take: 1, walletAddress: $walletAddress, rankBy: $rankBy) {
+        query Points($walletAddress: AddressCAIP10!, $orderBy: LegacyLeaderboardOrderBy) {
+          legacyLeaderboard(walletAddress: $walletAddress, orderBy: $orderBy) {
+            walletAddress
+            rank
+            points
+            tradingVolumeUsd
+            referralCount
+            totalEntries
+          }
+        }
+        """
+        data = self._post(query, {"walletAddress": caip_wallet, "orderBy": order_by})
+        item = data.get("legacyLeaderboard")
+        if not item:
+            return None
+        return PointsSnapshot(
+            wallet_address=str(item["walletAddress"]),
+            rank=int(item["rank"]),
+            points=Decimal(str(item["points"])),
+            trading_volume_usd=Decimal(str(item["tradingVolumeUsd"])),
+            liquid_amount_usd=Decimal("0"),
+            referral_count=int(item.get("referralCount") or 0),
+            total_snapshot_entries=int(item.get("totalEntries") or 0),
+            snapshot_date="",
+        )
+
+    def fetch_fractional_token_by_name(self, name: str) -> Optional[LaunchpadTokenInfo]:
+        query = """
+        query FractionalTokens(
+          $name: String
+          $status: FractionalTokenStatus
+          $skip: Int
+          $take: Int
+          $sortBy: FractionalTokensSortBy
+          $sortOrder: SortOrderType
+          $launchStatus: LaunchStatus
+          $tlds: [String!]
+        ) {
+          fractionalTokens(
+            name: $name
+            status: $status
+            skip: $skip
+            take: $take
+            sortBy: $sortBy
+            sortOrder: $sortOrder
+            launchStatus: $launchStatus
+            tlds: $tlds
+          ) {
             items {
-              walletAddress
-              rank
-              points
-              tradingVolumeUsd
-              liquidAmountUsd
-              referralCount
-              totalSnapshotEntries
-              snapshotDate
+              id
+              address
+              poolAddress
+              launchpadAddress
+              status
+              priceUsd
+              tvlUsd
+              volumeUsd
+              name
+              params {
+                quoteToken
+                name
+                symbol
+                decimals
+                poolFeeBps
+                bondingCurveModelImpl
+                initialPrice
+                finalPrice
+              }
             }
           }
         }
         """
-        data = self._post(query, {"walletAddress": wallet_address, "rankBy": rank_by})
-        items = data.get("leaderboards", {}).get("items", [])
-        if not items:
-            return None
-        i = items[0]
-        return PointsSnapshot(
-            wallet_address=str(i["walletAddress"]),
-            rank=int(i["rank"]),
-            points=Decimal(str(i["points"])),
-            trading_volume_usd=Decimal(str(i["tradingVolumeUsd"])),
-            liquid_amount_usd=Decimal(str(i["liquidAmountUsd"])),
-            referral_count=int(i.get("referralCount") or 0),
-            total_snapshot_entries=int(i["totalSnapshotEntries"]),
-            snapshot_date=str(i["snapshotDate"]),
+        data = self._post(
+            query,
+            {
+                "name": name.strip().lower(),
+                "take": 5,
+                "sortBy": "FDV",
+                "sortOrder": "DESC",
+            },
+        )
+        items = data.get("fractionalTokens", {}).get("items", [])
+        exact_name = name.strip().lower()
+        for item in items:
+            if str(item.get("name") or "").strip().lower() != exact_name:
+                continue
+            params = item.get("params") or {}
+            launchpad_address = str(item.get("launchpadAddress") or "").strip()
+            if not launchpad_address:
+                continue
+            return LaunchpadTokenInfo(
+                token_id=int(item["id"]),
+                name=str(item.get("name") or ""),
+                address=str(item["address"]).lower(),
+                launchpad_address=launchpad_address.lower(),
+                pool_address=str(item.get("poolAddress") or "").lower() or None,
+                status=str(item.get("status") or ""),
+                price_usd=Decimal(str(item.get("priceUsd") or "0")),
+                tvl_usd=Decimal(str(item.get("tvlUsd") or "0")),
+                volume_usd=Decimal(str(item.get("volumeUsd") or "0")),
+                symbol=str(params.get("symbol") or ""),
+                decimals=int(params.get("decimals") or 18),
+                quote_token_address=str(params.get("quoteToken") or "").lower(),
+                pool_fee_bps=int(params.get("poolFeeBps") or 0),
+                bonding_curve_model_impl=str(params.get("bondingCurveModelImpl") or "").lower(),
+                initial_price=Decimal(str(params.get("initialPrice") or "0")),
+                final_price=Decimal(str(params.get("finalPrice") or "0")),
+            )
+        return None
+
+    def fetch_fractional_tokens(self, take: int = 250, max_pages: int = 10) -> List[LaunchpadTokenInfo]:
+        query = """
+        query FractionalTokens(
+          $status: FractionalTokenStatus
+          $skip: Int
+          $take: Int
+          $sortBy: FractionalTokensSortBy
+          $sortOrder: SortOrderType
+          $launchStatus: LaunchStatus
+          $tlds: [String!]
+        ) {
+          fractionalTokens(
+            status: $status
+            skip: $skip
+            take: $take
+            sortBy: $sortBy
+            sortOrder: $sortOrder
+            launchStatus: $launchStatus
+            tlds: $tlds
+          ) {
+            items {
+              id
+              address
+              poolAddress
+              launchpadAddress
+              status
+              priceUsd
+              tvlUsd
+              volumeUsd
+              name
+              params {
+                quoteToken
+                name
+                symbol
+                decimals
+                poolFeeBps
+                bondingCurveModelImpl
+                initialPrice
+                finalPrice
+              }
+            }
+          }
+        }
+        """
+        out: List[LaunchpadTokenInfo] = []
+        seen: set[str] = set()
+        for page in range(max_pages):
+            data = self._post(
+                query,
+                {
+                    "skip": page * take,
+                    "take": take,
+                    "sortBy": "FDV",
+                    "sortOrder": "DESC",
+                },
+            )
+            items = data.get("fractionalTokens", {}).get("items", [])
+            if not items:
+                break
+            for item in items:
+                address = str(item.get("address") or "").strip().lower()
+                if not address or address in seen:
+                    continue
+                seen.add(address)
+                params = item.get("params") or {}
+                out.append(
+                    LaunchpadTokenInfo(
+                        token_id=int(item["id"]),
+                        name=str(item.get("name") or ""),
+                        address=address,
+                        launchpad_address=str(item.get("launchpadAddress") or "").strip().lower(),
+                        pool_address=str(item.get("poolAddress") or "").strip().lower() or None,
+                        status=str(item.get("status") or ""),
+                        price_usd=Decimal(str(item.get("priceUsd") or "0")),
+                        tvl_usd=Decimal(str(item.get("tvlUsd") or "0")),
+                        volume_usd=Decimal(str(item.get("volumeUsd") or "0")),
+                        symbol=str(params.get("symbol") or ""),
+                        decimals=int(params.get("decimals") or 18),
+                        quote_token_address=str(params.get("quoteToken") or "").strip().lower(),
+                        pool_fee_bps=int(params.get("poolFeeBps") or 0),
+                        bonding_curve_model_impl=str(params.get("bondingCurveModelImpl") or "").strip().lower(),
+                        initial_price=Decimal(str(params.get("initialPrice") or "0")),
+                        final_price=Decimal(str(params.get("finalPrice") or "0")),
+                    )
+                )
+            if len(items) < take:
+                break
+        return out
+
+    def fetch_universal_router_quote(
+        self,
+        token_in_address: str,
+        token_out_address: str,
+        amount_raw: int,
+        chain_id: int,
+        trade_type: str = "exactIn",
+        slippage_tolerance_pct: Decimal = Decimal("5"),
+        portion_bips: int = DOMA_INTERFACE_PORTION_BIPS,
+        portion_recipient: str = DOMA_INTERFACE_PORTION_RECIPIENT,
+    ) -> UniversalRouterQuote:
+        if int(amount_raw) <= 0:
+            raise ValueError("amount_raw must be > 0")
+        def _quote_addr(addr: str) -> str:
+            addr_norm = str(addr).strip()
+            if addr_norm.lower() == DOMA_NATIVE_TOKEN_SENTINEL:
+                return DOMA_NATIVE_TOKEN_SENTINEL
+            return Web3.to_checksum_address(addr_norm)
+        params = {
+            "tokenInAddress": _quote_addr(token_in_address),
+            "tokenInChainId": str(chain_id),
+            "tokenOutAddress": _quote_addr(token_out_address),
+            "tokenOutChainId": str(chain_id),
+            "amount": str(int(amount_raw)),
+            "type": trade_type,
+            "enableUniversalRouter": "true",
+            "slippageTolerance": format(Decimal(slippage_tolerance_pct).normalize(), "f"),
+        }
+        if portion_bips > 0 and portion_recipient:
+            params["portionBips"] = str(int(portion_bips))
+            params["portionRecipient"] = Web3.to_checksum_address(portion_recipient)
+        resp = requests.get(
+            DOMA_INTERFACE_QUOTE_URL,
+            params=params,
+            timeout=20,
+            proxies=self.proxies,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        method = data.get("methodParameters") or {}
+        to = str(method.get("to") or "").strip()
+        calldata = str(method.get("calldata") or "").strip()
+        value_hex = str(method.get("value") or "0x00").strip()
+        if not to or not calldata:
+            raise RuntimeError(f"Invalid UniversalRouter quote payload: {data}")
+        return UniversalRouterQuote(
+            to=to.lower(),
+            calldata=calldata,
+            value_raw=int(value_hex, 16) if value_hex.startswith("0x") else int(value_hex or "0"),
+            quote_raw=int(str(data.get("quote") or "0")),
+            quote_decimals=Decimal(str(data.get("quoteDecimals") or "0")),
+            gas_use_estimate=int(str(data.get("gasUseEstimate") or "0")),
+            gas_use_estimate_usd=Decimal(str(data.get("gasUseEstimateUSD") or "0")),
+            price_impact_pct=Decimal(str(data.get("priceImpact") or "0")),
+            route_string=str(data.get("routeString") or ""),
+            quote_id=str(data.get("quoteId") or ""),
         )
 
 
@@ -435,6 +771,8 @@ class EvmExecutionClient:
             if self.router_address
             else None
         )
+        self.permit2_address = Web3.to_checksum_address(PERMIT2_ADDRESS)
+        self.permit2 = self.web3.eth.contract(address=self.permit2_address, abi=PERMIT2_ABI)
 
     def get_native_balance(self) -> Decimal:
         wei = self.web3.eth.get_balance(self.account_address)
@@ -481,9 +819,24 @@ class EvmExecutionClient:
         )
 
     def _send_tx(self, tx: dict) -> str:
-        signed = self.web3.eth.account.sign_transaction(tx, private_key=self.private_key)
-        tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
-        return tx_hash.hex()
+        last_exc: Optional[Exception] = None
+        current_tx = dict(tx)
+        for attempt in range(3):
+            try:
+                signed = self.web3.eth.account.sign_transaction(current_tx, private_key=self.private_key)
+                tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
+                return tx_hash.hex()
+            except ValueError as exc:
+                message = str(exc)
+                if "nonce too low" not in message and "replacement transaction underpriced" not in message:
+                    raise
+                last_exc = exc
+                time.sleep(1 + attempt)
+                current_tx["nonce"] = self.web3.eth.get_transaction_count(self.account_address, "pending")
+                current_tx["gasPrice"] = self.web3.eth.gas_price
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Failed to send transaction")
 
     def _base_tx(self) -> dict:
         nonce = self.web3.eth.get_transaction_count(self.account_address, "pending")
@@ -495,20 +848,56 @@ class EvmExecutionClient:
             "gasPrice": gas_price,
         }
 
-    def ensure_allowance(self, token_address: str, required_amount_raw: int) -> Optional[str]:
-        if self.router_address is None:
-            raise RuntimeError("Router is not configured")
+    def ensure_allowance(
+        self,
+        token_address: str,
+        required_amount_raw: int,
+        spender_address: Optional[str] = None,
+        approve_max: bool = False,
+    ) -> Optional[str]:
+        spender = spender_address or self.router_address
+        if spender is None:
+            raise RuntimeError("Spender is not configured")
+        spender_cs = Web3.to_checksum_address(spender)
         token = self.web3.eth.contract(
             address=Web3.to_checksum_address(token_address),
             abi=ERC20_ABI,
         )
-        current = token.functions.allowance(self.account_address, self.router_address).call()
+        current = token.functions.allowance(self.account_address, spender_cs).call()
         if int(current) >= int(required_amount_raw):
             return None
 
-        tx = token.functions.approve(self.router_address, int(required_amount_raw)).build_transaction(
+        approval_amount = MAX_UINT256 if approve_max else int(required_amount_raw)
+        tx = token.functions.approve(spender_cs, approval_amount).build_transaction(
             self._base_tx()
         )
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        return self._send_tx(tx)
+
+    def get_permit2_allowance(self, token_address: str, spender_address: str) -> Tuple[int, int, int]:
+        amount, expiration, nonce = self.permit2.functions.allowance(
+            self.account_address,
+            Web3.to_checksum_address(token_address),
+            Web3.to_checksum_address(spender_address),
+        ).call()
+        return int(amount), int(expiration), int(nonce)
+
+    def ensure_permit2_allowance(
+        self,
+        token_address: str,
+        spender_address: str,
+        required_amount_raw: int,
+    ) -> Optional[str]:
+        current_amount, expiration, _ = self.get_permit2_allowance(token_address, spender_address)
+        if current_amount >= int(required_amount_raw) and expiration > int(time.time()) + 3600:
+            return None
+
+        tx = self.permit2.functions.approve(
+            Web3.to_checksum_address(token_address),
+            Web3.to_checksum_address(spender_address),
+            MAX_UINT160,
+            MAX_UINT48,
+        ).build_transaction(self._base_tx())
         tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
         return self._send_tx(tx)
 
@@ -541,6 +930,18 @@ class EvmExecutionClient:
                 "value": missing,
             }
         )
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        return self._send_tx(tx)
+
+    def unwrap_weth(self, weth_address: str, amount_raw: int) -> Optional[str]:
+        amount_raw = int(amount_raw)
+        if amount_raw <= 0:
+            return None
+        weth = self.web3.eth.contract(
+            address=Web3.to_checksum_address(weth_address),
+            abi=WETH_ABI,
+        )
+        tx = weth.functions.withdraw(amount_raw).build_transaction(self._base_tx())
         tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
         return self._send_tx(tx)
 
@@ -628,6 +1029,55 @@ class EvmExecutionClient:
             )
 
         tx = self.router.functions.exactInput(params).build_transaction(self._base_tx())
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        return self._send_tx(tx)
+
+    def execute_launchpad_buy(
+        self,
+        launchpad_address: str,
+        amount_in_raw: int,
+        min_amount_out_raw: int,
+    ) -> str:
+        launchpad = self.web3.eth.contract(
+            address=Web3.to_checksum_address(launchpad_address),
+            abi=LAUNCHPAD_ABI,
+        )
+        tx = launchpad.functions.buy(
+            int(amount_in_raw),
+            int(min_amount_out_raw),
+        ).build_transaction(self._base_tx())
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        return self._send_tx(tx)
+
+    def execute_launchpad_sell(
+        self,
+        launchpad_address: str,
+        amount_in_raw: int,
+        min_amount_out_raw: int,
+    ) -> str:
+        launchpad = self.web3.eth.contract(
+            address=Web3.to_checksum_address(launchpad_address),
+            abi=LAUNCHPAD_ABI,
+        )
+        tx = launchpad.functions.sell(
+            int(amount_in_raw),
+            int(min_amount_out_raw),
+        ).build_transaction(self._base_tx())
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        return self._send_tx(tx)
+
+    def execute_prebuilt_transaction(
+        self,
+        to_address: str,
+        calldata: str,
+        value_raw: int = 0,
+    ) -> str:
+        tx = {
+            **self._base_tx(),
+            "to": Web3.to_checksum_address(to_address),
+            "data": calldata,
+            "value": int(value_raw),
+        }
         tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
         return self._send_tx(tx)
 

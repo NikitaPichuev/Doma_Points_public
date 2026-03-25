@@ -170,7 +170,7 @@ class BotConfig:
     points_wallets: List[str] = field(default_factory=list)
     leaderboard_rank_by: str = os.getenv("LEADERBOARD_RANK_BY", "POINTS")
     csv_delimiter: str = os.getenv("CSV_DELIMITER", ";")
-    wallet_delay_min_sec: float = float(os.getenv("WALLET_DELAY_MIN_SEC", "5"))
+    wallet_delay_min_sec: float = float(os.getenv("WALLET_DELAY_MIN_SEC", "10"))
     wallet_delay_max_sec: float = float(os.getenv("WALLET_DELAY_MAX_SEC", "20"))
 
     def __post_init__(self) -> None:
