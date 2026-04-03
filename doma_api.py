@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -13,6 +14,7 @@ getcontext().prec = 50
 
 PUBLIC_DOMA_API_KEY = "v1.c6e3f41019fb97237b7f192d49adb2ae464f2ba7ca6c0737fd6eab71ee01d1d4"
 DOMA_INTERFACE_QUOTE_URL = "https://pqzyj9pnj7.execute-api.us-west-1.amazonaws.com/prod/quote"
+DOMA_EXPLORER_API_URL = "https://explorer.doma.xyz/api/v2"
 DOMA_NATIVE_TOKEN_SENTINEL = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 DOMA_INTERFACE_PORTION_BIPS = 10
 DOMA_INTERFACE_PORTION_RECIPIENT = "0x582366f5f9C5ae5C658c30758dd24d57Ce4F111a"
@@ -387,8 +389,8 @@ class DomaSubgraphClient:
             syms = {p.token0.symbol, p.token1.symbol}
             if "WETH" in syms and "USDC.E" in syms:
                 if p.token0.symbol == "WETH":
-                    return p.token0_price
-                return p.token1_price
+                    return p.token1_price
+                return p.token0_price
         return Decimal("0")
 
 
@@ -413,6 +415,7 @@ class DomaApiClient:
             merged.append(PUBLIC_DOMA_API_KEY)
         self.api_keys = merged
         self.proxies = proxies or None
+        self.explorer_api_url = DOMA_EXPLORER_API_URL.rstrip("/")
 
     def _headers(self, api_key: str = "") -> Dict[str, str]:
         h = {"content-type": "application/json"}
@@ -464,6 +467,16 @@ class DomaApiClient:
         if last_error is not None:
             raise last_error
         raise RuntimeError("Doma API request failed")
+
+    def _explorer_get(self, path: str, params: Optional[dict] = None) -> dict:
+        resp = requests.get(
+            f"{self.explorer_api_url}/{path.lstrip('/')}",
+            params=params or None,
+            timeout=20,
+            proxies=self.proxies,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def fetch_points(self, wallet_address: str, rank_by: str = "POINTS") -> Optional[PointsSnapshot]:
         order_by = str(rank_by or "POINTS").strip().upper()
@@ -580,6 +593,245 @@ class DomaApiClient:
                 final_price=Decimal(str(params.get("finalPrice") or "0")),
             )
         return None
+
+    def fetch_wallet_fractional_token_volume_usd(
+        self,
+        wallet_address: str,
+        fractional_token_id: int,
+        take: int = 100,
+        max_pages: int = 20,
+        since: Optional[datetime] = None,
+    ) -> Decimal:
+        caip_wallet = f"eip155:97477:{wallet_address}"
+        query = """
+        query FractionalTokenSwaps(
+          $address: AddressCAIP10!
+          $fractionalTokenId: Int!
+          $skip: Int
+          $take: Int
+          $sortOrder: SortOrderType
+        ) {
+          fractionalTokenSwaps(
+            address: $address
+            fractionalTokenId: $fractionalTokenId
+            skip: $skip
+            take: $take
+            sortOrder: $sortOrder
+          ) {
+            items {
+              date
+              quoteTokenAmount
+              priceUsd
+              quoteToken {
+                decimals
+                usdExchangeRate
+              }
+            }
+          }
+        }
+        """
+        total_volume_usd = Decimal("0")
+        since_utc = since.astimezone(timezone.utc) if since is not None else None
+        for page in range(max_pages):
+            data = self._post(
+                query,
+                {
+                    "address": caip_wallet,
+                    "fractionalTokenId": int(fractional_token_id),
+                    "skip": page * take,
+                    "take": take,
+                    "sortOrder": "DESC",
+                },
+            )
+            items = data.get("fractionalTokenSwaps", {}).get("items", [])
+            if not items:
+                break
+            reached_older_items = False
+            for item in items:
+                item_date_raw = str(item.get("date") or "").strip()
+                if since_utc is not None and item_date_raw:
+                    item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
+                    if item_date < since_utc:
+                        reached_older_items = True
+                        continue
+                quote_token = item.get("quoteToken") or {}
+                decimals = int(quote_token.get("decimals") or 18)
+                usd_rate = Decimal(str(quote_token.get("usdExchangeRate") or "0"))
+                quote_amount_raw = abs(int(str(item.get("quoteTokenAmount") or "0")))
+                quote_amount = Decimal(quote_amount_raw) / (Decimal(10) ** decimals)
+                if usd_rate > 0:
+                    total_volume_usd += quote_amount * usd_rate
+                    continue
+                price_usd = Decimal(str(item.get("priceUsd") or "0"))
+                if price_usd > 0:
+                    total_volume_usd += quote_amount * price_usd
+                else:
+                    total_volume_usd += quote_amount
+            if len(items) < take or reached_older_items:
+                break
+        return total_volume_usd
+
+    def fetch_wallet_pool_volume_usd(
+        self,
+        wallet_address: str,
+        pool_address: str,
+        pool_addresses: Optional[List[str]] = None,
+        tracked_token_symbol: str = "",
+        quote_token_symbol: str = "USDC.E",
+        take: int = 100,
+        max_pages: int = 20,
+        since: Optional[datetime] = None,
+    ) -> Decimal:
+        caip_wallet = f"eip155:97477:{wallet_address}"
+        query = """
+        query TokenSwaps(
+          $buyerAddress: AddressCAIP10!
+          $poolAddress: String!
+          $skip: Int
+          $take: Int
+          $sortOrder: SortOrderType
+        ) {
+          tokenSwaps(
+            buyerAddress: $buyerAddress
+            poolAddress: $poolAddress
+            skip: $skip
+            take: $take
+            sortOrder: $sortOrder
+          ) {
+            items {
+              amountUsd
+              date
+              txHash
+            }
+          }
+        }
+        """
+        total_volume_usd = Decimal("0")
+        pool_address_list = [str(addr).strip().lower() for addr in (pool_addresses or [pool_address]) if str(addr).strip()]
+        pool_address_list = list(dict.fromkeys(pool_address_list))
+        since_utc = since.astimezone(timezone.utc) if since is not None else None
+        try:
+            for current_pool_address in pool_address_list:
+                for page in range(max_pages):
+                    data = self._post(
+                        query,
+                        {
+                            "buyerAddress": caip_wallet,
+                            "poolAddress": current_pool_address,
+                            "skip": page * take,
+                            "take": take,
+                            "sortOrder": "DESC",
+                        },
+                    )
+                    items = data.get("tokenSwaps", {}).get("items", [])
+                    if not items:
+                        break
+                    reached_older_items = False
+                    for item in items:
+                        item_date_raw = str(item.get("date") or "").strip()
+                        if since_utc is not None and item_date_raw:
+                            item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
+                            if item_date < since_utc:
+                                reached_older_items = True
+                                continue
+                        amount_usd = Decimal(str(item.get("amountUsd") or "0"))
+                        if amount_usd < 0:
+                            amount_usd = -amount_usd
+                        total_volume_usd += amount_usd
+                    if len(items) < take or reached_older_items:
+                        break
+            return total_volume_usd
+        except Exception:
+            return self.fetch_wallet_pool_volume_usd_from_explorer(
+                wallet_address=wallet_address,
+                pool_address=pool_address,
+                pool_addresses=pool_address_list,
+                tracked_token_symbol=tracked_token_symbol,
+                quote_token_symbol=quote_token_symbol,
+                max_pages=max_pages,
+                since=since,
+            )
+
+    def fetch_wallet_pool_volume_usd_from_explorer(
+        self,
+        wallet_address: str,
+        pool_address: str,
+        tracked_token_symbol: str = "",
+        pool_addresses: Optional[List[str]] = None,
+        quote_token_symbol: str = "USDC.E",
+        max_pages: int = 20,
+        since: Optional[datetime] = None,
+    ) -> Decimal:
+        wallet_lc = str(wallet_address).strip().lower()
+        pool_set = {
+            str(addr).strip().lower()
+            for addr in (pool_addresses or [pool_address])
+            if str(addr).strip()
+        }
+        tracked_symbol = str(tracked_token_symbol or "").strip().upper()
+        quote_symbol = str(quote_token_symbol or "USDC.E").strip().upper()
+        since_utc = since.astimezone(timezone.utc) if since is not None else None
+
+        tx_groups: Dict[str, List[dict]] = {}
+        next_params: Optional[dict] = None
+        reached_older_items = False
+
+        for _page in range(max_pages):
+            data = self._explorer_get(
+                f"addresses/{wallet_address}/token-transfers",
+                params=next_params,
+            )
+            items = data.get("items", [])
+            if not items:
+                break
+            for item in items:
+                item_date_raw = str(item.get("timestamp") or "").strip()
+                if since_utc is not None and item_date_raw:
+                    item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
+                    if item_date < since_utc:
+                        reached_older_items = True
+                        continue
+                tx_hash = str(item.get("transaction_hash") or "").strip().lower()
+                if not tx_hash:
+                    continue
+                tx_groups.setdefault(tx_hash, []).append(item)
+            if reached_older_items:
+                break
+            next_params = data.get("next_page_params")
+            if not next_params:
+                break
+
+        total_volume_usd = Decimal("0")
+        for items in tx_groups.values():
+            symbols = {
+                str((item.get("token") or {}).get("symbol") or "").strip().upper()
+                for item in items
+            }
+            if tracked_symbol and tracked_symbol not in symbols:
+                continue
+            if quote_symbol not in symbols:
+                continue
+            has_pool_touch = False
+            quote_amount = Decimal("0")
+            for item in items:
+                from_hash = str(((item.get("from") or {}).get("hash")) or "").strip().lower()
+                to_hash = str(((item.get("to") or {}).get("hash")) or "").strip().lower()
+                token_meta = item.get("token") or {}
+                symbol = str(token_meta.get("symbol") or "").strip().upper()
+                decimals = int(token_meta.get("decimals") or (item.get("total") or {}).get("decimals") or 18)
+                value_raw = int(str((item.get("total") or {}).get("value") or "0"))
+                wallet_involved = from_hash == wallet_lc or to_hash == wallet_lc
+                counterparty_is_pool = (
+                    (from_hash == wallet_lc and to_hash in pool_set)
+                    or (from_hash in pool_set and to_hash == wallet_lc)
+                )
+                if wallet_involved and counterparty_is_pool:
+                    has_pool_touch = True
+                if wallet_involved and symbol == quote_symbol and counterparty_is_pool:
+                    quote_amount += Decimal(value_raw) / (Decimal(10) ** decimals)
+            if has_pool_touch and quote_amount > 0:
+                total_volume_usd += quote_amount
+        return total_volume_usd
 
     def fetch_fractional_tokens(self, take: int = 250, max_pages: int = 10) -> List[LaunchpadTokenInfo]:
         query = """
