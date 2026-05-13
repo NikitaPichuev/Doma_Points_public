@@ -149,8 +149,11 @@ def _build_exec_client_with_rpc_fallback(
     log_prefix: str,
 ) -> EvmExecutionClient:
     errors: List[str] = []
-    proxy_variants: List[Tuple[str, Optional[Dict[str, str]]]] = [("proxy", proxies)] if proxies else []
-    proxy_variants.append(("direct", None))
+    proxy_variants: List[Tuple[str, Optional[Dict[str, str]]]]
+    if proxies:
+        proxy_variants = [("proxy", proxies)]
+    else:
+        proxy_variants = [("direct", None)]
 
     for rpc_url in _doma_rpc_candidates(cfg):
         for proxy_label, request_proxies in proxy_variants:

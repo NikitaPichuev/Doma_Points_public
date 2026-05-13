@@ -45,6 +45,16 @@ def _normalize_proxy(value: str) -> str:
     if not v:
         return ""
     if "://" not in v:
+        # Accept common provider format host:port@login:password and convert it
+        # to the URL format expected by requests: login:password@host:port.
+        if "@" in v:
+            left, right = v.rsplit("@", 1)
+            left_host = left.rsplit(":", 1)[0]
+            right_host = right.rsplit(":", 1)[0]
+            left_looks_host = "." in left_host or left_host.lower() == "localhost"
+            right_looks_host = "." in right_host or right_host.lower() == "localhost"
+            if left_looks_host and not right_looks_host and ":" in left and ":" in right:
+                return f"http://{right}@{left}"
         return f"http://{v}"
     return v
 
