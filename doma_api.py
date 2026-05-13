@@ -1087,7 +1087,7 @@ class EvmExecutionClient:
             request_kwargs["proxies"] = request_proxies
         self.web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs=request_kwargs))
         if not self.web3.is_connected():
-            raise RuntimeError("RPC connection failed")
+            raise RuntimeError(f"RPC connection failed: {rpc_url}")
         self.chain_id = chain_id
         self.account_address = Web3.to_checksum_address(account_address)
         self.private_key = private_key

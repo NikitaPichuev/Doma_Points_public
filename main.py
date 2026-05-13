@@ -131,6 +131,57 @@ def _random_swap_delay_sec() -> float:
     return random.uniform(4, 10)
 
 
+def _doma_rpc_candidates(cfg: BotConfig) -> List[str]:
+    candidates: List[str] = []
+    for rpc_url in [cfg.rpc_url, "https://rpc.doma.xyz/", "https://doma.drpc.org/"]:
+        normalized = (rpc_url or "").strip()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def _build_exec_client_with_rpc_fallback(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    private_key: str,
+    proxies: Optional[Dict[str, str]],
+    log_prefix: str,
+) -> EvmExecutionClient:
+    errors: List[str] = []
+    proxy_variants: List[Tuple[str, Optional[Dict[str, str]]]] = [("proxy", proxies)] if proxies else []
+    proxy_variants.append(("direct", None))
+
+    for rpc_url in _doma_rpc_candidates(cfg):
+        for proxy_label, request_proxies in proxy_variants:
+            try:
+                client = EvmExecutionClient(
+                    rpc_url=rpc_url,
+                    chain_id=cfg.chain_id,
+                    account_address=wallet,
+                    private_key=private_key,
+                    router_address=cfg.router_address,
+                    quoter_address=cfg.quoter_address,
+                    router_variant=cfg.router_variant,
+                    request_proxies=request_proxies,
+                )
+                actual_chain_id = client.get_chain_id()
+                if actual_chain_id != cfg.chain_id:
+                    raise RuntimeError(f"chain_id mismatch: rpc={actual_chain_id} cfg={cfg.chain_id}")
+                if rpc_url != cfg.rpc_url or proxy_label == "direct":
+                    logger.info(
+                        "%s wallet=%s RPC selected | url=%s | mode=%s",
+                        log_prefix,
+                        wallet,
+                        rpc_url,
+                        proxy_label,
+                    )
+                return client
+            except Exception as exc:
+                errors.append(f"{rpc_url} ({proxy_label}): {exc}")
+    raise RuntimeError("All RPC attempts failed: " + " | ".join(errors))
+
+
 def _cleanup_weth_balance(
     logger: logging.Logger,
     exec_client: EvmExecutionClient,
@@ -2376,15 +2427,13 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
                 logger.warning(_quest_log("wallet=%s init failed: %s"), wallet, exc)
                 continue
 
-            exec_client = EvmExecutionClient(
-                rpc_url=cfg.rpc_url,
-                chain_id=cfg.chain_id,
-                account_address=wallet,
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg=cfg,
+                logger=logger,
+                wallet=wallet,
                 private_key=private_key,
-                router_address=cfg.router_address,
-                quoter_address=cfg.quoter_address,
-                router_variant=cfg.router_variant,
-                request_proxies=proxies,
+                proxies=proxies,
+                log_prefix=_quest_log(""),
             )
 
             try:
@@ -3354,15 +3403,13 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                         api_keys=cfg.doma_api_keys,
                         proxies=proxies,
                     )
-                    exec_client = EvmExecutionClient(
-                        rpc_url=cfg.rpc_url,
-                        chain_id=cfg.chain_id,
-                        account_address=wallet,
+                    exec_client = _build_exec_client_with_rpc_fallback(
+                        cfg=cfg,
+                        logger=logger,
+                        wallet=wallet,
                         private_key=private_key,
-                        router_address=cfg.router_address,
-                        quoter_address=cfg.quoter_address,
-                        router_variant=cfg.router_variant,
-                        request_proxies=proxies,
+                        proxies=proxies,
+                        log_prefix="[DOMAIN]",
                     )
                     before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
                     amount_expr = _pick_random_amount_expr(
@@ -3497,15 +3544,13 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                 max_raw=max_raw,
             )
             logger.info("[DOMAIN] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
-            exec_client = EvmExecutionClient(
-                rpc_url=cfg.rpc_url,
-                chain_id=cfg.chain_id,
-                account_address=wallet,
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg=cfg,
+                logger=logger,
+                wallet=wallet,
                 private_key=private_key,
-                router_address=cfg.router_address,
-                quoter_address=cfg.quoter_address,
-                router_variant=cfg.router_variant,
-                request_proxies=proxies,
+                proxies=proxies,
+                log_prefix="[DOMAIN]",
             )
             before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
 
@@ -4098,15 +4143,13 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
             continue
         logger.info("[SWEEP] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
 
-        exec_client = EvmExecutionClient(
-            rpc_url=cfg.rpc_url,
-            chain_id=cfg.chain_id,
-            account_address=wallet,
+        exec_client = _build_exec_client_with_rpc_fallback(
+            cfg=cfg,
+            logger=logger,
+            wallet=wallet,
             private_key=private_key,
-            router_address=cfg.router_address,
-            quoter_address=cfg.quoter_address,
-            router_variant=cfg.router_variant,
-            request_proxies=proxies,
+            proxies=proxies,
+            log_prefix="[SWEEP]",
         )
 
         held_launchpad_tokens: List[Tuple[LaunchpadTokenInfo, Decimal]] = []
@@ -4466,15 +4509,13 @@ def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) 
                     max_raw=max_raw,
                 )
             logger.info("[PAIR] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
-            exec_client = EvmExecutionClient(
-                rpc_url=cfg.rpc_url,
-                chain_id=cfg.chain_id,
-                account_address=wallet,
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg=cfg,
+                logger=logger,
+                wallet=wallet,
                 private_key=private_key,
-                router_address=cfg.router_address,
-                quoter_address=cfg.quoter_address,
-                router_variant=cfg.router_variant,
-                request_proxies=proxies,
+                proxies=proxies,
+                log_prefix="[PAIR]",
             )
             before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "PAIR")
 
@@ -4609,15 +4650,13 @@ def run_volume_farm_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                 logger.warning("[VOLUME] wallet=%s init failed: %s", wallet, exc)
                 continue
 
-            exec_client = EvmExecutionClient(
-                rpc_url=cfg.rpc_url,
-                chain_id=cfg.chain_id,
-                account_address=wallet,
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg=cfg,
+                logger=logger,
+                wallet=wallet,
                 private_key=private_key,
-                router_address=cfg.router_address,
-                quoter_address=cfg.quoter_address,
-                router_variant=cfg.router_variant,
-                request_proxies=proxies,
+                proxies=proxies,
+                log_prefix="[VOLUME]",
             )
 
             usdc_token, weth_token = _find_tokens_for_direction(pool, "USDC.E", "ETH") or (None, None)
