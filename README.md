@@ -1,69 +1,233 @@
-# Doma Swap Bot Public
+# Doma Points Public Bot
 
-Public sanitized copy of a Doma network bot for swaps, bridge actions, points checks, position closing, token sweeping, and volume farming.
+Публичная очищенная версия бота для Doma Network: свапы, bridge, проверка points, закрытие позиций, сбор токенов, фарм объёма, торговля domain-токенами, domain quest volume и выставление доменов на продажу.
 
-## Included Modes
+## Важно
 
-1. `Bridge`
-2. `Check points`
-3. `Close all positions`
-4. `Swap domain token`
-5. `Swap ETH <-> USDC.E`
-6. `Sell all tokens -> USDC.E`
-7. `Farm 250+ volume ETH <-> USDC.E`
+Этот репозиторий не содержит приватных ключей, кошельков, прокси и реальных API-ключей. Все локальные секреты должны храниться только в `.env`, `keys.txt`, `wallets.txt`, `api_keys.txt`, `proxies.txt`.
 
-## Requirements
+Использование на реальных кошельках связано с рисками:
 
-- Windows
-- Python 3.11+
-- Access to Doma RPC
-- Your own wallets, private keys, API keys, and proxies
+- расход газа;
+- slippage и price impact;
+- ошибки RPC/API;
+- задержки обновления points;
+- риск невыгодного фарма;
+- риск выставить домен по неправильной цене, если задать неверный диапазон.
 
-## Quick Start
+Тестируйте на малых суммах.
 
-1. Copy `.env.example` to `.env`
-2. Fill your own values in `.env`
-3. Fill these files line-by-line:
-   - `wallets.txt`
-   - `keys.txt`
-   - `api_keys.txt`
-   - `proxies.txt`
-4. Keep wallet, key, API key, and proxy lines aligned by the same wallet index
-5. Run `INSTALL.bat`
-6. Run `START.bat`
+## Возможности
 
-## Important Notes
+Главное меню `main.py`:
 
-- This is a public sanitized copy
-- No real secrets should be included
-- Contract addresses and token addresses in the repo are public on-chain data
-- Volume and points on Doma can update with delay
-- Proxy quality directly affects stability
+```text
+1) Bridge
+2) Check points
+3) Close all positions
+4) Swap domain token
+5) Swap ETH <-> USDC.E
+6) Collect all tokens -> ETH / USDC.E
+7) Farm 250+ volume ETH <-> USDC.E
+8) Domain quest volume
+9) List unlisted domains for sale
+10) Exit
+```
 
-## Files
+## Domain Quest Tokens
 
-- `main.py` - main menu and mode execution
-- `doma_api.py` - Doma API, quote, router, and chain execution helpers
-- `config.py` - config loading
-- `contracts.json` - contract addresses
-- `points_checker.py` - points-related helpers
-- `position_manager.py` - position closing logic
-- `relay_bridge.py` - bridge logic
-- `strategy.py` - strategy helpers
+В режиме `8) Domain quest volume` доступны:
 
-## Safety
+```text
+rides.com
+software.ai
+alert.ai
+swimsuits.ai
+trenches.ai
+depin.ai
+terabytes.ai
+mishka.ai
+playonline.ai
+exemption.ai
+bipod.ai
+itprojects.ai
+lifeadvice.ai
+onlineadvisor.ai
+continents.ai
+loancrypto.ai
+coinlogic.ai
+agenticconsultant.ai
+gobitcoin.xyz
+closingbells.com
+get.cash
+```
 
-Read [SANITIZED_PUBLIC_COPY.txt](SANITIZED_PUBLIC_COPY.txt) before use.
+Режим делает объём по паре `USDC.E <-> domain token`, умеет стартовать от `ETH`, проверяет доступные балансы и по завершении может вернуть остаток в `USDC.E` или `ETH`.
 
-You are responsible for:
+## Выставление доменов на продажу
 
-- your private keys
-- your proxies
-- your RPC/provider stability
-- gas costs
-- slippage
-- point farming profitability
+Режим `9) List unlisted domains for sale`:
+
+- берёт домены из кошелька;
+- отдельно проверяет уже выставленные;
+- выставляет только невыставленные;
+- цену берёт случайно между minimum и maximum;
+- округляет цену до десятых;
+- валюта листинга: `USDC.E`;
+- срок листинга по умолчанию: `90` дней;
+- пауза между доменами настраивается в меню;
+- результаты пишет в `domain_listings.csv`.
+
+Для листинга используется `@doma-protocol/orderbook-sdk`, поэтому нужны Node.js-зависимости.
+
+## Установка
+
+Требования:
+
+- Windows;
+- Python `3.11+`;
+- Node.js `20+`;
+- доступ к Doma RPC;
+- свои кошельки и приватные ключи.
+
+Шаги:
+
+1. Склонируйте репозиторий.
+2. Запустите `INSTALL.bat`.
+3. Установите Node.js-зависимости:
+
+```bash
+npm install
+```
+
+4. Скопируйте `.env.example` в `.env`, если `INSTALL.bat` не сделал это автоматически.
+5. Заполните локальные файлы:
+
+```text
+wallets.txt
+keys.txt
+api_keys.txt
+proxies.txt
+```
+
+6. Запустите:
+
+```bash
+START.bat
+```
+
+или:
+
+```bash
+python main.py
+```
+
+## Формат файлов
+
+`wallets.txt`:
+
+```text
+0x...
+0x...
+```
+
+`keys.txt`:
+
+```text
+private_key_for_wallet_1
+private_key_for_wallet_2
+```
+
+Строки должны совпадать:
+
+```text
+wallets.txt line 1 -> keys.txt line 1 -> api_keys.txt line 1 -> proxies.txt line 1
+wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line 2
+```
+
+`api_keys.txt` можно оставить пустым, если используется публичный fallback или ключ задан в `.env`.
+
+`proxies.txt` необязателен. Если прокси не нужны, оставьте файл пустым или с комментариями.
+
+## Основные настройки `.env`
+
+```text
+RPC_URL=https://rpc.doma.xyz/
+SUBGRAPH_URL=https://graph.doma.xyz/subgraphs/name/uniswap-v3-doma-mainnet
+CHAIN_ID=97477
+
+PAPER_MODE=false
+DRY_RUN=false
+ENABLE_EXECUTION=true
+REQUIRE_LIVE_CONFIRMATION=false
+
+WALLET_DELAY_MIN_SEC=4
+WALLET_DELAY_MAX_SEC=10
+```
+
+Если включены реальные транзакции, приватные ключи должны быть указаны в `keys.txt` или `.env`.
+
+## Основные файлы
+
+```text
+main.py                  main menu and mode execution
+doma_api.py              Doma API, quotes, router and execution helpers
+config.py                config loading from .env and local files
+contracts.json           Doma contract and token addresses
+relay_bridge.py          bridge logic
+position_manager.py      close position logic
+points_checker.py        points helper
+strategy.py              strategy helper
+badges_parser.py         badge holder parser and export tool
+doma_list_domain.mjs     Doma orderbook listing helper
+doma_node_esm_loader.mjs Node ESM compatibility loader for Doma SDK
+```
+
+## Badge Parser
+
+`badges_parser.py` выгружает badge holder stats и умеет сохранять отчёты в удобных форматах.
+
+Пример:
+
+```bash
+python badges_parser.py
+```
+
+## Выходные файлы
+
+Бот может создавать локальные файлы:
+
+```text
+trades.csv
+points.csv
+domain_listings.csv
+bot.log
+state.json
+```
+
+Они не должны попадать в GitHub.
+
+## Безопасность
+
+Никогда не коммитьте:
+
+- `.env`;
+- `keys.txt`;
+- `wallets.txt`;
+- `api_keys.txt`;
+- `proxies.txt`;
+- `state.json`;
+- CSV-логи;
+- `bot.log`;
+- `node_modules/`.
+
+Перед публикацией проверяйте:
+
+```bash
+git status --short
+git diff --cached
+```
 
 ## Disclaimer
 
-Use at your own risk. Test with small balances first.
+Проект предоставляется как есть. Вы сами отвечаете за приватные ключи, транзакции, комиссии, выставленные цены, торговые решения и последствия использования бота.
