@@ -1,0 +1,25 @@
+{
+  "name": "doma_swap_bot_public",
+  "version": "1.0.0",
+  "description": "Public sanitized copy of a Doma network bot for swaps, bridge actions, points checks, position closing, token sweeping, and volume farming.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NikitaPichuev/Doma_Points_public.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/NikitaPichuev/Doma_Points_public/issues"
+  },
+  "homepage": "https://github.com/NikitaPichuev/Doma_Points_public#readme",
+  "dependencies": {
+    "@doma-protocol/orderbook-sdk": "^0.1.8",
+    "ethers": "^6.16.0"
+  }
+}

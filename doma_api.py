@@ -294,6 +294,17 @@ class LaunchpadTokenInfo:
 
 
 @dataclass
+class OwnedDomain:
+    name: str
+    token_id: str
+    token_address: str
+    network_id: str
+    owner_address: str
+    token_type: str
+    orderbook_disabled: bool
+
+
+@dataclass
 class UniversalRouterQuote:
     to: str
     calldata: str
@@ -593,6 +604,84 @@ class DomaApiClient:
                 final_price=Decimal(str(params.get("finalPrice") or "0")),
             )
         return None
+
+    def fetch_owned_domains(
+        self,
+        wallet_address: str,
+        chain_id: int = 97477,
+        listed: Optional[bool] = None,
+        take: int = 100,
+        max_pages: int = 50,
+    ) -> List[OwnedDomain]:
+        caip_wallet = f"eip155:{chain_id}:{wallet_address.lower()}"
+        query = """
+        query OwnedNames(
+          $ownedBy: [AddressCAIP10!]
+          $listed: Boolean
+          $skip: Int
+          $take: Int
+          $includeDetokenized: Boolean
+        ) {
+          names(
+            ownedBy: $ownedBy
+            listed: $listed
+            skip: $skip
+            take: $take
+            includeDetokenized: $includeDetokenized
+          ) {
+            items {
+              name
+              ownershipToken {
+                tokenId
+                tokenAddress
+                networkId
+                ownerAddress
+                type
+                orderbookDisabled
+              }
+            }
+            totalCount
+            hasNextPage
+          }
+        }
+        """
+        out: List[OwnedDomain] = []
+        skip = 0
+        page_take = max(1, min(int(take), 500))
+        for _ in range(max_pages):
+            variables = {
+                "ownedBy": [caip_wallet],
+                "listed": listed,
+                "skip": skip,
+                "take": page_take,
+                "includeDetokenized": False,
+            }
+            data = self._post(query, variables)
+            page = data.get("names") or {}
+            items = page.get("items") or []
+            for item in items:
+                token = item.get("ownershipToken") or {}
+                name = str(item.get("name") or "").strip().lower()
+                token_id = str(token.get("tokenId") or "").strip()
+                token_address = str(token.get("tokenAddress") or "").strip().lower()
+                network_id = str(token.get("networkId") or "").strip()
+                if not name or not token_id or not token_address:
+                    continue
+                out.append(
+                    OwnedDomain(
+                        name=name,
+                        token_id=token_id,
+                        token_address=token_address,
+                        network_id=network_id,
+                        owner_address=str(token.get("ownerAddress") or "").strip().lower(),
+                        token_type=str(token.get("type") or ""),
+                        orderbook_disabled=bool(token.get("orderbookDisabled") or False),
+                    )
+                )
+            if not page.get("hasNextPage"):
+                break
+            skip += len(items) if items else page_take
+        return out
 
     def fetch_wallet_fractional_token_volume_usd(
         self,

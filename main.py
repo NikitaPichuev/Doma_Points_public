@@ -3,9 +3,11 @@
 import csv
 import json
 import logging
+import os
 import random
 import re
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -25,6 +27,7 @@ from doma_api import (
     DOMA_NATIVE_TOKEN_SENTINEL,
     EvmExecutionClient,
     LaunchpadTokenInfo,
+    OwnedDomain,
     PointsSnapshot,
     Pool,
     Token,
@@ -71,9 +74,37 @@ ANSI_GREEN = "\033[92m"
 ANSI_RED = "\033[91m"
 ANSI_YELLOW = "\033[93m"
 ANSI_CYAN = "\033[96m"
-MIN_EXECUTABLE_TRADE_USD = Decimal("1")
-RIDES_VOLUME_CHECK_SINCE = datetime(2026, 3, 2, 0, 0, 0, tzinfo=timezone.utc)
-RIDES_QUEST_COMPLETION_THRESHOLD_USD = Decimal("25")
+MIN_EXECUTABLE_TRADE_USD = Decimal("0.10")
+DOMAIN_QUEST_VOLUME_CHECK_SINCE = datetime(2026, 3, 2, 0, 0, 0, tzinfo=timezone.utc)
+DOMAIN_QUEST_COMPLETION_THRESHOLD_USD = Decimal("25")
+DOMAIN_QUEST_TOKENS = [
+    "rides.com",
+    "software.ai",
+    "alert.ai",
+    "swimsuits.ai",
+    "trenches.ai",
+    "depin.ai",
+    "terabytes.ai",
+    "mishka.ai",
+    "playonline.ai",
+    "exemption.ai",
+    "bipod.ai",
+    "itprojects.ai",
+    "lifeadvice.ai",
+    "onlineadvisor.ai",
+    "continents.ai",
+    "loancrypto.ai",
+    "coinlogic.ai",
+    "agenticconsultant.ai",
+    "gobitcoin.xyz",
+    "closingbells.com",
+    "get.cash",
+]
+DOMAIN_LISTING_CSV = Path("domain_listings.csv")
+DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
+DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
+DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
+DOMAIN_LISTING_SOURCE = "doma-swap-bot-public"
 
 
 def _color(text: str, code: str) -> str:
@@ -97,7 +128,7 @@ def _is_proxy_connectivity_error(exc: Exception) -> bool:
 
 
 def _random_swap_delay_sec() -> float:
-    return random.uniform(6, 16)
+    return random.uniform(4, 10)
 
 
 def _cleanup_weth_balance(
@@ -1780,6 +1811,46 @@ def _token_from_launchpad(info: LaunchpadTokenInfo) -> Token:
     )
 
 
+def _token_from_launchpad_price(info: LaunchpadTokenInfo, eth_price: Decimal) -> Token:
+    derived_eth = Decimal("0")
+    if info.price_usd > 0 and eth_price > 0:
+        derived_eth = info.price_usd / eth_price
+    return Token(
+        address=info.address,
+        symbol=canonical_symbol(info.symbol or info.name),
+        decimals=info.decimals,
+        derived_eth=derived_eth,
+    )
+
+
+def _token_from_config_override(cfg: BotConfig, symbol: str, decimals: int) -> Token:
+    token_symbol = canonical_symbol(symbol)
+    address = cfg.token_address_overrides.get(token_symbol)
+    if not address:
+        raise RuntimeError(f"{token_symbol} token address not found in contracts.json")
+    return Token(
+        address=address,
+        symbol=token_symbol,
+        decimals=decimals,
+        derived_eth=Decimal("1") if token_symbol == "WETH" else Decimal("0"),
+    )
+
+
+def _fetch_eth_price_via_doma_quote(cfg: BotConfig, doma_api: DomaApiClient, quote_token: Token) -> Decimal:
+    quote = doma_api.fetch_universal_router_quote(
+        token_in_address=DOMA_NATIVE_TOKEN_SENTINEL,
+        token_out_address=quote_token.address,
+        amount_raw=decimal_to_raw(Decimal("1"), 18),
+        chain_id=cfg.chain_id,
+        trade_type="exactIn",
+        portion_bips=0,
+        portion_recipient="",
+    )
+    if quote.quote_decimals <= 0:
+        raise RuntimeError("Doma ETH/USD quote returned zero output")
+    return quote.quote_decimals
+
+
 def _execute_launchpad_buy(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -2042,7 +2113,7 @@ def get_domain_swap_menu_input(state: BotState) -> Optional[Tuple[str, str, str,
 def get_domain_mode_menu_choice() -> Optional[str]:
     print("\nDomain token mode:")
     print("1) Single round-trip")
-    print("2) rides.com quest volume")
+    print("2) Domain quest volume")
     print("3) Back")
     raw = input("Select [1-3]: ").strip()
     if raw == "3":
@@ -2050,14 +2121,35 @@ def get_domain_mode_menu_choice() -> Optional[str]:
     if raw == "1":
         return "single"
     if raw == "2":
-        return "rides"
+        return "quest"
     raise ValueError("Invalid domain mode selection")
 
 
-def get_rides_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str, str]]:
+def get_domain_quest_token_choice() -> Optional[str]:
+    print("\nQuest token:")
+    for idx, domain_name in enumerate(DOMAIN_QUEST_TOKENS, start=1):
+        print(f"{idx}) {domain_name}")
+    back_index = len(DOMAIN_QUEST_TOKENS) + 1
+    print(f"{back_index}) Back")
+    raw = input(f"Select [1-{back_index}]: ").strip()
+    if raw == str(back_index):
+        return None
+    try:
+        picked_idx = int(raw)
+    except ValueError as exc:
+        raise ValueError("Invalid quest token selection") from exc
+    if not 1 <= picked_idx <= len(DOMAIN_QUEST_TOKENS):
+        raise ValueError("Invalid quest token selection")
+    return DOMAIN_QUEST_TOKENS[picked_idx - 1]
+
+
+def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str, str, str]]:
     _ = state
-    print("\nrides.com quest volume:")
-    print("Target: USDC.E <-> RIDES.com")
+    domain_name = get_domain_quest_token_choice()
+    if not domain_name:
+        return None
+    print(f"\n{domain_name} quest volume:")
+    print(f"Target: USDC.E <-> {domain_name}")
     print("\nPartial return percent range:")
     min_raw = input("Minimum percent [95]: ").strip() or "95"
     max_raw = input("Maximum percent [99]: ").strip() or "99"
@@ -2073,10 +2165,10 @@ def get_rides_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str,
     if final_raw not in {"1", "2"}:
         raise ValueError("Invalid final asset selection")
     final_asset = "USDC.E" if final_raw == "1" else "ETH"
-    return min_raw, max_raw, target_raw, final_asset
+    return domain_name, min_raw, max_raw, target_raw, final_asset
 
 
-def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
     success_wallets = 0
     failed_wallets = 0
     skipped_wallets = 0
@@ -2088,12 +2180,13 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
         if wallet not in failed_wallet_addresses:
             failed_wallet_addresses.append(wallet)
 
-    picked = get_rides_quest_menu_input(state)
+    picked = get_domain_quest_menu_input(state)
     if not picked:
-        logger.info("rides.com quest volume canceled by user.")
+        logger.info("Domain quest volume canceled by user.")
         return
-    min_raw, max_raw, target_raw, final_asset = picked
+    domain_name, min_raw, max_raw, target_raw, final_asset = picked
     target_volume = _parse_decimal_input(target_raw)
+    quest_target_volume = min(target_volume, DOMAIN_QUEST_COMPLETION_THRESHOLD_USD)
     partial_min = _parse_decimal_input(min_raw)
     partial_max = _parse_decimal_input(max_raw)
     if partial_min <= 0 or partial_max <= 0:
@@ -2101,27 +2194,64 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
     if partial_max > 100:
         raise ValueError("Partial return percent cannot be > 100")
 
-    wallet_key_records = _build_wallet_key_records(cfg, logger, "RIDES")
+    mode_label = f"QUEST {domain_name}"
+
+    def _quest_log(message: str) -> str:
+        return f"[{mode_label}] {message}"
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "QUEST")
     if not wallet_key_records:
         raise ValueError(
-            "No wallet/private-key pairs available for rides.com quest "
+            f"No wallet/private-key pairs available for {domain_name} quest "
             "(fill wallets.txt + keys.txt line-by-line or set valid PRIVATE_KEY in .env)"
         )
     wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
 
+    shared_doma_api = DomaApiClient(
+        cfg.doma_api_url,
+        api_key=cfg.doma_api_key,
+        api_keys=cfg.doma_api_keys,
+    )
+    launchpad_info = shared_doma_api.fetch_fractional_token_by_name(domain_name)
+    if not launchpad_info:
+        raise RuntimeError(f"{domain_name} launchpad token not found")
+    quest_symbol = canonical_symbol(launchpad_info.symbol or launchpad_info.name)
+    if not launchpad_info.pool_address:
+        raise RuntimeError(f"{domain_name} pool route not found")
+    quote_token = Token(
+        address=launchpad_info.quote_token_address,
+        symbol="USDC.E",
+        decimals=6,
+        derived_eth=Decimal("0"),
+    )
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
+    eth_price = _fetch_eth_price_via_doma_quote(cfg, shared_doma_api, quote_token)
+    rides_token = _token_from_launchpad_price(launchpad_info, eth_price)
+    rides_pool_addresses = [launchpad_info.pool_address]
+
     logger.info(
-        "[RIDES] mode started | source=AUTO pair=USDC.E<->RIDES.com wallets=%s | start_wallet=%s | target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s",
+        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | target=%s USDC.E | quest_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
+        domain_name,
         len(wallet_key_records),
         wallet_start_offset + 1,
         _format_decimal_plain(target_volume),
+        _format_decimal_plain(quest_target_volume),
         min_raw,
         max_raw,
         final_asset,
     )
+    logger.info(
+        _quest_log("metadata loaded | symbol=%s token=%s pool=%s token_price=%s eth_price=%s"),
+        quest_symbol,
+        rides_token.address,
+        launchpad_info.pool_address,
+        _format_decimal_plain(launchpad_info.price_usd),
+        _format_decimal_plain(eth_price),
+    )
 
     def _sleep_between_swaps() -> None:
         delay_sec = _random_swap_delay_sec()
-        logger.info("[RIDES] delay between swaps: %.2f sec", delay_sec)
+        logger.info(_quest_log("delay between swaps: %.2f sec"), delay_sec)
         time.sleep(delay_sec)
 
     def _best_effort_failed_rides_cleanup(
@@ -2136,7 +2266,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
         final_asset: str,
     ) -> None:
         logger.info(
-            "[RIDES] wallet=%s failed before target reached | quest volume not finalized, running cleanup to %s",
+            _quest_log("wallet=%s failed before target reached | quest volume not finalized, running cleanup to %s"),
             wallet,
             final_asset,
         )
@@ -2148,7 +2278,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
             rides_usd = rides_balance * rides_price_usd
             if rides_balance > 0 and rides_usd >= MIN_EXECUTABLE_TRADE_USD:
                 logger.info(
-                    "[RIDES] wallet=%s failed-run cleanup | %s->USDC.E amount=100%% of %s",
+                    _quest_log("wallet=%s failed-run cleanup | %s->USDC.E amount=100%% of %s"),
                     wallet,
                     rides_token.symbol,
                     rides_token.symbol,
@@ -2160,23 +2290,23 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                     doma_api=doma_api,
                     exec_client=exec_client,
                     token_in=rides_token,
-                    token_out=quote_token,
-                    display_in_symbol=rides_token.symbol,
-                    display_out_symbol="USDC.E",
-                    trade_amount_expr="100%",
-                    eth_price=eth_price,
-                    label=f"RIDES {wallet} {rides_token.symbol}>USDC.E FAIL-CLEANUP",
-                    wait_for_pre_tx=True,
-                    is_eth_source=False,
-                    unwrap_to_native=False,
-                )
+                        token_out=quote_token,
+                        display_in_symbol=rides_token.symbol,
+                        display_out_symbol="USDC.E",
+                        trade_amount_expr="100%",
+                        eth_price=eth_price,
+                        label=f"{mode_label} {wallet} {rides_token.symbol}>USDC.E FAIL-CLEANUP",
+                        wait_for_pre_tx=True,
+                        is_eth_source=False,
+                        unwrap_to_native=False,
+                    )
                 if ok_sell and state.last_tx_hash and _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
                     _sleep_between_swaps()
                 else:
-                    logger.warning("[RIDES] wallet=%s failed-run cleanup sell did not confirm", wallet)
+                    logger.warning(_quest_log("wallet=%s failed-run cleanup sell did not confirm"), wallet)
             elif rides_balance > 0:
                 logger.info(
-                    "[RIDES] wallet=%s failed-run cleanup skipped | %s dust below $1 (%s)",
+                    _quest_log("wallet=%s failed-run cleanup skipped | %s dust below $0.10 (%s)"),
                     wallet,
                     rides_token.symbol,
                     _format_decimal_plain(rides_usd),
@@ -2186,7 +2316,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                 usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                 if usdc_balance >= MIN_EXECUTABLE_TRADE_USD:
                     logger.info(
-                        "[RIDES] wallet=%s failed-run cleanup | USDC.E->ETH amount=100%% of USDC.E",
+                        _quest_log("wallet=%s failed-run cleanup | USDC.E->ETH amount=100%% of USDC.E"),
                         wallet,
                     )
                     ok_exit = _execute_trade_via_doma_ui_route(
@@ -2201,7 +2331,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         display_out_symbol="ETH",
                         trade_amount_expr="100%",
                         eth_price=eth_price,
-                        label=f"RIDES {wallet} USDC.E>ETH FAIL-CLEANUP",
+                        label=f"{mode_label} {wallet} USDC.E>ETH FAIL-CLEANUP",
                         is_eth_source=False,
                         unwrap_to_native=True,
                         wait_for_pre_tx=True,
@@ -2211,90 +2341,40 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                             logger=logger,
                             exec_client=exec_client,
                             weth_token=weth_token,
-                            label=f"RIDES {wallet} FAIL-CLEANUP",
+                            label=f"{mode_label} {wallet} FAIL-CLEANUP",
                             reason="failed-run cleanup",
                             wait_for_receipt=True,
                         )
                     else:
-                        logger.warning("[RIDES] wallet=%s failed-run cleanup exit to ETH did not confirm", wallet)
+                        logger.warning(_quest_log("wallet=%s failed-run cleanup exit to ETH did not confirm"), wallet)
                 elif usdc_balance > 0:
                     logger.info(
-                        "[RIDES] wallet=%s failed-run cleanup skipped | USDC.E dust below $1 (%s)",
+                        _quest_log("wallet=%s failed-run cleanup skipped | USDC.E dust below $0.10 (%s)"),
                         wallet,
                         _format_decimal_plain(usdc_balance),
                     )
         except Exception as cleanup_exc:
-            logger.warning("[RIDES] wallet=%s failed-run cleanup error: %s", wallet, cleanup_exc)
+            logger.warning(_quest_log("wallet=%s failed-run cleanup error: %s"), wallet, cleanup_exc)
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
-        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "RIDES")
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "QUEST")
         if skip_wallet:
             skipped_wallets += 1
             continue
-        logger.info("[RIDES] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
+        logger.info(_quest_log("wallet %s"), _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
         before_points_snapshot: Optional[PointsSnapshot] = None
         try:
             try:
-                subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
                 doma_api = DomaApiClient(
                     cfg.doma_api_url,
                     api_key=cfg.doma_api_key,
                     api_keys=cfg.doma_api_keys,
                     proxies=proxies,
                 )
-                pools = subgraph.fetch_top_pools(limit=1000)
-                eth_price = subgraph.fetch_eth_price_usd()
-                if eth_price <= 0:
-                    raise RuntimeError("Failed to resolve ETH/USD")
-                launchpad_info = doma_api.fetch_fractional_token_by_name("rides.com")
-                if not launchpad_info:
-                    raise RuntimeError("rides.com launchpad token not found")
-                if canonical_symbol(launchpad_info.symbol or launchpad_info.name) != "RIDES.COM":
-                    raise RuntimeError(f"Unexpected rides.com symbol payload: {launchpad_info.symbol}")
-                if not launchpad_info.pool_address:
-                    raise RuntimeError("rides.com pool route not found")
-                pool_eth_usdc = _find_best_pool_for_symbols(cfg, pools, "ETH", "USDC.E", ignore_limits=True)
-                if not pool_eth_usdc:
-                    raise RuntimeError("No pool route found for ETH<->USDC.E")
-                rides_pool_candidates = [
-                    p
-                    for p in pools
-                    if {
-                        canonical_symbol(p.token0.symbol),
-                        canonical_symbol(p.token1.symbol),
-                    }
-                    == {"USDC.E", "RIDES.COM"}
-                ]
-                pool_rides_usdc = _find_pool_by_address(pools, launchpad_info.pool_address)
-                if not pool_rides_usdc:
-                    pool_rides_usdc = _find_best_pool_for_symbols(cfg, pools, "USDC.E", "RIDES.COM", ignore_limits=True)
-                if not pool_rides_usdc:
-                    raise RuntimeError("No pool route found for RIDES.COM<->USDC.E")
-                if not rides_pool_candidates:
-                    rides_pool_candidates = [pool_rides_usdc]
             except Exception as exc:
                 _fail_wallet()
-                logger.warning("[RIDES] wallet=%s init failed: %s", wallet, exc)
+                logger.warning(_quest_log("wallet=%s init failed: %s"), wallet, exc)
                 continue
-
-            quote_token = Token(
-                address=launchpad_info.quote_token_address,
-                symbol="USDC.E",
-                decimals=6,
-                derived_eth=Decimal("0"),
-            )
-            weth_usdc_pair = _find_tokens_for_direction(pool_eth_usdc, "ETH", "USDC.E")
-            if not weth_usdc_pair:
-                _fail_wallet()
-                logger.warning("[RIDES] wallet=%s invalid ETH<->USDC.E pool metadata", wallet)
-                continue
-            weth_token, _ = weth_usdc_pair
-            rides_usdc_pair = _find_tokens_for_direction(pool_rides_usdc, "USDC.E", "RIDES.COM")
-            if not rides_usdc_pair:
-                _fail_wallet()
-                logger.warning("[RIDES] wallet=%s invalid RIDES.COM<->USDC.E pool metadata", wallet)
-                continue
-            _, rides_token = rides_usdc_pair
 
             exec_client = EvmExecutionClient(
                 rpc_url=cfg.rpc_url,
@@ -2307,35 +2387,35 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                 request_proxies=proxies,
             )
 
-            before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "RIDES")
             try:
-                rides_pool_addresses = [p.address for p in rides_pool_candidates]
                 historical_launchpad_volume = doma_api.fetch_wallet_fractional_token_volume_usd(
                     wallet_address=wallet,
                     fractional_token_id=launchpad_info.token_id,
-                    since=RIDES_VOLUME_CHECK_SINCE,
+                    since=DOMAIN_QUEST_VOLUME_CHECK_SINCE,
                 )
                 historical_pool_volume = doma_api.fetch_wallet_pool_volume_usd(
                     wallet_address=wallet,
-                    pool_address=pool_rides_usdc.address,
+                    pool_address=launchpad_info.pool_address,
                     pool_addresses=rides_pool_addresses,
                     tracked_token_symbol=rides_token.symbol,
-                    since=RIDES_VOLUME_CHECK_SINCE,
+                    since=DOMAIN_QUEST_VOLUME_CHECK_SINCE,
                 )
                 accumulated_volume = historical_launchpad_volume + historical_pool_volume
             except Exception as exc:
                 logger.warning(
-                    "[RIDES] wallet=%s historical rides volume fetch failed, assuming 0: %s",
+                    _quest_log("wallet=%s historical %s volume fetch failed, assuming 0: %s"),
                     wallet,
+                    domain_name,
                     exc,
                 )
                 accumulated_volume = Decimal("0")
-            rides_completion_threshold = min(target_volume, RIDES_QUEST_COMPLETION_THRESHOLD_USD)
+            rides_completion_threshold = quest_target_volume
             if accumulated_volume >= rides_completion_threshold:
                 logger.info(
-                    "[RIDES] wallet=%s already has rides volume since %s = %s/%s | completion_threshold=%s | skipping wallet",
+                    _quest_log("wallet=%s already has %s volume since %s = %s/%s | completion_threshold=%s | skipping wallet"),
                     wallet,
-                    RIDES_VOLUME_CHECK_SINCE.date().isoformat(),
+                    domain_name,
+                    DOMAIN_QUEST_VOLUME_CHECK_SINCE.date().isoformat(),
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(target_volume),
                     _format_decimal_plain(rides_completion_threshold),
@@ -2344,9 +2424,10 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                 continue
             if accumulated_volume > 0:
                 logger.info(
-                    "[RIDES] wallet=%s historical rides volume since %s = %s/%s | remaining=%s",
+                    _quest_log("wallet=%s historical %s volume since %s = %s/%s | remaining=%s"),
                     wallet,
-                    RIDES_VOLUME_CHECK_SINCE.date().isoformat(),
+                    domain_name,
+                    DOMAIN_QUEST_VOLUME_CHECK_SINCE.date().isoformat(),
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(target_volume),
                     _format_decimal_plain(target_volume - accumulated_volume),
@@ -2354,40 +2435,43 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
             cycle = 0
             wallet_failed = False
 
-            while accumulated_volume < target_volume:
+            while accumulated_volume < quest_target_volume:
                 cycle += 1
                 logger.info(
-                    "[RIDES] wallet=%s cycle=%s | progress=%s/%s",
+                    _quest_log("wallet=%s cycle=%s | progress=%s/%s"),
                     wallet,
                     cycle,
                     _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(target_volume),
+                    _format_decimal_plain(quest_target_volume),
                 )
 
                 full_balance_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                 full_balance_rides = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
                 rides_price_usd = pick_token_usd_price(rides_token, eth_price, launchpad_info.price_usd)
+                full_balance_rides_usd = full_balance_rides * rides_price_usd
+                has_usable_usdc = full_balance_usdc >= MIN_EXECUTABLE_TRADE_USD
+                has_usable_rides = full_balance_rides_usd >= MIN_EXECUTABLE_TRADE_USD
                 reserve_eth = Decimal("0.00001")
                 spendable_eth = exec_client.get_native_balance() - reserve_eth
                 spendable_eth = spendable_eth if spendable_eth > 0 else Decimal("0")
                 spendable_eth_usd = spendable_eth * eth_price
 
-                if full_balance_usdc <= 0 and full_balance_rides <= 0:
+                if not has_usable_usdc and not has_usable_rides:
                     if spendable_eth <= 0:
-                        logger.warning("[RIDES] wallet=%s no usable ETH/USDC.E/%s balance for quest cycle", wallet, rides_token.symbol)
+                        logger.warning(_quest_log("wallet=%s no usable ETH/USDC.E/%s balance for quest cycle"), wallet, rides_token.symbol)
                         wallet_failed = True
                         break
                     bootstrap_eth = spendable_eth * Decimal("0.95")
                     bootstrap_trade_usd = bootstrap_eth * eth_price
                     if bootstrap_trade_usd < MIN_EXECUTABLE_TRADE_USD:
                         logger.warning(
-                            "[RIDES] wallet=%s bootstrap skipped | ETH->USDC.E input below $1 (%s)",
+                            _quest_log("wallet=%s bootstrap skipped | ETH->USDC.E input below $0.10 (%s)"),
                             wallet,
                             _format_decimal_plain(bootstrap_trade_usd),
                         )
                         break
                     logger.info(
-                        "[RIDES] wallet=%s bootstrap | ETH->USDC.E amount=95%% spendable ETH",
+                        _quest_log("wallet=%s bootstrap | ETH->USDC.E amount=95%% spendable ETH"),
                         wallet,
                     )
                     ok_bootstrap = _execute_trade_via_doma_ui_route(
@@ -2402,7 +2486,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         display_out_symbol="USDC.E",
                         trade_amount_expr=_format_decimal_plain(bootstrap_eth),
                         eth_price=eth_price,
-                        label=f"RIDES {wallet} ETH>USDC.E BOOTSTRAP",
+                        label=f"{mode_label} {wallet} ETH>USDC.E BOOTSTRAP",
                         is_eth_source=True,
                         unwrap_to_native=False,
                         wait_for_pre_tx=True,
@@ -2412,17 +2496,17 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         break
                     _sleep_between_swaps()
                     continue
-                elif full_balance_rides <= 0 and full_balance_usdc > 0 and spendable_eth_usd >= MIN_EXECUTABLE_TRADE_USD and spendable_eth_usd > full_balance_usdc:
+                elif not has_usable_rides and full_balance_usdc > 0 and spendable_eth_usd >= MIN_EXECUTABLE_TRADE_USD and spendable_eth_usd > full_balance_usdc:
                     bootstrap_eth = spendable_eth * Decimal("0.95")
                     bootstrap_trade_usd = bootstrap_eth * eth_price
                     logger.info(
-                        "[RIDES] wallet=%s source selected | ETH balance larger than USDC.E (%s > %s), using ETH",
+                        _quest_log("wallet=%s source selected | ETH balance larger than USDC.E (%s > %s), using ETH"),
                         wallet,
                         _format_decimal_plain(spendable_eth_usd),
                         _format_decimal_plain(full_balance_usdc),
                     )
                     logger.info(
-                        "[RIDES] wallet=%s bootstrap | ETH->USDC.E amount=95%% spendable ETH",
+                        _quest_log("wallet=%s bootstrap | ETH->USDC.E amount=95%% spendable ETH"),
                         wallet,
                     )
                     ok_bootstrap = _execute_trade_via_doma_ui_route(
@@ -2437,7 +2521,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         display_out_symbol="USDC.E",
                         trade_amount_expr=_format_decimal_plain(bootstrap_eth),
                         eth_price=eth_price,
-                        label=f"RIDES {wallet} ETH>USDC.E BOOTSTRAP",
+                        label=f"{mode_label} {wallet} ETH>USDC.E BOOTSTRAP",
                         is_eth_source=True,
                         unwrap_to_native=False,
                         wait_for_pre_tx=True,
@@ -2464,14 +2548,14 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                     full_trade_usd = full_balance * rides_price_usd
                     full_trade_expr = "100%"
 
-                remaining_volume = target_volume - accumulated_volume
+                remaining_volume = quest_target_volume - accumulated_volume
                 if full_balance <= 0 or full_trade_usd <= 0:
-                    logger.warning("[RIDES] wallet=%s no usable USDC.E/%s balance for quest cycle", wallet, rides_token.symbol)
+                    logger.warning(_quest_log("wallet=%s no usable USDC.E/%s balance for quest cycle"), wallet, rides_token.symbol)
                     wallet_failed = True
                     break
                 if full_trade_usd < MIN_EXECUTABLE_TRADE_USD:
                     logger.warning(
-                        "[RIDES] wallet=%s full step skipped | %s balance below $1 (%s)",
+                        _quest_log("wallet=%s full step skipped | %s balance below $0.10 (%s)"),
                         wallet,
                         full_in_symbol,
                         _format_decimal_plain(full_trade_usd),
@@ -2486,13 +2570,13 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         full_trade_usd = capped_full_usd
                         full_trade_expr = f"${_format_decimal_plain(capped_full_usd)}"
                         logger.info(
-                            "[RIDES] wallet=%s near target | capping full step to %s",
+                            _quest_log("wallet=%s near target | capping full step to %s"),
                             wallet,
                             full_trade_expr,
                         )
 
                 logger.info(
-                    "[RIDES] wallet=%s full step | %s->%s amount=%s",
+                    _quest_log("wallet=%s full step | %s->%s amount=%s"),
                     wallet,
                     full_in_symbol,
                     full_out_symbol,
@@ -2512,7 +2596,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         display_out_symbol=rides_token.symbol,
                         trade_amount_expr=full_trade_expr,
                         eth_price=eth_price,
-                        label=f"RIDES {wallet} USDC.E>{rides_token.symbol}",
+                        label=f"{mode_label} {wallet} USDC.E>{rides_token.symbol}",
                         wait_for_pre_tx=True,
                     )
                     if ok_full:
@@ -2531,7 +2615,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         display_out_symbol="USDC.E",
                         trade_amount_expr=full_trade_expr,
                         eth_price=eth_price,
-                        label=f"RIDES {wallet} {rides_token.symbol}>USDC.E",
+                        label=f"{mode_label} {wallet} {rides_token.symbol}>USDC.E",
                         wait_for_pre_tx=True,
                     )
                 if not ok_full or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
@@ -2545,7 +2629,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                 )
                 if full_added_volume <= 0:
                     logger.warning(
-                        "[RIDES] wallet=%s full step volume fallback used | before_usdc=%s after_usdc=%s input=%s",
+                        _quest_log("wallet=%s full step volume fallback used | before_usdc=%s after_usdc=%s input=%s"),
                         wallet,
                         _format_decimal_plain(full_before_usdc_balance),
                         _format_decimal_plain(full_after_usdc_balance),
@@ -2554,13 +2638,13 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                     full_added_volume = full_trade_usd
                 accumulated_volume += full_added_volume
                 logger.info(
-                    "[RIDES] wallet=%s full_added_volume=%s | total_volume=%s/%s",
+                    _quest_log("wallet=%s full_added_volume=%s | total_volume=%s/%s"),
                     wallet,
                     _format_decimal_plain(full_added_volume),
                     _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(target_volume),
+                    _format_decimal_plain(quest_target_volume),
                 )
-                if accumulated_volume >= target_volume:
+                if accumulated_volume >= quest_target_volume:
                     break
                 _sleep_between_swaps()
 
@@ -2579,14 +2663,14 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                     partial_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
                     _, partial_trade_usd = resolve_trade_amount(partial_expr, partial_balance, rides_price_usd)
 
-                remaining_volume = target_volume - accumulated_volume
+                remaining_volume = quest_target_volume - accumulated_volume
                 if partial_balance <= 0 or partial_trade_usd <= 0:
-                    logger.warning("[RIDES] wallet=%s no balance for partial %s step", wallet, partial_in_symbol)
+                    logger.warning(_quest_log("wallet=%s no balance for partial %s step"), wallet, partial_in_symbol)
                     wallet_failed = True
                     break
                 if partial_trade_usd < MIN_EXECUTABLE_TRADE_USD:
                     logger.warning(
-                        "[RIDES] wallet=%s partial step skipped | %s input below $1 (%s)",
+                        _quest_log("wallet=%s partial step skipped | %s input below $0.10 (%s)"),
                         wallet,
                         partial_in_symbol,
                         _format_decimal_plain(partial_trade_usd),
@@ -2601,13 +2685,13 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         partial_trade_usd = capped_partial_usd
                         partial_expr = f"${_format_decimal_plain(capped_partial_usd)}"
                         logger.info(
-                            "[RIDES] wallet=%s near target | capping partial step to %s",
+                            _quest_log("wallet=%s near target | capping partial step to %s"),
                             wallet,
                             partial_expr,
                         )
 
                 logger.info(
-                    "[RIDES] wallet=%s partial step | %s->%s amount=%s",
+                    _quest_log("wallet=%s partial step | %s->%s amount=%s"),
                     wallet,
                     partial_in_symbol,
                     partial_out_symbol,
@@ -2627,7 +2711,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         display_out_symbol=rides_token.symbol,
                         trade_amount_expr=partial_expr,
                         eth_price=eth_price,
-                        label=f"RIDES {wallet} USDC.E>{rides_token.symbol}",
+                        label=f"{mode_label} {wallet} USDC.E>{rides_token.symbol}",
                         wait_for_pre_tx=True,
                     )
                     if ok_partial:
@@ -2646,7 +2730,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         display_out_symbol="USDC.E",
                         trade_amount_expr=partial_expr,
                         eth_price=eth_price,
-                        label=f"RIDES {wallet} {rides_token.symbol}>USDC.E",
+                        label=f"{mode_label} {wallet} {rides_token.symbol}>USDC.E",
                         wait_for_pre_tx=True,
                     )
                 if not ok_partial or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
@@ -2660,7 +2744,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                 )
                 if partial_added_volume <= 0:
                     logger.warning(
-                        "[RIDES] wallet=%s partial step volume fallback used | before_usdc=%s after_usdc=%s input=%s",
+                        _quest_log("wallet=%s partial step volume fallback used | before_usdc=%s after_usdc=%s input=%s"),
                         wallet,
                         _format_decimal_plain(partial_before_usdc_balance),
                         _format_decimal_plain(partial_after_usdc_balance),
@@ -2669,13 +2753,13 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                     partial_added_volume = partial_trade_usd
                 accumulated_volume += partial_added_volume
                 logger.info(
-                    "[RIDES] wallet=%s partial_added_volume=%s | total_volume=%s/%s",
+                    _quest_log("wallet=%s partial_added_volume=%s | total_volume=%s/%s"),
                     wallet,
                     _format_decimal_plain(partial_added_volume),
                     _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(target_volume),
+                    _format_decimal_plain(quest_target_volume),
                 )
-                if accumulated_volume < target_volume:
+                if accumulated_volume < quest_target_volume:
                     _sleep_between_swaps()
 
             if wallet_failed:
@@ -2690,20 +2774,20 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                     final_asset=final_asset,
                 )
                 _fail_wallet()
-            elif accumulated_volume >= target_volume:
+            elif accumulated_volume >= quest_target_volume:
                 final_rides_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
                 if final_rides_balance > 0:
                     final_rides_usd = final_rides_balance * rides_price_usd
                     if final_rides_usd < MIN_EXECUTABLE_TRADE_USD:
                         logger.info(
-                            "[RIDES] wallet=%s final settle skipped | %s dust below $1 (%s)",
+                            _quest_log("wallet=%s final settle skipped | %s dust below $0.10 (%s)"),
                             wallet,
                             rides_token.symbol,
                             _format_decimal_plain(final_rides_usd),
                         )
                     else:
                         logger.info(
-                            "[RIDES] wallet=%s final settle | %s->USDC.E amount=100%% of %s",
+                            _quest_log("wallet=%s final settle | %s->USDC.E amount=100%% of %s"),
                             wallet,
                             rides_token.symbol,
                             rides_token.symbol,
@@ -2721,7 +2805,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                             display_out_symbol="USDC.E",
                             trade_amount_expr="100%",
                             eth_price=eth_price,
-                            label=f"RIDES {wallet} {rides_token.symbol}>USDC.E FINAL",
+                            label=f"{mode_label} {wallet} {rides_token.symbol}>USDC.E FINAL",
                             wait_for_pre_tx=True,
                         )
                         if not ok_settle or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
@@ -2735,7 +2819,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                             )
                             if final_added_volume <= 0:
                                 logger.warning(
-                                    "[RIDES] wallet=%s final settle volume fallback used | before_usdc=%s after_usdc=%s",
+                                    _quest_log("wallet=%s final settle volume fallback used | before_usdc=%s after_usdc=%s"),
                                     wallet,
                                     _format_decimal_plain(final_before_usdc_balance),
                                     _format_decimal_plain(final_after_usdc_balance),
@@ -2743,11 +2827,11 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                                 final_added_volume = max(Decimal("0"), final_after_usdc_balance - final_before_usdc_balance)
                             accumulated_volume += final_added_volume
                             logger.info(
-                                "[RIDES] wallet=%s final_settle_added_volume=%s | total_volume=%s/%s",
+                                _quest_log("wallet=%s final_settle_added_volume=%s | total_volume=%s/%s"),
                                 wallet,
                                 _format_decimal_plain(final_added_volume),
                                 _format_decimal_plain(accumulated_volume),
-                                _format_decimal_plain(target_volume),
+                                _format_decimal_plain(quest_target_volume),
                             )
 
                 if wallet_failed:
@@ -2767,7 +2851,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         final_usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                         if final_usdc_balance >= MIN_EXECUTABLE_TRADE_USD:
                             logger.info(
-                                "[RIDES] wallet=%s final exit | USDC.E->ETH amount=100%% of USDC.E",
+                                _quest_log("wallet=%s final exit | USDC.E->ETH amount=100%% of USDC.E"),
                                 wallet,
                             )
                             ok_exit = _execute_trade_via_doma_ui_route(
@@ -2782,7 +2866,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                                 display_out_symbol="ETH",
                                 trade_amount_expr="100%",
                                 eth_price=eth_price,
-                                label=f"RIDES {wallet} USDC.E>ETH EXIT",
+                                label=f"{mode_label} {wallet} USDC.E>ETH EXIT",
                                 is_eth_source=False,
                                 unwrap_to_native=True,
                                 wait_for_pre_tx=True,
@@ -2794,13 +2878,13 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                                     logger=logger,
                                     exec_client=exec_client,
                                     weth_token=weth_token,
-                                    label=f"RIDES {wallet} FINAL",
+                                    label=f"{mode_label} {wallet} FINAL",
                                     reason="final cleanup",
                                     wait_for_receipt=True,
                                 )
                         elif final_usdc_balance > 0:
                             logger.info(
-                                "[RIDES] wallet=%s final exit skipped | USDC.E dust below $1 (%s)",
+                                _quest_log("wallet=%s final exit skipped | USDC.E dust below $0.10 (%s)"),
                                 wallet,
                                 _format_decimal_plain(final_usdc_balance),
                             )
@@ -2809,7 +2893,7 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
                         continue
                     success_wallets += 1
                     logger.info(
-                        "[RIDES] wallet=%s target reached | total_volume=%s USDC.E | final_asset=%s",
+                        _quest_log("wallet=%s target reached | total_volume=%s USDC.E | final_asset=%s"),
                         wallet,
                         _format_decimal_plain(accumulated_volume),
                         final_asset,
@@ -2819,21 +2903,352 @@ def run_rides_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: B
         except Exception as exc:
             _fail_wallet()
             if _is_proxy_connectivity_error(exc):
-                logger.warning("[RIDES] wallet=%s proxy/RPC failed during run, skipping wallet: %s", wallet, exc)
+                logger.warning(_quest_log("wallet=%s proxy/RPC failed during run, skipping wallet: %s"), wallet, exc)
             else:
-                logger.warning("[RIDES] wallet=%s runtime failed, skipping wallet: %s", wallet, exc)
-        finally:
-            if before_points_snapshot is not None:
-                after_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "RIDES")
-                _log_wallet_points_delta(logger, "RIDES", wallet, before_points_snapshot, after_points_snapshot)
-
+                logger.warning(_quest_log("wallet=%s runtime failed, skipping wallet: %s"), wallet, exc)
         if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
             delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
-            logger.info("[RIDES] delay before next wallet: %.2f sec", delay_sec)
+            logger.info(_quest_log("delay before next wallet: %.2f sec"), delay_sec)
             time.sleep(delay_sec)
 
     _print_mode_summary(
-        "RIDES",
+        mode_label,
+        len(wallet_key_records),
+        success_wallets,
+        failed_wallets,
+        skipped_wallets,
+        failed_wallet_addresses,
+    )
+
+
+def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
+    print("\nList unlisted domains for sale:")
+    min_raw = input("Minimum price in USDC.E: ").strip()
+    max_raw = input("Maximum price in USDC.E: ").strip()
+    if not min_raw or not max_raw:
+        raise ValueError("Minimum and maximum listing prices are required")
+    min_price = _parse_decimal_input(min_raw)
+    max_price = _parse_decimal_input(max_raw)
+    if min_price <= 0 or max_price <= 0:
+        raise ValueError("Listing prices must be > 0")
+    if max_price < min_price:
+        raise ValueError("Maximum price cannot be lower than minimum price")
+    duration_raw = input(f"Listing duration days [{DOMAIN_LISTING_DEFAULT_DURATION_DAYS}]: ").strip()
+    if not duration_raw:
+        duration_raw = str(DOMAIN_LISTING_DEFAULT_DURATION_DAYS)
+    duration_days = _parse_decimal_input(duration_raw)
+    if duration_days <= 0:
+        raise ValueError("Listing duration must be > 0")
+    delay_min_raw = input(f"Minimum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Domain listing delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum domain listing delay cannot be lower than minimum delay")
+    return min_raw, max_raw, duration_raw, delay_min_raw, delay_max_raw
+
+
+def _random_listing_price(min_price: Decimal, max_price: Decimal) -> Decimal:
+    if min_price == max_price:
+        return min_price.quantize(Decimal("0.1"))
+    spread = max_price - min_price
+    price = min_price + spread * Decimal(str(random.random()))
+    return price.quantize(Decimal("0.1"))
+
+
+def _doma_orderbook_base_url(cfg: BotConfig) -> str:
+    base = (cfg.doma_api_url or "https://api.doma.xyz/graphql").strip().rstrip("/")
+    if base.endswith("/graphql"):
+        base = base[: -len("/graphql")]
+    return base or "https://api.doma.xyz"
+
+
+def _first_doma_api_key(cfg: BotConfig) -> str:
+    for key in [cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys]:
+        key = (key or "").strip()
+        if key:
+            return key
+    return ""
+
+
+def _listing_currency_address(cfg: BotConfig) -> str:
+    address = cfg.token_address_overrides.get("USDC.E") or cfg.token_address_overrides.get("USDC")
+    if not address:
+        raise ValueError("USDC.E token address is missing in contracts.json")
+    return Web3.to_checksum_address(address)
+
+
+def _domain_listing_helper_path() -> Path:
+    return Path(__file__).with_name("doma_list_domain.mjs")
+
+
+def _domain_listing_loader_path() -> Path:
+    return Path(__file__).with_name("doma_node_esm_loader.mjs")
+
+
+def _run_domain_listing_helper(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    private_key: str,
+    domain: OwnedDomain,
+    price: Decimal,
+    duration_days: Decimal,
+    proxy: Optional[str],
+) -> Tuple[bool, str, str]:
+    helper_path = _domain_listing_helper_path()
+    if not helper_path.exists():
+        raise FileNotFoundError(f"Listing helper not found: {helper_path}")
+    loader_path = _domain_listing_loader_path()
+    if not loader_path.exists():
+        raise FileNotFoundError(f"Node ESM loader not found: {loader_path}")
+    price_raw = decimal_to_raw(price, 6)
+    if price_raw <= 0:
+        raise ValueError(f"Listing price is too small after USDC.E conversion: {price}")
+    duration_ms = int(duration_days * Decimal("86400000"))
+    payload = {
+        "chainId": cfg.chain_id,
+        "rpcUrl": cfg.rpc_url,
+        "privateKey": private_key,
+        "contract": domain.token_address,
+        "tokenId": domain.token_id,
+        "priceRaw": str(price_raw),
+        "currencyContractAddress": _listing_currency_address(cfg),
+        "durationMs": duration_ms,
+        "source": DOMAIN_LISTING_SOURCE,
+        "orderbookBaseUrl": _doma_orderbook_base_url(cfg),
+        "apiKey": _first_doma_api_key(cfg),
+        "proxy": proxy or "",
+    }
+    env = dict(os.environ)
+    if proxy:
+        env["HTTP_PROXY"] = proxy
+        env["HTTPS_PROXY"] = proxy
+    env["NODE_NO_WARNINGS"] = "1"
+    result = subprocess.run(
+        ["node", "--loader", loader_path.as_uri(), str(helper_path)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=str(helper_path.parent),
+        env=env,
+        timeout=600,
+    )
+    for line in result.stderr.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            logger.info("[LIST] wallet=%s domain=%s helper: %s", wallet, domain.name, line)
+            continue
+        if event.get("type") == "progress":
+            tx_hashes = event.get("tx_hashes") or ""
+            if tx_hashes:
+                logger.info(
+                    "[LIST] wallet=%s domain=%s progress | action=%s state=%s tx=%s",
+                    wallet,
+                    domain.name,
+                    event.get("action") or "",
+                    event.get("state") or event.get("status") or "",
+                    tx_hashes,
+                )
+        elif not event.get("ok", True):
+            logger.warning("[LIST] wallet=%s domain=%s helper error: %s", wallet, domain.name, event.get("error"))
+    if result.returncode != 0:
+        return False, "", (result.stderr or result.stdout or f"node exited with {result.returncode}").strip()
+    try:
+        data = json.loads(result.stdout.splitlines()[-1])
+    except Exception as exc:
+        return False, "", f"failed to parse helper output: {exc}; stdout={result.stdout.strip()}"
+    if not data.get("ok"):
+        return False, "", str(data.get("error") or "unknown helper error")
+    orders = (data.get("result") or {}).get("orders") or []
+    order_id = str((orders[0] or {}).get("orderId") or "") if orders else ""
+    return True, order_id, ""
+
+
+def _eligible_unlisted_domains(all_domains: List[OwnedDomain], listed_domains: List[OwnedDomain], chain_id: int) -> List[OwnedDomain]:
+    listed_names = {d.name.lower() for d in listed_domains}
+    target_network = f"eip155:{chain_id}"
+    out: List[OwnedDomain] = []
+    seen: set[str] = set()
+    for domain in all_domains:
+        if domain.name.lower() in listed_names:
+            continue
+        if domain.name.lower() in seen:
+            continue
+        seen.add(domain.name.lower())
+        if domain.network_id and domain.network_id != target_network:
+            continue
+        if domain.orderbook_disabled:
+            continue
+        out.append(domain)
+    return out
+
+
+def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    picked = get_domain_listing_menu_input()
+    if not picked:
+        logger.info("[LIST] canceled by user.")
+        return
+    min_raw, max_raw, duration_raw, delay_min_raw, delay_max_raw = picked
+    min_price = _parse_decimal_input(min_raw)
+    max_price = _parse_decimal_input(max_raw)
+    duration_days = _parse_decimal_input(duration_raw)
+    listing_delay_min = float(_parse_decimal_input(delay_min_raw))
+    listing_delay_max = float(_parse_decimal_input(delay_max_raw))
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "LIST")
+    if not wallet_key_records:
+        raise ValueError(
+            "No wallet/private-key pairs available for domain listing "
+            "(fill wallets.txt + keys.txt line-by-line or set valid PRIVATE_KEY in .env)"
+        )
+    wallet_key_records, wallet_start_offset, _ = _apply_wallet_start_selection(wallet_key_records)
+
+    listing_csv = cfg.trades_csv_file.parent / DOMAIN_LISTING_CSV.name
+    ensure_csv(
+        listing_csv,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "domain",
+            "price_usdce",
+            "duration_days",
+            "token_address",
+            "token_id",
+            "order_id",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    logger.info(
+        "[LIST] mode started | wallets=%s | start_wallet=%s | price=%s-%s USDC.E | duration=%s days | delay=%s-%s sec | currency=USDC.E",
+        len(wallet_key_records),
+        wallet_start_offset + 1,
+        _format_decimal_plain(min_price),
+        _format_decimal_plain(max_price),
+        _format_decimal_plain(duration_days),
+        _format_decimal_plain(_parse_decimal_input(delay_min_raw)),
+        _format_decimal_plain(_parse_decimal_input(delay_max_raw)),
+    )
+    success_wallets = 0
+    failed_wallets = 0
+    skipped_wallets = 0
+    failed_wallet_addresses: List[str] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "LIST")
+        proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+        if skip_wallet:
+            skipped_wallets += 1
+            continue
+        logger.info(
+            "[LIST] wallet %s",
+            _wallet_progress_label(idx + wallet_start_offset, len(wallet_key_records) + wallet_start_offset, wallet),
+        )
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_key=cfg.doma_api_key,
+                api_keys=cfg.doma_api_keys,
+                proxies=proxies,
+            )
+            all_domains = doma_api.fetch_owned_domains(wallet, chain_id=cfg.chain_id, listed=None)
+            listed_domains = doma_api.fetch_owned_domains(wallet, chain_id=cfg.chain_id, listed=True)
+            unlisted_domains = _eligible_unlisted_domains(all_domains, listed_domains, cfg.chain_id)
+            if not unlisted_domains:
+                skipped_wallets += 1
+                logger.info(
+                    "[LIST] wallet=%s no unlisted domains | owned=%s listed=%s",
+                    wallet,
+                    len(all_domains),
+                    len(listed_domains),
+                )
+                continue
+            logger.info(
+                "[LIST] wallet=%s unlisted domains=%s | owned=%s listed=%s | proxy=%s",
+                wallet,
+                len(unlisted_domains),
+                len(all_domains),
+                len(listed_domains),
+                "yes" if proxy else "no",
+            )
+            wallet_success = 0
+            wallet_failed = 0
+            for domain_idx, domain in enumerate(unlisted_domains, start=1):
+                price = _random_listing_price(min_price, max_price)
+                logger.info(
+                    "[LIST] wallet=%s domain %s/%s %s | price=%s USDC.E",
+                    wallet,
+                    domain_idx,
+                    len(unlisted_domains),
+                    domain.name,
+                    _format_decimal_plain(price),
+                )
+                ok, order_id, reason = _run_domain_listing_helper(
+                    cfg=cfg,
+                    logger=logger,
+                    wallet=wallet,
+                    private_key=private_key,
+                    domain=domain,
+                    price=price,
+                    duration_days=duration_days,
+                    proxy=proxy,
+                )
+                append_csv(
+                    listing_csv,
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        "ok" if ok else "failed",
+                        wallet,
+                        domain.name,
+                        _format_decimal_plain(price),
+                        _format_decimal_plain(duration_days),
+                        domain.token_address,
+                        domain.token_id,
+                        order_id,
+                        reason,
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+                if ok:
+                    wallet_success += 1
+                    logger.info("[LIST] wallet=%s domain=%s listed | order_id=%s", wallet, domain.name, order_id)
+                else:
+                    wallet_failed += 1
+                    logger.warning("[LIST] wallet=%s domain=%s list failed: %s", wallet, domain.name, reason)
+                if domain_idx < len(unlisted_domains):
+                    delay_sec = random.uniform(listing_delay_min, listing_delay_max)
+                    logger.info("[LIST] delay before next domain: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+            if wallet_success > 0:
+                success_wallets += 1
+            if wallet_failed > 0:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[LIST] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+            logger.info("[LIST] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    _print_mode_summary(
+        "LIST",
         len(wallet_key_records),
         success_wallets,
         failed_wallets,
@@ -2857,8 +3272,8 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
     if not domain_mode:
         logger.info("Domain swap canceled by user.")
         return
-    if domain_mode == "rides":
-        run_rides_quest_volume_once(cfg, logger, state)
+    if domain_mode == "quest":
+        run_domain_quest_volume_once(cfg, logger, state)
         return
     picked = get_domain_swap_menu_input(state)
     if not picked:
@@ -2889,6 +3304,39 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
         time.sleep(delay_sec)
 
     use_relay_swap = not cfg.router_address or cfg.router_address == "0x0000000000000000000000000000000000000000"
+    pooled_launchpad_info: Optional[LaunchpadTokenInfo] = None
+    pooled_quote_token: Optional[Token] = None
+    pooled_domain_token: Optional[Token] = None
+    pooled_weth_token: Optional[Token] = None
+    pooled_eth_price = Decimal("0")
+    try:
+        shared_doma_api = DomaApiClient(
+            cfg.doma_api_url,
+            api_key=cfg.doma_api_key,
+            api_keys=cfg.doma_api_keys,
+        )
+        candidate_launchpad = shared_doma_api.fetch_fractional_token_by_name(dst_symbol.lower())
+        if candidate_launchpad and candidate_launchpad.pool_address:
+            pooled_launchpad_info = candidate_launchpad
+            pooled_quote_token = Token(
+                address=pooled_launchpad_info.quote_token_address,
+                symbol="USDC.E",
+                decimals=6,
+                derived_eth=Decimal("0"),
+            )
+            pooled_eth_price = _fetch_eth_price_via_doma_quote(cfg, shared_doma_api, pooled_quote_token)
+            pooled_domain_token = _token_from_launchpad_price(pooled_launchpad_info, pooled_eth_price)
+            pooled_weth_token = _token_from_config_override(cfg, "WETH", 18)
+            logger.info(
+                "[DOMAIN] metadata loaded | symbol=%s token=%s pool=%s token_price=%s eth_price=%s",
+                pooled_domain_token.symbol,
+                pooled_domain_token.address,
+                pooled_launchpad_info.pool_address,
+                _format_decimal_plain(pooled_launchpad_info.price_usd),
+                _format_decimal_plain(pooled_eth_price),
+            )
+    except Exception as exc:
+        logger.warning("[DOMAIN] metadata prefetch failed for %s: %s", dst_symbol, exc)
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "DOMAIN")
@@ -2898,6 +3346,115 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
         logger.info("[DOMAIN] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
         before_points_snapshot: Optional[PointsSnapshot] = None
         try:
+            if pooled_launchpad_info and pooled_quote_token and pooled_domain_token and pooled_weth_token and pooled_eth_price > 0:
+                try:
+                    doma_api = DomaApiClient(
+                        cfg.doma_api_url,
+                        api_key=cfg.doma_api_key,
+                        api_keys=cfg.doma_api_keys,
+                        proxies=proxies,
+                    )
+                    exec_client = EvmExecutionClient(
+                        rpc_url=cfg.rpc_url,
+                        chain_id=cfg.chain_id,
+                        account_address=wallet,
+                        private_key=private_key,
+                        router_address=cfg.router_address,
+                        quoter_address=cfg.quoter_address,
+                        router_variant=cfg.router_variant,
+                        request_proxies=proxies,
+                    )
+                    before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
+                    amount_expr = _pick_random_amount_expr(
+                        amount_mode,
+                        _parse_decimal_input(min_raw),
+                        _parse_decimal_input(max_raw),
+                        state,
+                        min_raw=min_raw,
+                        max_raw=max_raw,
+                    )
+                    logger.info("[DOMAIN] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
+                    if src_symbol == "ETH":
+                        forward_token_in = pooled_weth_token
+                        forward_display_in = "ETH"
+                        forward_is_eth_source = True
+                        reverse_token_out = pooled_weth_token
+                        reverse_display_out = "ETH"
+                        reverse_unwrap_to_native = True
+                    elif src_symbol == "USDC.E":
+                        forward_token_in = pooled_quote_token
+                        forward_display_in = "USDC.E"
+                        forward_is_eth_source = False
+                        reverse_token_out = pooled_quote_token
+                        reverse_display_out = "USDC.E"
+                        reverse_unwrap_to_native = False
+                    else:
+                        logger.warning("[DOMAIN] wallet=%s unsupported source %s for %s", wallet, src_symbol, dst_symbol)
+                        _fail_wallet()
+                        continue
+
+                    before_dst = exec_client.get_erc20_balance(pooled_domain_token.address, pooled_domain_token.decimals)
+                    ok_fw = _execute_trade_via_doma_ui_route(
+                        cfg=cfg,
+                        logger=logger,
+                        state=state,
+                        doma_api=doma_api,
+                        exec_client=exec_client,
+                        token_in=forward_token_in,
+                        token_out=pooled_domain_token,
+                        display_in_symbol=forward_display_in,
+                        display_out_symbol=pooled_domain_token.symbol,
+                        trade_amount_expr=amount_expr,
+                        eth_price=pooled_eth_price,
+                        label=f"DOMAIN {wallet} {src_symbol}>{pooled_domain_token.symbol}",
+                        is_eth_source=forward_is_eth_source,
+                        wait_for_pre_tx=True,
+                    )
+                    if not ok_fw:
+                        _fail_wallet()
+                        continue
+                    if state.last_tx_hash:
+                        _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                        _sleep_between_domain_swaps()
+
+                    after_dst = exec_client.get_erc20_balance(pooled_domain_token.address, pooled_domain_token.decimals)
+                    delta_dst = after_dst - before_dst
+                    if delta_dst <= 0:
+                        logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, pooled_domain_token.symbol)
+                        _fail_wallet()
+                        continue
+
+                    ok_bw = _execute_trade_via_doma_ui_route(
+                        cfg=cfg,
+                        logger=logger,
+                        state=state,
+                        doma_api=doma_api,
+                        exec_client=exec_client,
+                        token_in=pooled_domain_token,
+                        token_out=reverse_token_out,
+                        display_in_symbol=pooled_domain_token.symbol,
+                        display_out_symbol=reverse_display_out,
+                        trade_amount_expr=_format_decimal_plain(delta_dst),
+                        eth_price=pooled_eth_price,
+                        label=f"DOMAIN {wallet} {pooled_domain_token.symbol}>{src_symbol}",
+                        is_eth_source=False,
+                        unwrap_to_native=reverse_unwrap_to_native,
+                        wait_for_pre_tx=True,
+                    )
+                    if ok_bw:
+                        success_wallets += 1
+                    else:
+                        _fail_wallet()
+                    if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+                        delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+                        logger.info("[DOMAIN] delay before next wallet: %.2f sec", delay_sec)
+                        time.sleep(delay_sec)
+                    continue
+                except Exception as exc:
+                    _fail_wallet()
+                    logger.warning("[DOMAIN] wallet=%s Doma UI route failed: %s", wallet, exc)
+                    continue
+
             try:
                 subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
                 doma_api = DomaApiClient(
@@ -3739,7 +4296,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     had_errors = True
             elif spendable_eth > 0 and eth_percent > 0:
                 logger.info(
-                    "[SWEEP] wallet=%s native ETH->USDC.E skipped | below $1 (%s)",
+                    "[SWEEP] wallet=%s native ETH->USDC.E skipped | below $0.10 (%s)",
                     wallet,
                     _format_decimal_plain(native_eth_usd),
                 )
@@ -3774,7 +4331,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     had_errors = True
             elif usdc_balance > 0:
                 logger.info(
-                    "[SWEEP] wallet=%s final settle skipped | USDC.E dust below $1 (%s)",
+                    "[SWEEP] wallet=%s final settle skipped | USDC.E dust below $0.10 (%s)",
                     wallet,
                     _format_decimal_plain(usdc_balance),
                 )
@@ -4127,7 +4684,7 @@ def run_volume_farm_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                     break
                 if full_trade_usd < MIN_EXECUTABLE_TRADE_USD:
                     logger.warning(
-                        "[VOLUME] wallet=%s full step skipped | %s input below $1 (%s)",
+                        "[VOLUME] wallet=%s full step skipped | %s input below $0.10 (%s)",
                         wallet,
                         full_in_symbol,
                         _format_decimal_plain(full_trade_usd),
@@ -4212,7 +4769,7 @@ def run_volume_farm_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                     break
                 if partial_trade_usd < MIN_EXECUTABLE_TRADE_USD:
                     logger.warning(
-                        "[VOLUME] wallet=%s partial step skipped | %s input below $1 (%s)",
+                        "[VOLUME] wallet=%s partial step skipped | %s input below $0.10 (%s)",
                         wallet,
                         partial_in_symbol,
                         _format_decimal_plain(partial_trade_usd),
@@ -4329,7 +4886,7 @@ def run_volume_farm_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                         )
                 elif final_usdc_balance > 0:
                     logger.info(
-                        "[VOLUME] wallet=%s final settle skipped | USDC.E dust below $1 (%s)",
+                        "[VOLUME] wallet=%s final settle skipped | USDC.E dust below $0.10 (%s)",
                         wallet,
                         _format_decimal_plain(final_usdc_balance),
                     )
@@ -4457,9 +5014,10 @@ def get_menu_choice() -> str:
     print("5) Swap ETH <-> USDC.E")
     print("6) Collect all tokens -> ETH / USDC.E")
     print("7) Farm 250+ volume ETH <-> USDC.E")
-    print("8) rides.com quest volume")
-    print("9) Exit")
-    return input("Select [1-9]: ").strip()
+    print("8) Domain quest volume")
+    print("9) List unlisted domains for sale")
+    print("10) Exit")
+    return input("Select [1-10]: ").strip()
 
 
 def main() -> None:
@@ -4573,10 +5131,18 @@ def main() -> None:
     if choice == "8":
         validate_config(cfg)
         try:
-            run_rides_quest_volume_once(cfg, logger, state)
+            run_domain_quest_volume_once(cfg, logger, state)
             save_state(cfg.state_file, state)
         except Exception as exc:
-            logger.exception("rides.com quest volume failed: %s", exc)
+            logger.exception("Domain quest volume failed: %s", exc)
+        return
+    if choice == "9":
+        validate_config(cfg)
+        try:
+            run_domain_listing_once(cfg, logger, state)
+            save_state(cfg.state_file, state)
+        except Exception as exc:
+            logger.exception("Domain listing failed: %s", exc)
         return
     logger.info("Exit selected.")
 
