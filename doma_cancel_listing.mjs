@@ -43,10 +43,7 @@ function emitProgress(steps) {
   );
 }
 
-async function main() {
-  const inputRaw = fs.readFileSync(0, 'utf8');
-  const input = JSON.parse(inputRaw);
-
+async function cancelListing(input, proxy) {
   const chainId = Number(requireField(input, 'chainId'));
   const rpcUrl = String(requireField(input, 'rpcUrl'));
   const privateKey = String(requireField(input, 'privateKey'));
@@ -55,17 +52,21 @@ async function main() {
   const source = String(input.source || 'doma-swap-bot-public');
   const baseUrl = String(input.orderbookBaseUrl || 'https://api.doma.xyz').replace(/\/+$/, '');
   const apiKey = String(input.apiKey || '');
-  const proxy = String(input.proxy || '');
-
-  if (proxy) {
-    process.env.HTTP_PROXY = proxy;
-    process.env.HTTPS_PROXY = proxy;
-  }
 
   const defaultHeaders = {};
   if (apiKey) {
     defaultHeaders['Api-Key'] = apiKey;
     defaultHeaders['x-api-key'] = apiKey;
+  }
+
+  const previousHttpProxy = process.env.HTTP_PROXY;
+  const previousHttpsProxy = process.env.HTTPS_PROXY;
+  if (proxy) {
+    process.env.HTTP_PROXY = proxy;
+    process.env.HTTPS_PROXY = proxy;
+  } else {
+    delete process.env.HTTP_PROXY;
+    delete process.env.HTTPS_PROXY;
   }
 
   const provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: 'doma' });
@@ -79,15 +80,36 @@ async function main() {
     },
   });
 
-  const result = await client.cancelListing({
-    params: {
-      orderId,
-      cancellationType,
-    },
-    signer,
-    chainId: `eip155:${chainId}`,
-    onProgress: emitProgress,
-  });
+  try {
+    return await client.cancelListing({
+      params: {
+        orderId,
+        cancellationType,
+      },
+      signer,
+      chainId: `eip155:${chainId}`,
+      onProgress: emitProgress,
+    });
+  } finally {
+    if (previousHttpProxy === undefined) {
+      delete process.env.HTTP_PROXY;
+    } else {
+      process.env.HTTP_PROXY = previousHttpProxy;
+    }
+    if (previousHttpsProxy === undefined) {
+      delete process.env.HTTPS_PROXY;
+    } else {
+      process.env.HTTPS_PROXY = previousHttpsProxy;
+    }
+  }
+}
+
+async function main() {
+  const inputRaw = fs.readFileSync(0, 'utf8');
+  const input = JSON.parse(inputRaw);
+  const proxy = String(input.proxy || '');
+
+  const result = await cancelListing(input, proxy);
 
   console.log(JSON.stringify({ ok: true, result }));
 }

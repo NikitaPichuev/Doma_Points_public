@@ -125,6 +125,30 @@ def _is_proxy_connectivity_error(exc: Exception) -> bool:
         "failed to establish a new connection",
         "max retries exceeded",
         "winerror 10065",
+        "proxy authentication required",
+        "tunnel connection failed",
+        "failed to parse",
+        "squid software foundation",
+        "service unavailable",
+        "status 503",
+    ]
+    return any(marker in message for marker in markers)
+
+
+def _is_proxy_connectivity_text(text: str) -> bool:
+    message = str(text or "").lower()
+    markers = [
+        "proxyerror",
+        "cannot connect to proxy",
+        "failed to establish a new connection",
+        "max retries exceeded",
+        "winerror 10065",
+        "proxy authentication required",
+        "tunnel connection failed",
+        "failed to parse",
+        "squid software foundation",
+        "service unavailable",
+        "status 503",
     ]
     return any(marker in message for marker in markers)
 
@@ -3575,6 +3599,12 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 else:
                     wallet_failed += 1
                     logger.warning("[DELIST] wallet=%s domain=%s cancel failed: %s", wallet, listing.name, reason)
+                    if _is_proxy_connectivity_text(reason):
+                        logger.warning(
+                            "[DELIST] wallet=%s proxy failed during cancel, skipping remaining listings for this wallet",
+                            wallet,
+                        )
+                        break
                 if listing_idx < len(listings):
                     delay_sec = random.uniform(delisting_delay_min, delisting_delay_max)
                     logger.info("[DELIST] delay before next domain: %.2f sec", delay_sec)
