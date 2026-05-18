@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { ethers } from 'ethers';
-import { createDomaOrderbookClient } from '@doma-protocol/orderbook-sdk';
+import { Seaport } from '@opensea/seaport-js';
+import { ApiClient, createDomaOrderbookClient } from '@doma-protocol/orderbook-sdk';
 
 function requireField(input, name) {
   const value = input[name];
@@ -43,12 +44,76 @@ function emitProgress(steps) {
   );
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function postCancelWithRetry(apiClient, payload) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await apiClient.cancelListing(payload, { timeout: 60000 });
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        await sleep(1500 * attempt);
+      }
+    }
+  }
+  throw lastError;
+}
+
+async function cancelListingOffChainDirect({ signer, chainId, orderId, baseUrl, defaultHeaders }) {
+  const seaport = new Seaport(signer, {
+    balanceAndApprovalChecksOnOrderCreation: false,
+  });
+  const seaportAddress = await seaport.contract.getAddress();
+  const numericChainId = Number(chainId);
+  const signature = await signer.signTypedData(
+    {
+      name: 'Seaport',
+      version: '1.6',
+      chainId: numericChainId,
+      verifyingContract: seaportAddress,
+    },
+    {
+      OrderHash: [{ name: 'orderHash', type: 'bytes32' }],
+    },
+    {
+      orderHash: orderId,
+    },
+  );
+
+  const apiClient = new ApiClient({
+    baseUrl,
+    defaultHeaders,
+  });
+
+  await postCancelWithRetry(apiClient, {
+    orderId,
+    signature: {
+      orderHash: orderId,
+      signature,
+    },
+  });
+
+  return {
+    transactionHash: null,
+    status: 'success',
+    gasUsed: '0',
+    gasPrice: '0',
+    mode: 'off-chain-direct',
+  };
+}
+
 async function cancelListing(input, proxy) {
   const chainId = Number(requireField(input, 'chainId'));
   const rpcUrl = String(requireField(input, 'rpcUrl'));
   const privateKey = String(requireField(input, 'privateKey'));
   const orderId = String(requireField(input, 'orderId'));
-  const cancellationType = String(input.cancellationType || 'off-chain');
+  // Doma UI cancels marketplace listings with an off-chain OrderHash signature.
+  // Keep this path forced even if an old Python process still sends "on-chain".
+  const cancellationType = 'off-chain';
   const source = String(input.source || 'doma-swap-bot-public');
   const baseUrl = String(input.orderbookBaseUrl || 'https://api.doma.xyz').replace(/\/+$/, '');
   const apiKey = String(input.apiKey || '');
@@ -71,6 +136,18 @@ async function cancelListing(input, proxy) {
 
   const provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: 'doma' });
   const signer = new ethers.Wallet(privateKey, provider);
+
+  try {
+    if (cancellationType === 'off-chain') {
+      return await cancelListingOffChainDirect({
+        signer,
+        chainId,
+        orderId,
+        baseUrl,
+        defaultHeaders,
+      });
+    }
+
   const client = createDomaOrderbookClient({
     source,
     chains: [buildDomaChain(chainId, rpcUrl)],
@@ -80,7 +157,6 @@ async function cancelListing(input, proxy) {
     },
   });
 
-  try {
     return await client.cancelListing({
       params: {
         orderId,
