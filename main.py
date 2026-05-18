@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -75,7 +75,7 @@ ANSI_RED = "\033[91m"
 ANSI_YELLOW = "\033[93m"
 ANSI_CYAN = "\033[96m"
 MIN_EXECUTABLE_TRADE_USD = Decimal("0.10")
-DOMAIN_QUEST_VOLUME_CHECK_SINCE = datetime(2026, 3, 2, 0, 0, 0, tzinfo=timezone.utc)
+DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS = 6
 DOMAIN_QUEST_COMPLETION_THRESHOLD_USD = Decimal("25")
 DOMAIN_QUEST_TOKENS = [
     "rides.com",
@@ -2254,6 +2254,8 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
     def _quest_log(message: str) -> str:
         return f"[{mode_label}] {message}"
 
+    volume_since = datetime.now(timezone.utc) - timedelta(days=DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS)
+
     wallet_key_records = _build_wallet_key_records(cfg, logger, "QUEST")
     if not wallet_key_records:
         raise ValueError(
@@ -2285,10 +2287,12 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
     rides_pool_addresses = [launchpad_info.pool_address]
 
     logger.info(
-        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | target=%s USDC.E | quest_target=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
+        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | lookback=%s days since=%s | target=%s USDC.E | quest_target=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
         domain_name,
         len(wallet_key_records),
         wallet_start_offset + 1,
+        DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
+        volume_since.isoformat(),
         _format_decimal_plain(target_volume),
         _format_decimal_plain(quest_target_volume),
         _format_decimal_plain(execution_target_volume),
@@ -2412,6 +2416,21 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
         except Exception as cleanup_exc:
             logger.warning(_quest_log("wallet=%s failed-run cleanup error: %s"), wallet, cleanup_exc)
 
+    def _fetch_recent_quest_volume(doma_api: DomaApiClient, wallet: str) -> Decimal:
+        launchpad_volume = doma_api.fetch_wallet_fractional_token_volume_usd(
+            wallet_address=wallet,
+            fractional_token_id=launchpad_info.token_id,
+            since=volume_since,
+        )
+        pool_volume = doma_api.fetch_wallet_pool_volume_usd(
+            wallet_address=wallet,
+            pool_address=launchpad_info.pool_address,
+            pool_addresses=rides_pool_addresses,
+            tracked_token_symbol=rides_token.symbol,
+            since=volume_since,
+        )
+        return launchpad_volume + pool_volume
+
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "QUEST")
         if skip_wallet:
@@ -2442,22 +2461,10 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
             )
 
             try:
-                historical_launchpad_volume = doma_api.fetch_wallet_fractional_token_volume_usd(
-                    wallet_address=wallet,
-                    fractional_token_id=launchpad_info.token_id,
-                    since=DOMAIN_QUEST_VOLUME_CHECK_SINCE,
-                )
-                historical_pool_volume = doma_api.fetch_wallet_pool_volume_usd(
-                    wallet_address=wallet,
-                    pool_address=launchpad_info.pool_address,
-                    pool_addresses=rides_pool_addresses,
-                    tracked_token_symbol=rides_token.symbol,
-                    since=DOMAIN_QUEST_VOLUME_CHECK_SINCE,
-                )
-                accumulated_volume = historical_launchpad_volume + historical_pool_volume
+                accumulated_volume = _fetch_recent_quest_volume(doma_api, wallet)
             except Exception as exc:
                 logger.warning(
-                    _quest_log("wallet=%s historical %s volume fetch failed, assuming 0: %s"),
+                    _quest_log("wallet=%s recent %s volume fetch failed, assuming 0: %s"),
                     wallet,
                     domain_name,
                     exc,
@@ -2466,10 +2473,11 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
             rides_completion_threshold = quest_target_volume
             if accumulated_volume >= rides_completion_threshold:
                 logger.info(
-                    _quest_log("wallet=%s already has %s volume since %s = %s/%s | completion_threshold=%s | skipping wallet"),
+                    _quest_log("wallet=%s already has %s volume for last %s days since %s = %s/%s | completion_threshold=%s | skipping wallet"),
                     wallet,
                     domain_name,
-                    DOMAIN_QUEST_VOLUME_CHECK_SINCE.date().isoformat(),
+                    DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
+                    volume_since.isoformat(),
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(target_volume),
                     _format_decimal_plain(rides_completion_threshold),
@@ -2478,13 +2486,25 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
                 continue
             if accumulated_volume > 0:
                 logger.info(
-                    _quest_log("wallet=%s historical %s volume since %s = %s/%s | remaining=%s"),
+                    _quest_log("wallet=%s recent %s volume for last %s days since %s = %s/%s | remaining_to_target=%s | planned_topup_to=%s"),
                     wallet,
                     domain_name,
-                    DOMAIN_QUEST_VOLUME_CHECK_SINCE.date().isoformat(),
+                    DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
+                    volume_since.isoformat(),
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(target_volume),
                     _format_decimal_plain(target_volume - accumulated_volume),
+                    _format_decimal_plain(execution_target_volume),
+                )
+            else:
+                logger.info(
+                    _quest_log("wallet=%s recent %s volume for last %s days since %s = 0/%s | planned_topup_to=%s"),
+                    wallet,
+                    domain_name,
+                    DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
+                    volume_since.isoformat(),
+                    _format_decimal_plain(target_volume),
+                    _format_decimal_plain(execution_target_volume),
                 )
             cycle = 0
             wallet_failed = False
