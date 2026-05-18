@@ -5179,90 +5179,94 @@ def main() -> None:
         run_replay_report(cfg, logger)
         return
 
-    choice = "1"
-    if sys.stdin.isatty():
-        choice = get_menu_choice()
+    while True:
+        choice = "1"
+        if sys.stdin.isatty():
+            choice = get_menu_choice()
 
-    if choice == "1":
-        validate_config(cfg)
-        try:
-            selected_tasks = get_bridge_tasks_from_menu(state)
-            if not selected_tasks:
-                logger.info("Bridge mode canceled by user.")
-                return
-            original_tasks = cfg.bridge_tasks
-            cfg.bridge_tasks = selected_tasks
+        if choice == "1":
+            validate_config(cfg)
             try:
-                run_bridge_once(cfg, logger, state)
-            finally:
-                cfg.bridge_tasks = original_tasks
+                selected_tasks = get_bridge_tasks_from_menu(state)
+                if not selected_tasks:
+                    logger.info("Bridge mode canceled by user.")
+                    return
+                original_tasks = cfg.bridge_tasks
+                cfg.bridge_tasks = selected_tasks
+                try:
+                    run_bridge_once(cfg, logger, state)
+                finally:
+                    cfg.bridge_tasks = original_tasks
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Bridge mode failed: %s", exc)
+            return
+        if choice == "2":
+            run_points_once(cfg, logger, state)
             save_state(cfg.state_file, state)
-        except Exception as exc:
-            logger.exception("Bridge mode failed: %s", exc)
+            return
+        if choice == "3":
+            try:
+                run_close_position_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Close position failed: %s", exc)
+            return
+        if choice == "4":
+            validate_config(cfg)
+            try:
+                run_domain_swap_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain swap failed: %s", exc)
+            return
+        if choice == "5":
+            validate_config(cfg)
+            try:
+                run_pair_swap_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Pair swap failed: %s", exc)
+            return
+        if choice == "6":
+            validate_config(cfg)
+            try:
+                run_sweep_tokens_to_usdce_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Sweep collect mode failed: %s", exc)
+            return
+        if choice == "7":
+            validate_config(cfg)
+            try:
+                run_volume_farm_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Volume farm failed: %s", exc)
+            return
+        if choice == "8":
+            validate_config(cfg)
+            try:
+                run_domain_quest_volume_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain quest volume failed: %s", exc)
+            return
+        if choice == "9":
+            validate_config(cfg)
+            try:
+                run_domain_listing_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain listing failed: %s", exc)
+            return
+        if choice == "10":
+            print_doma_quest_guide(logger)
+            if sys.stdin.isatty():
+                input("\nPress Enter to return to menu...")
+            continue
+        logger.info("Exit selected.")
         return
-    if choice == "2":
-        run_points_once(cfg, logger, state)
-        save_state(cfg.state_file, state)
-        return
-    if choice == "3":
-        try:
-            run_close_position_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-        except Exception as exc:
-            logger.exception("Close position failed: %s", exc)
-        return
-    if choice == "4":
-        validate_config(cfg)
-        try:
-            run_domain_swap_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-        except Exception as exc:
-            logger.exception("Domain swap failed: %s", exc)
-        return
-    if choice == "5":
-        validate_config(cfg)
-        try:
-            run_pair_swap_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-        except Exception as exc:
-            logger.exception("Pair swap failed: %s", exc)
-        return
-    if choice == "6":
-        validate_config(cfg)
-        try:
-            run_sweep_tokens_to_usdce_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-        except Exception as exc:
-            logger.exception("Sweep collect mode failed: %s", exc)
-        return
-    if choice == "7":
-        validate_config(cfg)
-        try:
-            run_volume_farm_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-        except Exception as exc:
-            logger.exception("Volume farm failed: %s", exc)
-        return
-    if choice == "8":
-        validate_config(cfg)
-        try:
-            run_domain_quest_volume_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-        except Exception as exc:
-            logger.exception("Domain quest volume failed: %s", exc)
-        return
-    if choice == "9":
-        validate_config(cfg)
-        try:
-            run_domain_listing_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-        except Exception as exc:
-            logger.exception("Domain listing failed: %s", exc)
-        return
-    if choice == "10":
-        print_doma_quest_guide(logger)
-        return
-    logger.info("Exit selected.")
 
 
 if __name__ == "__main__":
