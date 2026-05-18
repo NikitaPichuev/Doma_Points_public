@@ -5093,8 +5093,46 @@ def get_menu_choice() -> str:
     print("7) Farm 250+ volume ETH <-> USDC.E")
     print("8) Domain quest volume")
     print("9) List unlisted domains for sale")
-    print("10) Exit")
-    return input("Select [1-10]: ").strip()
+    print("10) Doma quest guide")
+    print("11) Exit")
+    return input("Select [1-11]: ").strip()
+
+
+def print_doma_quest_guide(logger: logging.Logger) -> None:
+    lines = [
+        "",
+        "Doma quest guide:",
+        "",
+        "Daily:",
+        "  Make a $5 or greater swap on any domain token.",
+        "  Use mode 8: Domain quest volume -> any token -> Target volume = 5.",
+        "",
+        "Weekly:",
+        "  List any domain on the marketplace.",
+        "  Use mode 9: List unlisted domains for sale.",
+        "",
+        "  Trade $100 in total volume this week.",
+        "  Use mode 7: Farm volume ETH <-> USDC.E -> Target volume = 100.",
+        "",
+        "  Trade $250 in total volume this week.",
+        "  Use mode 7: Farm volume ETH <-> USDC.E -> Target volume = 250.",
+        "",
+        "Season:",
+        "  Add at least $10 / $50 in liquidity to a domain token.",
+        "  Not automated yet. Needs Uniswap V3 mint/increase-liquidity implementation.",
+        "",
+        "  Bridge a domain from Doma to Base.",
+        "  Not automated yet. Current bridge mode bridges fungible tokens, not domain NFTs.",
+        "",
+        "  Mint 5 domain NFTs.",
+        "  Not automated yet. Needs registrar/checkout flow implementation.",
+        "",
+        "  Stake 3 subdomains.",
+        "  Not automated yet. Needs subdomain staking contract/API implementation.",
+    ]
+    for line in lines:
+        print(line)
+    logger.info("[QUEST_GUIDE] shown")
 
 
 def main() -> None:
@@ -5220,6 +5258,9 @@ def main() -> None:
             save_state(cfg.state_file, state)
         except Exception as exc:
             logger.exception("Domain listing failed: %s", exc)
+        return
+    if choice == "10":
+        print_doma_quest_guide(logger)
         return
     logger.info("Exit selected.")
 
