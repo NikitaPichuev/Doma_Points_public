@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { ethers } from 'ethers';
-import { createDomaOrderbookClient, OrderbookType } from '@doma-protocol/orderbook-sdk';
+import { ApiClient, ListingHandler, OrderbookType } from '@doma-protocol/orderbook-sdk';
 
 function requireField(input, name) {
   const value = input[name];
@@ -73,20 +73,44 @@ async function main() {
 
   const provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: 'doma' });
   const signer = new ethers.Wallet(privateKey, provider);
-  const client = createDomaOrderbookClient({
+  const apiClient = new ApiClient({
+    baseUrl,
+    defaultHeaders,
+  });
+
+  // Avoid SDK preflight API calls that are often blocked by proxy Squid 503.
+  // The final create-listing POST still goes through Doma API with the proxy.
+  apiClient.getSupportedCurrencies = async () => ({
+    currencies: [
+      {
+        contractAddress: currencyContractAddress,
+        symbol: 'USDC.E',
+        decimals: 6,
+      },
+    ],
+  });
+
+  const config = {
     source,
     chains: [buildDomaChain(chainId, rpcUrl)],
     apiClientOptions: {
       baseUrl,
       defaultHeaders,
     },
-  });
+  };
+  const handler = new ListingHandler(
+    config,
+    apiClient,
+    signer,
+    `eip155:${chainId}`,
+    emitProgress,
+  );
 
-  const result = await client.createListing({
-    params: {
+  const result = await handler.execute({
       source,
       orderbook: OrderbookType.DOMA,
       cancelExisting: false,
+      marketplaceFees: [],
       items: [
         {
           contract,
@@ -96,10 +120,6 @@ async function main() {
           duration: durationMs,
         },
       ],
-    },
-    signer,
-    chainId: `eip155:${chainId}`,
-    onProgress: emitProgress,
   });
 
   console.log(JSON.stringify({ ok: true, result }));
