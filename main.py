@@ -20,6 +20,7 @@ from web3 import Web3
 
 from config import BotConfig
 from doma_api import (
+    DomainListing,
     DomaApiClient,
     DomaSubgraphClient,
     DOMA_INTERFACE_PORTION_BIPS,
@@ -101,6 +102,7 @@ DOMAIN_QUEST_TOKENS = [
     "get.cash",
 ]
 DOMAIN_LISTING_CSV = Path("domain_listings.csv")
+DOMAIN_DELISTING_CSV = Path("domain_delistings.csv")
 DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
@@ -3046,6 +3048,30 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
     return min_raw, max_raw, duration_raw, delay_min_raw, delay_max_raw
 
 
+def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str]]:
+    print("\nCancel active domain listings:")
+    print("Cancellation type:")
+    print("1) Off-chain signature (recommended)")
+    print("2) On-chain Seaport cancel")
+    cancellation_raw = input("Select [1-2, default 1]: ").strip() or "1"
+    if cancellation_raw not in {"1", "2"}:
+        raise ValueError("Invalid cancellation type")
+    cancellation_type = "off-chain" if cancellation_raw == "1" else "on-chain"
+    delay_min_raw = input(f"Minimum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Domain delisting delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum domain delisting delay cannot be lower than minimum delay")
+    return cancellation_type, delay_min_raw, delay_max_raw
+
+
 def _random_listing_price(min_price: Decimal, max_price: Decimal) -> Decimal:
     if min_price == max_price:
         return min_price.quantize(Decimal("0.1"))
@@ -3078,6 +3104,10 @@ def _listing_currency_address(cfg: BotConfig) -> str:
 
 def _domain_listing_helper_path() -> Path:
     return Path(__file__).with_name("doma_list_domain.mjs")
+
+
+def _domain_cancel_listing_helper_path() -> Path:
+    return Path(__file__).with_name("doma_cancel_listing.mjs")
 
 
 def _domain_listing_loader_path() -> Path:
@@ -3165,6 +3195,79 @@ def _run_domain_listing_helper(
     orders = (data.get("result") or {}).get("orders") or []
     order_id = str((orders[0] or {}).get("orderId") or "") if orders else ""
     return True, order_id, ""
+
+
+def _run_domain_cancel_listing_helper(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    private_key: str,
+    listing: DomainListing,
+    cancellation_type: str,
+    proxy: Optional[str],
+) -> Tuple[bool, str, str]:
+    helper_path = _domain_cancel_listing_helper_path()
+    if not helper_path.exists():
+        raise FileNotFoundError(f"Cancel listing helper not found: {helper_path}")
+    loader_path = _domain_listing_loader_path()
+    if not loader_path.exists():
+        raise FileNotFoundError(f"Node ESM loader not found: {loader_path}")
+    payload = {
+        "chainId": cfg.chain_id,
+        "rpcUrl": cfg.rpc_url,
+        "privateKey": private_key,
+        "orderId": listing.order_id,
+        "cancellationType": cancellation_type,
+        "source": DOMAIN_LISTING_SOURCE,
+        "orderbookBaseUrl": _doma_orderbook_base_url(cfg),
+        "apiKey": _first_doma_api_key(cfg),
+        "proxy": proxy or "",
+    }
+    env = dict(os.environ)
+    if proxy:
+        env["HTTP_PROXY"] = proxy
+        env["HTTPS_PROXY"] = proxy
+    env["NODE_NO_WARNINGS"] = "1"
+    result = subprocess.run(
+        ["node", "--loader", loader_path.as_uri(), str(helper_path)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=str(helper_path.parent),
+        env=env,
+        timeout=600,
+    )
+    for line in result.stderr.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            logger.info("[DELIST] wallet=%s domain=%s helper: %s", wallet, listing.name, line)
+            continue
+        if event.get("type") == "progress":
+            tx_hashes = event.get("tx_hashes") or ""
+            logger.info(
+                "[DELIST] wallet=%s domain=%s progress | action=%s state=%s tx=%s",
+                wallet,
+                listing.name,
+                event.get("action") or "",
+                event.get("state") or event.get("status") or "",
+                tx_hashes,
+            )
+        elif not event.get("ok", True):
+            logger.warning("[DELIST] wallet=%s domain=%s helper error: %s", wallet, listing.name, event.get("error"))
+    if result.returncode != 0:
+        return False, "", (result.stderr or result.stdout or f"node exited with {result.returncode}").strip()
+    try:
+        data = json.loads(result.stdout.splitlines()[-1])
+    except Exception as exc:
+        return False, "", f"failed to parse helper output: {exc}; stdout={result.stdout.strip()}"
+    if not data.get("ok"):
+        return False, "", str(data.get("error") or "unknown helper error")
+    tx_hash = str(((data.get("result") or {}).get("transactionHash")) or "")
+    return True, tx_hash, ""
 
 
 def _eligible_unlisted_domains(all_domains: List[OwnedDomain], listed_domains: List[OwnedDomain], chain_id: int) -> List[OwnedDomain]:
@@ -3341,6 +3444,158 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
 
     _print_mode_summary(
         "LIST",
+        len(wallet_key_records),
+        success_wallets,
+        failed_wallets,
+        skipped_wallets,
+        failed_wallet_addresses,
+    )
+
+
+def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    picked = get_domain_delisting_menu_input()
+    if not picked:
+        logger.info("[DELIST] canceled by user.")
+        return
+    cancellation_type, delay_min_raw, delay_max_raw = picked
+    delisting_delay_min = float(_parse_decimal_input(delay_min_raw))
+    delisting_delay_max = float(_parse_decimal_input(delay_max_raw))
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "DELIST")
+    if not wallet_key_records:
+        raise ValueError(
+            "No wallet/private-key pairs available for domain delisting "
+            "(fill wallets.txt + keys.txt line-by-line or set valid PRIVATE_KEY in .env)"
+        )
+    wallet_key_records, wallet_start_offset, _ = _apply_wallet_start_selection(wallet_key_records)
+
+    delisting_csv = cfg.trades_csv_file.parent / DOMAIN_DELISTING_CSV.name
+    ensure_csv(
+        delisting_csv,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "domain",
+            "order_id",
+            "cancellation_type",
+            "tx_hash",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    logger.info(
+        "[DELIST] mode started | wallets=%s | start_wallet=%s | cancellation=%s | delay=%s-%s sec",
+        len(wallet_key_records),
+        wallet_start_offset + 1,
+        cancellation_type,
+        delay_min_raw,
+        delay_max_raw,
+    )
+
+    success_wallets = 0
+    failed_wallets = 0
+    skipped_wallets = 0
+    canceled_count = 0
+    failed_wallet_addresses: List[str] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "DELIST")
+        proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+        if skip_wallet:
+            skipped_wallets += 1
+            continue
+        logger.info(
+            "[DELIST] wallet %s",
+            _wallet_progress_label(idx + wallet_start_offset, len(wallet_key_records) + wallet_start_offset, wallet),
+        )
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_key=cfg.doma_api_key,
+                api_keys=cfg.doma_api_keys,
+                proxies=proxies,
+            )
+            listings = doma_api.fetch_wallet_domain_listings(wallet, chain_id=cfg.chain_id)
+            if not listings:
+                logger.info("[DELIST] wallet=%s no active listings | proxy=%s", wallet, "yes" if proxies else "no")
+                continue
+            logger.info(
+                "[DELIST] wallet=%s active listings=%s | proxy=%s",
+                wallet,
+                len(listings),
+                "yes" if proxies else "no",
+            )
+            wallet_success = 0
+            wallet_failed = 0
+            for listing_idx, listing in enumerate(listings, start=1):
+                logger.info(
+                    "[DELIST] wallet=%s domain %s/%s %s | order_id=%s",
+                    wallet,
+                    listing_idx,
+                    len(listings),
+                    listing.name,
+                    listing.order_id,
+                )
+                ok, tx_hash, reason = _run_domain_cancel_listing_helper(
+                    cfg=cfg,
+                    logger=logger,
+                    wallet=wallet,
+                    private_key=private_key,
+                    listing=listing,
+                    cancellation_type=cancellation_type,
+                    proxy=proxy,
+                )
+                append_csv(
+                    delisting_csv,
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        "ok" if ok else "failed",
+                        wallet,
+                        listing.name,
+                        listing.order_id,
+                        cancellation_type,
+                        tx_hash,
+                        reason,
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+                if ok:
+                    wallet_success += 1
+                    canceled_count += 1
+                    logger.info(
+                        "[DELIST] wallet=%s domain=%s canceled | order_id=%s tx=%s",
+                        wallet,
+                        listing.name,
+                        listing.order_id,
+                        tx_hash,
+                    )
+                else:
+                    wallet_failed += 1
+                    logger.warning("[DELIST] wallet=%s domain=%s cancel failed: %s", wallet, listing.name, reason)
+                if listing_idx < len(listings):
+                    delay_sec = random.uniform(delisting_delay_min, delisting_delay_max)
+                    logger.info("[DELIST] delay before next domain: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+            if wallet_success > 0:
+                success_wallets += 1
+            if wallet_failed > 0:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[DELIST] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+            logger.info("[DELIST] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    logger.info("[DELIST] canceled listings total=%s", canceled_count)
+    _print_mode_summary(
+        "DELIST",
         len(wallet_key_records),
         success_wallets,
         failed_wallets,
@@ -5102,10 +5357,36 @@ def get_menu_choice() -> str:
     print("6) Collect all tokens -> ETH / USDC.E")
     print("7) Farm 250+ volume ETH <-> USDC.E")
     print("8) Domain quest volume")
-    print("9) List unlisted domains for sale")
+    print("9) Manage domain marketplace listings")
     print("10) Doma quests")
     print("11) Exit")
     return input("Select [1-11]: ").strip()
+
+
+def get_domain_marketplace_menu_choice() -> str:
+    print("\nDomain marketplace listings:")
+    print("1) List unlisted domains for sale")
+    print("2) Cancel active listings")
+    print("3) Back")
+    return input("Select [1-3]: ").strip()
+
+
+def run_domain_marketplace_menu_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    while True:
+        choice = get_domain_marketplace_menu_choice()
+        if choice == "1":
+            validate_config(cfg)
+            run_domain_listing_once(cfg, logger, state)
+            save_state(cfg.state_file, state)
+            return
+        if choice == "2":
+            validate_config(cfg)
+            run_domain_delisting_once(cfg, logger, state)
+            save_state(cfg.state_file, state)
+            return
+        if choice == "3":
+            return
+        raise ValueError("Invalid domain marketplace listing selection")
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -5318,13 +5599,13 @@ def main() -> None:
                 logger.exception("Domain quest volume failed: %s", exc)
             return
         if choice == "9":
-            validate_config(cfg)
             try:
-                run_domain_listing_once(cfg, logger, state)
-                save_state(cfg.state_file, state)
+                run_domain_marketplace_menu_once(cfg, logger, state)
             except Exception as exc:
-                logger.exception("Domain listing failed: %s", exc)
-            return
+                logger.exception("Domain marketplace listing menu failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            continue
         if choice == "10":
             try:
                 run_doma_quests_menu_once(cfg, logger, state)

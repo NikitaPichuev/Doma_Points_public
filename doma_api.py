@@ -305,6 +305,20 @@ class OwnedDomain:
 
 
 @dataclass
+class DomainListing:
+    name: str
+    order_id: str
+    token_id: str
+    token_address: str
+    network_id: str
+    offerer_address: str
+    price_raw: str
+    currency_symbol: str
+    currency_decimals: int
+    expires_at: str
+
+
+@dataclass
 class UniversalRouterQuote:
     to: str
     calldata: str
@@ -681,6 +695,120 @@ class DomaApiClient:
             if not page.get("hasNextPage"):
                 break
             skip += len(items) if items else page_take
+        return out
+
+    def fetch_wallet_domain_listings(
+        self,
+        wallet_address: str,
+        chain_id: int = 97477,
+        take: int = 100,
+        max_pages: int = 50,
+    ) -> List[DomainListing]:
+        listed_domains = self.fetch_owned_domains(
+            wallet_address=wallet_address,
+            chain_id=chain_id,
+            listed=True,
+            take=take,
+            max_pages=max_pages,
+        )
+        if not listed_domains:
+            return []
+
+        query = """
+        query Listings(
+          $sld: String
+          $tlds: [String!]
+          $networkIds: [String!]
+          $skip: Int
+          $take: Int
+        ) {
+          listings(
+            sld: $sld
+            tlds: $tlds
+            networkIds: $networkIds
+            skip: $skip
+            take: $take
+          ) {
+            items {
+              id
+              externalId
+              name
+              tokenId
+              tokenAddress
+              offererAddress
+              price
+              expiresAt
+              currency {
+                symbol
+                decimals
+              }
+              chain {
+                networkId
+              }
+            }
+            hasNextPage
+          }
+        }
+        """
+        wallet_caip = f"eip155:{chain_id}:{wallet_address.lower()}"
+        target_network = f"eip155:{chain_id}"
+        out: List[DomainListing] = []
+        seen: set[str] = set()
+
+        for domain in listed_domains:
+            parts = domain.name.split(".", 1)
+            if len(parts) != 2:
+                continue
+            sld, tld = parts
+            skip = 0
+            page_take = max(1, min(int(take), 500))
+            for _ in range(max_pages):
+                data = self._post(
+                    query,
+                    {
+                        "sld": sld,
+                        "tlds": [tld],
+                        "networkIds": [target_network],
+                        "skip": skip,
+                        "take": page_take,
+                    },
+                )
+                page = data.get("listings") or {}
+                items = page.get("items") or []
+                for item in items:
+                    name = str(item.get("name") or "").strip().lower()
+                    token_id = str(item.get("tokenId") or "").strip()
+                    token_address = str(item.get("tokenAddress") or "").strip().lower()
+                    offerer = str(item.get("offererAddress") or "").strip().lower()
+                    network_id = str(((item.get("chain") or {}).get("networkId")) or "").strip()
+                    order_id = str(item.get("externalId") or item.get("id") or "").strip()
+                    if name != domain.name.lower():
+                        continue
+                    if token_id != domain.token_id or token_address != domain.token_address.lower():
+                        continue
+                    if network_id != target_network or offerer != wallet_caip:
+                        continue
+                    if not order_id or order_id in seen:
+                        continue
+                    seen.add(order_id)
+                    currency = item.get("currency") or {}
+                    out.append(
+                        DomainListing(
+                            name=name,
+                            order_id=order_id,
+                            token_id=token_id,
+                            token_address=token_address,
+                            network_id=network_id,
+                            offerer_address=offerer,
+                            price_raw=str(item.get("price") or "0"),
+                            currency_symbol=str(currency.get("symbol") or ""),
+                            currency_decimals=int(currency.get("decimals") or 0),
+                            expires_at=str(item.get("expiresAt") or ""),
+                        )
+                    )
+                if not page.get("hasNextPage"):
+                    break
+                skip += len(items) if items else page_take
         return out
 
     def fetch_wallet_fractional_token_volume_usd(
