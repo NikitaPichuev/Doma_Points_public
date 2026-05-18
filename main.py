@@ -2241,6 +2241,7 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
     domain_name, min_raw, max_raw, target_raw, final_asset = picked
     target_volume = _parse_decimal_input(target_raw)
     quest_target_volume = min(target_volume, DOMAIN_QUEST_COMPLETION_THRESHOLD_USD)
+    execution_target_volume = quest_target_volume + max(Decimal("1"), quest_target_volume * Decimal("0.10"))
     partial_min = _parse_decimal_input(min_raw)
     partial_max = _parse_decimal_input(max_raw)
     if partial_min <= 0 or partial_max <= 0:
@@ -2284,12 +2285,13 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
     rides_pool_addresses = [launchpad_info.pool_address]
 
     logger.info(
-        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | target=%s USDC.E | quest_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
+        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | target=%s USDC.E | quest_target=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
         domain_name,
         len(wallet_key_records),
         wallet_start_offset + 1,
         _format_decimal_plain(target_volume),
         _format_decimal_plain(quest_target_volume),
+        _format_decimal_plain(execution_target_volume),
         min_raw,
         max_raw,
         final_asset,
@@ -2487,7 +2489,7 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
             cycle = 0
             wallet_failed = False
 
-            while accumulated_volume < quest_target_volume:
+            while accumulated_volume < execution_target_volume:
                 cycle += 1
                 logger.info(
                     _quest_log("wallet=%s cycle=%s | progress=%s/%s"),
@@ -2521,6 +2523,7 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
                             wallet,
                             _format_decimal_plain(bootstrap_trade_usd),
                         )
+                        wallet_failed = True
                         break
                     logger.info(
                         _quest_log("wallet=%s bootstrap | ETH->USDC.E amount=95%% spendable ETH"),
@@ -2600,18 +2603,19 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
                     full_trade_usd = full_balance * rides_price_usd
                     full_trade_expr = "100%"
 
-                remaining_volume = quest_target_volume - accumulated_volume
+                remaining_volume = execution_target_volume - accumulated_volume
                 if full_balance <= 0 or full_trade_usd <= 0:
                     logger.warning(_quest_log("wallet=%s no usable USDC.E/%s balance for quest cycle"), wallet, rides_token.symbol)
                     wallet_failed = True
                     break
                 if full_trade_usd < MIN_EXECUTABLE_TRADE_USD:
                     logger.warning(
-                        _quest_log("wallet=%s full step skipped | %s balance below $0.10 (%s)"),
+                        _quest_log("wallet=%s full step skipped before execution target | %s balance below $0.10 (%s)"),
                         wallet,
                         full_in_symbol,
                         _format_decimal_plain(full_trade_usd),
                     )
+                    wallet_failed = True
                     break
                 if remaining_volume > 0 and remaining_volume < (full_trade_usd * Decimal("2")):
                     capped_full_usd = min(
@@ -2696,7 +2700,7 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(quest_target_volume),
                 )
-                if accumulated_volume >= quest_target_volume:
+                if accumulated_volume >= execution_target_volume:
                     break
                 _sleep_between_swaps()
 
@@ -2715,18 +2719,19 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
                     partial_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
                     _, partial_trade_usd = resolve_trade_amount(partial_expr, partial_balance, rides_price_usd)
 
-                remaining_volume = quest_target_volume - accumulated_volume
+                remaining_volume = execution_target_volume - accumulated_volume
                 if partial_balance <= 0 or partial_trade_usd <= 0:
                     logger.warning(_quest_log("wallet=%s no balance for partial %s step"), wallet, partial_in_symbol)
                     wallet_failed = True
                     break
                 if partial_trade_usd < MIN_EXECUTABLE_TRADE_USD:
                     logger.warning(
-                        _quest_log("wallet=%s partial step skipped | %s input below $0.10 (%s)"),
+                        _quest_log("wallet=%s partial step skipped before execution target | %s input below $0.10 (%s)"),
                         wallet,
                         partial_in_symbol,
                         _format_decimal_plain(partial_trade_usd),
                     )
+                    wallet_failed = True
                     break
                 if remaining_volume > 0 and partial_trade_usd > remaining_volume:
                     capped_partial_usd = min(
@@ -2811,8 +2816,18 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(quest_target_volume),
                 )
-                if accumulated_volume < quest_target_volume:
+                if accumulated_volume < execution_target_volume:
                     _sleep_between_swaps()
+
+            if not wallet_failed and accumulated_volume < execution_target_volume:
+                logger.warning(
+                    _quest_log("wallet=%s execution target not reached | local_volume=%s/%s | required_quest_target=%s"),
+                    wallet,
+                    _format_decimal_plain(accumulated_volume),
+                    _format_decimal_plain(execution_target_volume),
+                    _format_decimal_plain(quest_target_volume),
+                )
+                wallet_failed = True
 
             if wallet_failed:
                 _best_effort_failed_rides_cleanup(
@@ -2826,7 +2841,7 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
                     final_asset=final_asset,
                 )
                 _fail_wallet()
-            elif accumulated_volume >= quest_target_volume:
+            elif accumulated_volume >= execution_target_volume:
                 final_rides_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
                 if final_rides_balance > 0:
                     final_rides_usd = final_rides_balance * rides_price_usd
