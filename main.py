@@ -2222,7 +2222,12 @@ def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str
     return domain_name, min_raw, max_raw, target_raw, final_asset
 
 
-def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+def run_domain_quest_volume_once(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    state: BotState,
+    preset: Optional[Tuple[str, str, str, str, str]] = None,
+) -> None:
     success_wallets = 0
     failed_wallets = 0
     skipped_wallets = 0
@@ -2234,7 +2239,7 @@ def run_domain_quest_volume_once(cfg: BotConfig, logger: logging.Logger, state: 
         if wallet not in failed_wallet_addresses:
             failed_wallet_addresses.append(wallet)
 
-    picked = get_domain_quest_menu_input(state)
+    picked = preset or get_domain_quest_menu_input(state)
     if not picked:
         logger.info("Domain quest volume canceled by user.")
         return
@@ -4619,7 +4624,12 @@ def get_volume_farm_menu_input(state: BotState) -> Optional[Tuple[str, str, str]
     return min_raw, max_raw, target_raw
 
 
-def run_volume_farm_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+def run_volume_farm_once(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    state: BotState,
+    preset: Optional[Tuple[str, str, str]] = None,
+) -> None:
     success_wallets = 0
     failed_wallets = 0
     skipped_wallets = 0
@@ -4631,7 +4641,7 @@ def run_volume_farm_once(cfg: BotConfig, logger: logging.Logger, state: BotState
         if wallet not in failed_wallet_addresses:
             failed_wallet_addresses.append(wallet)
 
-    picked = get_volume_farm_menu_input(state)
+    picked = preset or get_volume_farm_menu_input(state)
     if not picked:
         logger.info("Volume farm canceled by user.")
         return
@@ -5093,46 +5103,101 @@ def get_menu_choice() -> str:
     print("7) Farm 250+ volume ETH <-> USDC.E")
     print("8) Domain quest volume")
     print("9) List unlisted domains for sale")
-    print("10) Doma quest guide")
+    print("10) Doma quests")
     print("11) Exit")
     return input("Select [1-11]: ").strip()
 
 
-def print_doma_quest_guide(logger: logging.Logger) -> None:
-    lines = [
-        "",
-        "Doma quest guide:",
-        "",
-        "Daily:",
-        "  Make a $5 or greater swap on any domain token.",
-        "  Use mode 8: Domain quest volume -> any token -> Target volume = 5.",
-        "",
-        "Weekly:",
-        "  List any domain on the marketplace.",
-        "  Use mode 9: List unlisted domains for sale.",
-        "",
-        "  Trade $100 in total volume this week.",
-        "  Use mode 7: Farm volume ETH <-> USDC.E -> Target volume = 100.",
-        "",
-        "  Trade $250 in total volume this week.",
-        "  Use mode 7: Farm volume ETH <-> USDC.E -> Target volume = 250.",
-        "",
-        "Season:",
-        "  Add at least $10 / $50 in liquidity to a domain token.",
-        "  Not automated yet. Needs Uniswap V3 mint/increase-liquidity implementation.",
-        "",
-        "  Bridge a domain from Doma to Base.",
-        "  Not automated yet. Current bridge mode bridges fungible tokens, not domain NFTs.",
-        "",
-        "  Mint 5 domain NFTs.",
-        "  Not automated yet. Needs registrar/checkout flow implementation.",
-        "",
-        "  Stake 3 subdomains.",
-        "  Not automated yet. Needs subdomain staking contract/API implementation.",
-    ]
-    for line in lines:
-        print(line)
-    logger.info("[QUEST_GUIDE] shown")
+def get_doma_quest_menu_choice() -> str:
+    print("\nDoma quests:")
+    print("1) Daily: $5+ swap on any domain token")
+    print("2) Weekly: list any domain on marketplace")
+    print("3) Weekly: trade $100 total volume")
+    print("4) Weekly: trade $250 total volume")
+    print("5) Season: add $10 liquidity to a domain token")
+    print("6) Season: add $50 liquidity to a domain token")
+    print("7) Season: bridge a domain from Doma to Base")
+    print("8) Season: mint 5 domain NFTs")
+    print("9) Season: stake 3 subdomains")
+    print("10) Back")
+    return input("Select [1-10]: ").strip()
+
+
+def _run_not_implemented_quest(logger: logging.Logger, quest_name: str, reason: str) -> None:
+    print("")
+    print(f"{quest_name}:")
+    print("Status: not automated yet.")
+    print(f"Reason: {reason}")
+    logger.warning("[DOMA_QUEST] %s not automated: %s", quest_name, reason)
+
+
+def run_doma_quests_menu_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    while True:
+        choice = get_doma_quest_menu_choice()
+        if choice == "1":
+            validate_config(cfg)
+            domain_name = get_domain_quest_token_choice()
+            if not domain_name:
+                continue
+            print(f"\nDaily swap quest selected: {domain_name} target=$5")
+            run_domain_quest_volume_once(cfg, logger, state, preset=(domain_name, "95", "99", "5", "ETH"))
+            save_state(cfg.state_file, state)
+            return
+        if choice == "2":
+            validate_config(cfg)
+            run_domain_listing_once(cfg, logger, state)
+            save_state(cfg.state_file, state)
+            return
+        if choice == "3":
+            validate_config(cfg)
+            print("\nWeekly volume quest selected: target=$100 ETH <-> USDC.E")
+            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "100"))
+            save_state(cfg.state_file, state)
+            return
+        if choice == "4":
+            validate_config(cfg)
+            print("\nWeekly volume quest selected: target=$250 ETH <-> USDC.E")
+            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "250"))
+            save_state(cfg.state_file, state)
+            return
+        if choice == "5":
+            _run_not_implemented_quest(
+                logger,
+                "Add at least $10 in liquidity to a domain token",
+                "the codebase has only close/decrease/collect position logic; it does not have Uniswap V3 mint/increase-liquidity yet.",
+            )
+            continue
+        if choice == "6":
+            _run_not_implemented_quest(
+                logger,
+                "Add at least $50 in liquidity to a domain token",
+                "the codebase has only close/decrease/collect position logic; it does not have Uniswap V3 mint/increase-liquidity yet.",
+            )
+            continue
+        if choice == "7":
+            _run_not_implemented_quest(
+                logger,
+                "Bridge a domain from Doma to Base",
+                "current bridge mode uses Relay for fungible tokens; domain NFT bridge contract/API is not implemented.",
+            )
+            continue
+        if choice == "8":
+            _run_not_implemented_quest(
+                logger,
+                "Mint 5 domain NFTs",
+                "registrar/checkout flow for domain NFT minting is not implemented.",
+            )
+            continue
+        if choice == "9":
+            _run_not_implemented_quest(
+                logger,
+                "Stake 3 subdomains",
+                "subdomain staking contract/API is not implemented.",
+            )
+            continue
+        if choice == "10":
+            return
+        raise ValueError("Invalid Doma quest selection")
 
 
 def main() -> None:
@@ -5261,9 +5326,12 @@ def main() -> None:
                 logger.exception("Domain listing failed: %s", exc)
             return
         if choice == "10":
-            print_doma_quest_guide(logger)
-            if sys.stdin.isatty():
-                input("\nPress Enter to return to menu...")
+            try:
+                run_doma_quests_menu_once(cfg, logger, state)
+            except Exception as exc:
+                logger.exception("Doma quest menu failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
             continue
         logger.info("Exit selected.")
         return
