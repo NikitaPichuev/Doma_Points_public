@@ -3074,13 +3074,7 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
 
 def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str]]:
     print("\nCancel active domain listings:")
-    print("Cancellation type:")
-    print("1) Off-chain signature (recommended)")
-    print("2) On-chain Seaport cancel")
-    cancellation_raw = input("Select [1-2, default 1]: ").strip() or "1"
-    if cancellation_raw not in {"1", "2"}:
-        raise ValueError("Invalid cancellation type")
-    cancellation_type = "off-chain" if cancellation_raw == "1" else "on-chain"
+    cancellation_type = "off-chain"
     delay_min_raw = input(f"Minimum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
     delay_max_raw = input(f"Maximum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
     if not delay_min_raw:
@@ -5387,36 +5381,11 @@ def get_menu_choice() -> str:
     print("6) Collect all tokens -> ETH / USDC.E")
     print("7) Farm 250+ volume ETH <-> USDC.E")
     print("8) Domain quest volume")
-    print("9) Manage domain marketplace listings")
-    print("10) Doma quests")
-    print("11) Exit")
-    return input("Select [1-11]: ").strip()
-
-
-def get_domain_marketplace_menu_choice() -> str:
-    print("\nDomain marketplace listings:")
-    print("1) List unlisted domains for sale")
-    print("2) Cancel active listings")
-    print("3) Back")
-    return input("Select [1-3]: ").strip()
-
-
-def run_domain_marketplace_menu_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
-    while True:
-        choice = get_domain_marketplace_menu_choice()
-        if choice == "1":
-            validate_config(cfg)
-            run_domain_listing_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-            return
-        if choice == "2":
-            validate_config(cfg)
-            run_domain_delisting_once(cfg, logger, state)
-            save_state(cfg.state_file, state)
-            return
-        if choice == "3":
-            return
-        raise ValueError("Invalid domain marketplace listing selection")
+    print("9) List unlisted domains for sale")
+    print("10) Cancel active domain listings")
+    print("11) Doma quests")
+    print("12) Exit")
+    return input("Select [1-12]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -5629,14 +5598,26 @@ def main() -> None:
                 logger.exception("Domain quest volume failed: %s", exc)
             return
         if choice == "9":
+            validate_config(cfg)
             try:
-                run_domain_marketplace_menu_once(cfg, logger, state)
+                run_domain_listing_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
             except Exception as exc:
-                logger.exception("Domain marketplace listing menu failed: %s", exc)
+                logger.exception("Domain listing failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
-            continue
+            return
         if choice == "10":
+            validate_config(cfg)
+            try:
+                run_domain_delisting_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain delisting failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "11":
             try:
                 run_doma_quests_menu_once(cfg, logger, state)
             except Exception as exc:
