@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import { ethers } from 'ethers';
 import { Seaport } from '@opensea/seaport-js';
 import { ApiClient } from '@doma-protocol/orderbook-sdk';
+import axios from 'axios';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 function requireField(input, name) {
   const value = input[name];
@@ -13,6 +15,41 @@ function requireField(input, name) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeProxy(value) {
+  const v = String(value || '').trim();
+  if (!v) {
+    return '';
+  }
+  if (v.includes('://')) {
+    return v;
+  }
+  if (v.includes('@')) {
+    const idx = v.lastIndexOf('@');
+    const left = v.slice(0, idx);
+    const right = v.slice(idx + 1);
+    const leftHost = left.split(':').slice(0, -1).join(':');
+    const rightHost = right.split(':').slice(0, -1).join(':');
+    const leftLooksHost = leftHost.includes('.') || leftHost.toLowerCase() === 'localhost';
+    const rightLooksHost = rightHost.includes('.') || rightHost.toLowerCase() === 'localhost';
+    if (leftLooksHost && !rightLooksHost && left.includes(':') && right.includes(':')) {
+      return `http://${right}@${left}`;
+    }
+  }
+  return `http://${v}`;
+}
+
+function configureAxiosProxy(proxy) {
+  const normalized = normalizeProxy(proxy);
+  if (!normalized) {
+    return '';
+  }
+  const agent = new HttpsProxyAgent(normalized);
+  axios.defaults.proxy = false;
+  axios.defaults.httpAgent = agent;
+  axios.defaults.httpsAgent = agent;
+  return normalized;
 }
 
 async function postCancelWithRetry(apiClient, payload) {
@@ -127,7 +164,7 @@ async function cancelListing(input, proxy) {
 async function main() {
   const inputRaw = fs.readFileSync(0, 'utf8');
   const input = JSON.parse(inputRaw);
-  const proxy = String(input.proxy || '');
+  const proxy = configureAxiosProxy(input.proxy || '');
 
   const result = await cancelListing(input, proxy);
 

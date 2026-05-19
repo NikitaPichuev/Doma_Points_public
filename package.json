@@ -20,6 +20,7 @@
   "homepage": "https://github.com/NikitaPichuev/Doma_Points_public#readme",
   "dependencies": {
     "@doma-protocol/orderbook-sdk": "^0.1.8",
-    "ethers": "^6.16.0"
+    "ethers": "^6.16.0",
+    "https-proxy-agent": "^7.0.6"
   }
 }
