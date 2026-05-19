@@ -108,6 +108,7 @@ DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
 DOMAIN_LISTING_SOURCE = "doma-swap-bot-public"
+PROXY_DOMA_RECORD_ADDRESS = "0xd0000000000067CB44aE7b6aC3AB5764dE20A3E2"
 BASE_CHAIN_CAIP2 = "eip155:8453"
 
 
@@ -3834,7 +3835,7 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
             wallet_success = 0
             wallet_failed = 0
             for domain_idx, domain in enumerate(selected_domains, start=1):
-                target_owner = f"{BASE_CHAIN_CAIP2}:{Web3.to_checksum_address(wallet)}"
+                target_owner = Web3.to_checksum_address(wallet)
                 logger.info(
                     "[DOMAIN_BRIDGE] wallet=%s domain %s/%s %s | token=%s | token_id=%s | target=%s",
                     wallet,
@@ -3856,9 +3857,8 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
                         logger.info("[DOMAIN_BRIDGE] wallet=%s domain=%s %s", wallet, domain.name, reason)
                     else:
                         tx_hash, fee_raw = exec_client.execute_domain_bridge(
-                            domain_record_address=domain.token_address,
+                            proxy_doma_record_address=PROXY_DOMA_RECORD_ADDRESS,
                             token_id=domain.token_id,
-                            is_synthetic=False,
                             target_chain_id=BASE_CHAIN_CAIP2,
                             target_owner_address=target_owner,
                         )

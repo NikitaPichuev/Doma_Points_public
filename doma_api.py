@@ -88,7 +88,6 @@ PROXY_DOMA_RECORD_ABI = [
     {
         "inputs": [
             {"internalType": "uint256", "name": "tokenId", "type": "uint256"},
-            {"internalType": "bool", "name": "isSynthetic", "type": "bool"},
             {"internalType": "string", "name": "targetChainId", "type": "string"},
             {"internalType": "string", "name": "targetOwnerAddress", "type": "string"},
         ],
@@ -103,6 +102,24 @@ PROXY_DOMA_RECORD_ABI = [
         ],
         "name": "getOperationFeeInNative",
         "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "string", "name": "targetChainId", "type": "string"},
+        ],
+        "name": "getBridgeFeeInNative",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "string", "name": "targetChainId", "type": "string"},
+        ],
+        "name": "isTargetChainSupported",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
         "stateMutability": "view",
         "type": "function",
     },
@@ -1576,23 +1593,34 @@ class EvmExecutionClient:
 
     def execute_domain_bridge(
         self,
-        domain_record_address: str,
+        proxy_doma_record_address: str,
         token_id: str,
         target_chain_id: str,
         target_owner_address: str,
-        is_synthetic: bool = False,
     ) -> Tuple[str, int]:
         record = self.web3.eth.contract(
-            address=Web3.to_checksum_address(domain_record_address),
+            address=Web3.to_checksum_address(proxy_doma_record_address),
             abi=PROXY_DOMA_RECORD_ABI,
         )
+        try:
+            if not bool(record.functions.isTargetChainSupported(str(target_chain_id)).call()):
+                raise RuntimeError(f"Domain bridge target chain is not supported: {target_chain_id}")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
         fn = record.functions.bridge(
             int(token_id),
-            bool(is_synthetic),
             str(target_chain_id),
             str(target_owner_address),
         )
         fee_candidates: List[int] = [0]
+        try:
+            fee = int(record.functions.getBridgeFeeInNative(str(target_chain_id)).call())
+            if fee > 0 and fee not in fee_candidates:
+                fee_candidates.append(fee)
+        except Exception:
+            pass
         try:
             bridge_operation = Web3.keccak(text="BRIDGE")
             fee = int(record.functions.getOperationFeeInNative(bridge_operation).call())
