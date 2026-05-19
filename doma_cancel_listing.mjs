@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { ethers } from 'ethers';
 import { Seaport } from '@opensea/seaport-js';
-import { ApiClient, createDomaOrderbookClient } from '@doma-protocol/orderbook-sdk';
+import { ApiClient } from '@doma-protocol/orderbook-sdk';
 
 function requireField(input, name) {
   const value = input[name];
@@ -9,39 +9,6 @@ function requireField(input, name) {
     throw new Error(`Missing required field: ${name}`);
   }
   return value;
-}
-
-function buildDomaChain(chainId, rpcUrl) {
-  return {
-    id: Number(chainId),
-    name: 'Doma',
-    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-    rpcUrls: {
-      default: { http: [rpcUrl] },
-      public: { http: [rpcUrl] },
-    },
-    blockExplorers: {
-      default: { name: 'Doma Explorer', url: 'https://explorer.doma.xyz' },
-    },
-  };
-}
-
-function emitProgress(steps) {
-  const latest = steps[steps.length - 1];
-  if (!latest) {
-    return;
-  }
-  const hashes = (latest.txHashes || []).map((x) => x.txHash).join(',');
-  console.error(
-    JSON.stringify({
-      type: 'progress',
-      status: latest.status,
-      action: latest.action,
-      state: latest.progressState || '',
-      tx_hashes: hashes,
-      error: latest.error || '',
-    }),
-  );
 }
 
 function sleep(ms) {
@@ -111,10 +78,6 @@ async function cancelListing(input, proxy) {
   const rpcUrl = String(requireField(input, 'rpcUrl'));
   const privateKey = String(requireField(input, 'privateKey'));
   const orderId = String(requireField(input, 'orderId'));
-  // Doma UI cancels marketplace listings with an off-chain OrderHash signature.
-  // Keep this path forced even if an old Python process still sends "on-chain".
-  const cancellationType = 'off-chain';
-  const source = String(input.source || 'doma-swap-bot-public');
   const baseUrl = String(input.orderbookBaseUrl || 'https://api.doma.xyz').replace(/\/+$/, '');
   const apiKey = String(input.apiKey || '');
 
@@ -138,33 +101,14 @@ async function cancelListing(input, proxy) {
   const signer = new ethers.Wallet(privateKey, provider);
 
   try {
-    if (cancellationType === 'off-chain') {
-      return await cancelListingOffChainDirect({
-        signer,
-        chainId,
-        orderId,
-        baseUrl,
-        defaultHeaders,
-      });
-    }
-
-  const client = createDomaOrderbookClient({
-    source,
-    chains: [buildDomaChain(chainId, rpcUrl)],
-    apiClientOptions: {
+    // Doma UI cancels marketplace listings with an off-chain OrderHash signature.
+    // Do the same directly: no SDK getListing/on-chain cancel path.
+    return await cancelListingOffChainDirect({
+      signer,
+      chainId,
+      orderId,
       baseUrl,
       defaultHeaders,
-    },
-  });
-
-    return await client.cancelListing({
-      params: {
-        orderId,
-        cancellationType,
-      },
-      signer,
-      chainId: `eip155:${chainId}`,
-      onProgress: emitProgress,
     });
   } finally {
     if (previousHttpProxy === undefined) {
