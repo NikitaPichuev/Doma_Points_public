@@ -3046,7 +3046,7 @@ def run_domain_quest_volume_once(
     )
 
 
-def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
+def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str, str]]:
     print("\nList unlisted domains for sale:")
     min_raw = input("Minimum price in USDC.E: ").strip()
     max_raw = input("Maximum price in USDC.E: ").strip()
@@ -3064,6 +3064,27 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
     duration_days = _parse_decimal_input(duration_raw)
     if duration_days <= 0:
         raise ValueError("Listing duration must be > 0")
+    print("Listing count:")
+    print("1) All unlisted domains")
+    print("2) Random amount from min/max")
+    count_mode_raw = input("Select [1-2, default 1]: ").strip()
+    if not count_mode_raw:
+        count_mode_raw = "1"
+    if count_mode_raw not in {"1", "2"}:
+        raise ValueError("Invalid listing count mode")
+    count_min_raw = ""
+    count_max_raw = ""
+    if count_mode_raw == "2":
+        count_min_raw = input("Minimum domains to list per wallet: ").strip()
+        count_max_raw = input("Maximum domains to list per wallet: ").strip()
+        if not count_min_raw or not count_max_raw:
+            raise ValueError("Minimum and maximum listing count are required")
+        count_min = int(_parse_decimal_input(count_min_raw))
+        count_max = int(_parse_decimal_input(count_max_raw))
+        if count_min <= 0 or count_max <= 0:
+            raise ValueError("Listing count must be > 0")
+        if count_max < count_min:
+            raise ValueError("Maximum listing count cannot be lower than minimum count")
     delay_min_raw = input(f"Minimum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
     delay_max_raw = input(f"Maximum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
     if not delay_min_raw:
@@ -3076,7 +3097,7 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
         raise ValueError("Domain listing delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum domain listing delay cannot be lower than minimum delay")
-    return min_raw, max_raw, duration_raw, delay_min_raw, delay_max_raw
+    return min_raw, max_raw, duration_raw, count_mode_raw, count_min_raw, count_max_raw, delay_min_raw, delay_max_raw
 
 
 def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str]]:
@@ -3141,6 +3162,16 @@ def _random_listing_price(min_price: Decimal, max_price: Decimal) -> Decimal:
     spread = max_price - min_price
     price = min_price + spread * Decimal(str(random.random()))
     return price.quantize(Decimal("0.1"))
+
+
+def _select_domains_for_listing(unlisted_domains: List[OwnedDomain], count_mode: str, count_min: int, count_max: int) -> List[OwnedDomain]:
+    if count_mode == "1":
+        return unlisted_domains
+    count = random.randint(count_min, count_max)
+    count = min(count, len(unlisted_domains))
+    if count >= len(unlisted_domains):
+        return unlisted_domains
+    return random.sample(unlisted_domains, count)
 
 
 def _doma_orderbook_base_url(cfg: BotConfig) -> str:
@@ -3382,10 +3413,12 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     if not picked:
         logger.info("[LIST] canceled by user.")
         return
-    min_raw, max_raw, duration_raw, delay_min_raw, delay_max_raw = picked
+    min_raw, max_raw, duration_raw, count_mode_raw, count_min_raw, count_max_raw, delay_min_raw, delay_max_raw = picked
     min_price = _parse_decimal_input(min_raw)
     max_price = _parse_decimal_input(max_raw)
     duration_days = _parse_decimal_input(duration_raw)
+    count_min = int(_parse_decimal_input(count_min_raw)) if count_min_raw else 0
+    count_max = int(_parse_decimal_input(count_max_raw)) if count_max_raw else 0
     listing_delay_min = float(_parse_decimal_input(delay_min_raw))
     listing_delay_max = float(_parse_decimal_input(delay_max_raw))
 
@@ -3416,12 +3449,13 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     )
 
     logger.info(
-        "[LIST] mode started | wallets=%s | start_wallet=%s | price=%s-%s USDC.E | duration=%s days | delay=%s-%s sec | currency=USDC.E",
+        "[LIST] mode started | wallets=%s | start_wallet=%s | price=%s-%s USDC.E | duration=%s days | count=%s | delay=%s-%s sec | currency=USDC.E",
         len(wallet_key_records),
         wallet_start_offset + 1,
         _format_decimal_plain(min_price),
         _format_decimal_plain(max_price),
         _format_decimal_plain(duration_days),
+        "all" if count_mode_raw == "1" else f"{count_min}-{count_max}",
         _format_decimal_plain(_parse_decimal_input(delay_min_raw)),
         _format_decimal_plain(_parse_decimal_input(delay_max_raw)),
     )
@@ -3459,9 +3493,11 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     len(listed_domains),
                 )
                 continue
+            selected_domains = _select_domains_for_listing(unlisted_domains, count_mode_raw, count_min, count_max)
             logger.info(
-                "[LIST] wallet=%s unlisted domains=%s | owned=%s listed=%s | proxy=%s",
+                "[LIST] wallet=%s selected=%s/%s unlisted domains | owned=%s listed=%s | proxy=%s",
                 wallet,
+                len(selected_domains),
                 len(unlisted_domains),
                 len(all_domains),
                 len(listed_domains),
@@ -3469,13 +3505,13 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             )
             wallet_success = 0
             wallet_failed = 0
-            for domain_idx, domain in enumerate(unlisted_domains, start=1):
+            for domain_idx, domain in enumerate(selected_domains, start=1):
                 price = _random_listing_price(min_price, max_price)
                 logger.info(
                     "[LIST] wallet=%s domain %s/%s %s | price=%s USDC.E",
                     wallet,
                     domain_idx,
-                    len(unlisted_domains),
+                    len(selected_domains),
                     domain.name,
                     _format_decimal_plain(price),
                 )
@@ -3511,7 +3547,7 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 else:
                     wallet_failed += 1
                     logger.warning("[LIST] wallet=%s domain=%s list failed: %s", wallet, domain.name, reason)
-                if domain_idx < len(unlisted_domains):
+                if domain_idx < len(selected_domains):
                     delay_sec = random.uniform(listing_delay_min, listing_delay_max)
                     logger.info("[LIST] delay before next domain: %.2f sec", delay_sec)
                     time.sleep(delay_sec)
