@@ -3717,6 +3717,10 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
         if skip_wallet:
             skipped_wallets += 1
             continue
+        if not proxies:
+            skipped_wallets += 1
+            logger.warning("[DOMAIN_BRIDGE] wallet=%s skipped: proxy is required for domain bridge", wallet)
+            continue
         logger.info(
             "[DOMAIN_BRIDGE] wallet %s",
             _wallet_progress_label(idx + wallet_start_offset, len(wallet_key_records) + wallet_start_offset, wallet),
