@@ -3842,19 +3842,20 @@ def _top_up_usdce_from_eth_for_cheap_buy(
     wallet: str,
     eth_price: Decimal,
     required_usdc: Decimal,
-) -> bool:
+) -> Tuple[bool, str, Decimal, Decimal]:
     current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
     if current_usdc >= required_usdc:
-        return True
+        return True, "", current_usdc, required_usdc
     if eth_price <= 0:
         logger.warning("[CHEAP_BUY] wallet=%s cannot top up USDC.E from ETH: ETH price is unknown", wallet)
-        return False
+        return False, "eth_price_unknown", current_usdc, required_usdc
 
     reserve_eth = Decimal("0.05") / eth_price
-    spendable_eth = exec_client.get_native_balance() - reserve_eth
+    native_eth = exec_client.get_native_balance()
+    spendable_eth = native_eth - reserve_eth
     if spendable_eth <= 0:
         logger.warning("[CHEAP_BUY] wallet=%s skipped | no USDC.E and no spendable ETH", wallet)
-        return False
+        return False, "no_spendable_eth", native_eth, reserve_eth
 
     missing_usdc = required_usdc - current_usdc
     target_usdc = max(missing_usdc, MIN_EXECUTABLE_TRADE_USD)
@@ -3869,7 +3870,7 @@ def _top_up_usdce_from_eth_for_cheap_buy(
             wallet,
             _format_decimal_plain(bootstrap_usd),
         )
-        return False
+        return False, "eth_bootstrap_below_min", bootstrap_usd, MIN_EXECUTABLE_TRADE_USD
 
     logger.info(
         "[CHEAP_BUY] wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
@@ -3896,11 +3897,13 @@ def _top_up_usdce_from_eth_for_cheap_buy(
     )
     if not ok or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
         logger.warning("[CHEAP_BUY] wallet=%s ETH->USDC.E bootstrap failed", wallet)
-        return False
+        return False, "eth_to_usdc_bootstrap_failed", current_usdc, required_usdc
 
     refreshed_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
     logger.info("[CHEAP_BUY] wallet=%s USDC.E after bootstrap=%s", wallet, _format_decimal_plain(refreshed_usdc))
-    return refreshed_usdc >= required_usdc
+    if refreshed_usdc >= required_usdc:
+        return True, "", refreshed_usdc, required_usdc
+    return False, "usdc_after_bootstrap_below_required", refreshed_usdc, required_usdc
 
 
 def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -3939,6 +3942,14 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     success_wallets = failed_wallets = skipped_wallets = 0
     buy_success_count = buy_failed_count = 0
     subdomain_success_count = subdomain_failed_count = 0
+    insufficient_balance_wallets: List[str] = []
+    insufficient_balance_seen: set[str] = set()
+
+    def _remember_insufficient(wallet_number: int, wallet_address: str) -> None:
+        if wallet_address.lower() in insufficient_balance_seen:
+            return
+        insufficient_balance_seen.add(wallet_address.lower())
+        insufficient_balance_wallets.append(f"#{wallet_number} {wallet_address} | insufficient balance")
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "CHEAP_BUY")
@@ -3959,7 +3970,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
             required_usdc_for_wallet = buy_amount_max_usdc * Decimal(tokens_per_wallet)
-            if not _top_up_usdce_from_eth_for_cheap_buy(
+            topup_ok, _, _, _ = _top_up_usdce_from_eth_for_cheap_buy(
                 cfg,
                 logger,
                 state,
@@ -3970,7 +3981,8 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 wallet,
                 eth_price,
                 required_usdc_for_wallet,
-            ):
+            )
+            if not topup_ok:
                 usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                 if usdc_balance >= buy_amount_min_usdc:
                     logger.warning(
@@ -3980,11 +3992,13 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     )
                 else:
                     skipped_wallets += 1
+                    _remember_insufficient(start_wallet + idx - 1, wallet)
                     logger.warning("[CHEAP_BUY] wallet=%s skipped | USDC.E balance below minimum buy amount (%s < %s)", wallet, _format_decimal_plain(usdc_balance), _format_decimal_plain(buy_amount_min_usdc))
                     continue
             usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
             if usdc_balance < buy_amount_min_usdc:
                 skipped_wallets += 1
+                _remember_insufficient(start_wallet + idx - 1, wallet)
                 logger.warning("[CHEAP_BUY] wallet=%s skipped | USDC.E balance below minimum buy amount (%s < %s)", wallet, _format_decimal_plain(usdc_balance), _format_decimal_plain(buy_amount_min_usdc))
                 continue
             wallet_success = wallet_failed = 0
@@ -3995,6 +4009,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 if current_usdc_balance < buy_amount_usdc:
                     wallet_failed += 1
                     buy_failed_count += 1
+                    _remember_insufficient(start_wallet + idx - 1, wallet)
                     logger.warning("[CHEAP_BUY] wallet=%s token=%s skipped | USDC.E balance below selected buy amount (%s < %s)", wallet, domain_token.symbol, _format_decimal_plain(current_usdc_balance), _format_decimal_plain(buy_amount_usdc))
                     break
                 expected_tokens = (buy_amount_usdc / info.price_usd) if info.price_usd > 0 else Decimal("0")
@@ -4039,6 +4054,12 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             logger.info("[CHEAP_BUY] delay before next wallet: %.2f sec", delay_sec)
             time.sleep(delay_sec)
     logger.info("[CHEAP_BUY] buys total | success=%s failed=%s | subdomains success=%s failed=%s", buy_success_count, buy_failed_count, subdomain_success_count, subdomain_failed_count)
+    if insufficient_balance_wallets:
+        logger.warning("[CHEAP_BUY] wallets with insufficient balance:")
+        print("\n[CHEAP_BUY] wallets with insufficient balance:")
+        for entry in insufficient_balance_wallets:
+            logger.warning("[CHEAP_BUY] insufficient balance | %s", entry)
+            print(f"  {entry}")
     _print_mode_summary("CHEAP_BUY", total=len(wallet_key_records), success=success_wallets, failed=failed_wallets, skipped=skipped_wallets)
 
 
