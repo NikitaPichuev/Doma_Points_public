@@ -3831,6 +3831,78 @@ def _eligible_cheap_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token
     return eligible
 
 
+def _top_up_usdce_from_eth_for_cheap_buy(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    state: BotState,
+    doma_api: DomaApiClient,
+    exec_client: EvmExecutionClient,
+    quote_token: Token,
+    weth_token: Token,
+    wallet: str,
+    eth_price: Decimal,
+    required_usdc: Decimal,
+) -> bool:
+    current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+    if current_usdc >= required_usdc:
+        return True
+    if eth_price <= 0:
+        logger.warning("[CHEAP_BUY] wallet=%s cannot top up USDC.E from ETH: ETH price is unknown", wallet)
+        return False
+
+    reserve_eth = Decimal("0.05") / eth_price
+    spendable_eth = exec_client.get_native_balance() - reserve_eth
+    if spendable_eth <= 0:
+        logger.warning("[CHEAP_BUY] wallet=%s skipped | no USDC.E and no spendable ETH", wallet)
+        return False
+
+    missing_usdc = required_usdc - current_usdc
+    target_usdc = max(missing_usdc, MIN_EXECUTABLE_TRADE_USD)
+    bootstrap_eth = target_usdc / eth_price
+    max_bootstrap_eth = spendable_eth
+    if bootstrap_eth > max_bootstrap_eth:
+        bootstrap_eth = max_bootstrap_eth
+    bootstrap_usd = bootstrap_eth * eth_price
+    if bootstrap_eth <= 0 or bootstrap_usd < MIN_EXECUTABLE_TRADE_USD:
+        logger.warning(
+            "[CHEAP_BUY] wallet=%s skipped | ETH->USDC.E bootstrap below minimum executable amount (%s USD)",
+            wallet,
+            _format_decimal_plain(bootstrap_usd),
+        )
+        return False
+
+    logger.info(
+        "[CHEAP_BUY] wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
+        wallet,
+        _format_decimal_plain(bootstrap_eth),
+        _format_decimal_plain(missing_usdc),
+    )
+    ok = _execute_trade_via_doma_ui_route(
+        cfg=cfg,
+        logger=logger,
+        state=state,
+        doma_api=doma_api,
+        exec_client=exec_client,
+        token_in=weth_token,
+        token_out=quote_token,
+        display_in_symbol="ETH",
+        display_out_symbol="USDC.E",
+        trade_amount_expr=_format_decimal_plain(bootstrap_eth),
+        eth_price=eth_price,
+        label=f"CHEAP_BUY {wallet} ETH>USDC.E BOOTSTRAP",
+        is_eth_source=True,
+        unwrap_to_native=False,
+        wait_for_pre_tx=True,
+    )
+    if not ok or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+        logger.warning("[CHEAP_BUY] wallet=%s ETH->USDC.E bootstrap failed", wallet)
+        return False
+
+    refreshed_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+    logger.info("[CHEAP_BUY] wallet=%s USDC.E after bootstrap=%s", wallet, _format_decimal_plain(refreshed_usdc))
+    return refreshed_usdc >= required_usdc
+
+
 def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
     picked = get_cheap_token_buy_menu_input()
     if not picked:
@@ -3850,6 +3922,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         raise RuntimeError("No wallet/private-key pairs available for cheap token buy")
     wallet_key_records, start_wallet, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
     quote_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
     logger.info(
         "[CHEAP_BUY] mode started | wallets=%s | start_wallet=%s | max_price<$%s | buy_amount=%s-%s USDC.E | tokens_per_wallet=%s-%s | delay=%s-%s sec",
         total_loaded_wallets,
@@ -3885,6 +3958,30 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 continue
             exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+            required_usdc_for_wallet = buy_amount_max_usdc * Decimal(tokens_per_wallet)
+            if not _top_up_usdce_from_eth_for_cheap_buy(
+                cfg,
+                logger,
+                state,
+                doma_api,
+                exec_client,
+                quote_token,
+                weth_token,
+                wallet,
+                eth_price,
+                required_usdc_for_wallet,
+            ):
+                usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                if usdc_balance >= buy_amount_min_usdc:
+                    logger.warning(
+                        "[CHEAP_BUY] wallet=%s partial USDC.E available after failed/full bootstrap (%s), continuing with current balance",
+                        wallet,
+                        _format_decimal_plain(usdc_balance),
+                    )
+                else:
+                    skipped_wallets += 1
+                    logger.warning("[CHEAP_BUY] wallet=%s skipped | USDC.E balance below minimum buy amount (%s < %s)", wallet, _format_decimal_plain(usdc_balance), _format_decimal_plain(buy_amount_min_usdc))
+                    continue
             usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
             if usdc_balance < buy_amount_min_usdc:
                 skipped_wallets += 1
