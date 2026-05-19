@@ -84,6 +84,30 @@ LAUNCHPAD_ABI = [
     },
 ]
 
+PROXY_DOMA_RECORD_ABI = [
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "tokenId", "type": "uint256"},
+            {"internalType": "bool", "name": "isSynthetic", "type": "bool"},
+            {"internalType": "string", "name": "targetChainId", "type": "string"},
+            {"internalType": "string", "name": "targetOwnerAddress", "type": "string"},
+        ],
+        "name": "bridge",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "bytes32", "name": "operation", "type": "bytes32"},
+        ],
+        "name": "getOperationFeeInNative",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
 WETH_ABI = [
     {
         "constant": False,
@@ -1549,6 +1573,53 @@ class EvmExecutionClient:
         }
         tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
         return self._send_tx(tx)
+
+    def execute_domain_bridge(
+        self,
+        proxy_doma_record_address: str,
+        token_id: str,
+        target_chain_id: str,
+        target_owner_address: str,
+        is_synthetic: bool = False,
+    ) -> Tuple[str, int]:
+        record = self.web3.eth.contract(
+            address=Web3.to_checksum_address(proxy_doma_record_address),
+            abi=PROXY_DOMA_RECORD_ABI,
+        )
+        fn = record.functions.bridge(
+            int(token_id),
+            bool(is_synthetic),
+            str(target_chain_id),
+            str(target_owner_address),
+        )
+        fee_candidates: List[int] = [0]
+        try:
+            bridge_operation = Web3.keccak(text="BRIDGE")
+            fee = int(record.functions.getOperationFeeInNative(bridge_operation).call())
+            if fee > 0 and fee not in fee_candidates:
+                fee_candidates.append(fee)
+        except Exception:
+            pass
+
+        native_balance = int(self.web3.eth.get_balance(self.account_address))
+        last_error: Optional[Exception] = None
+        for value_raw in fee_candidates:
+            if value_raw > native_balance:
+                continue
+            tx = {
+                **self._base_tx(),
+                "value": int(value_raw),
+            }
+            try:
+                tx = fn.build_transaction(tx)
+                tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+                return self._send_tx(tx), int(value_raw)
+            except Exception as exc:
+                last_error = exc
+                continue
+        if last_error:
+            raise last_error
+        raise RuntimeError("Unable to build domain bridge transaction")
 
 
 def decimal_to_raw(amount: Decimal, decimals: int) -> int:

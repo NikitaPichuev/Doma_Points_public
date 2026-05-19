@@ -103,10 +103,13 @@ DOMAIN_QUEST_TOKENS = [
 ]
 DOMAIN_LISTING_CSV = Path("domain_listings.csv")
 DOMAIN_DELISTING_CSV = Path("domain_delistings.csv")
+DOMAIN_BRIDGE_CSV = Path("domain_bridges.csv")
 DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
 DOMAIN_LISTING_SOURCE = "doma-swap-bot-public"
+PROXY_DOMA_RECORD_ADDRESS = "0xd0000000000067CB44aE7b6aC3AB5764dE20A3E2"
+BASE_CHAIN_CAIP2 = "eip155:8453"
 
 
 def _color(text: str, code: str) -> str:
@@ -3094,6 +3097,29 @@ def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str]]:
     return cancellation_type, delay_min_raw, delay_max_raw
 
 
+def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str]]:
+    print("\nBridge domain NFTs to Base:")
+    domains_raw = input("Domains per wallet [1]: ").strip()
+    if not domains_raw:
+        domains_raw = "1"
+    domains_per_wallet = int(_parse_decimal_input(domains_raw))
+    if domains_per_wallet <= 0:
+        raise ValueError("Domains per wallet must be > 0")
+    delay_min_raw = input(f"Minimum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Domain bridge delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum domain bridge delay cannot be lower than minimum delay")
+    return str(domains_per_wallet), delay_min_raw, delay_max_raw
+
+
 def _random_listing_price(min_price: Decimal, max_price: Decimal) -> Decimal:
     if min_price == max_price:
         return min_price.quantize(Decimal("0.1"))
@@ -3624,6 +3650,194 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     logger.info("[DELIST] canceled listings total=%s", canceled_count)
     _print_mode_summary(
         "DELIST",
+        len(wallet_key_records),
+        success_wallets,
+        failed_wallets,
+        skipped_wallets,
+        failed_wallet_addresses,
+    )
+
+
+def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    picked = get_domain_bridge_to_base_menu_input()
+    if not picked:
+        logger.info("[DOMAIN_BRIDGE] canceled by user.")
+        return
+    domains_per_wallet_raw, delay_min_raw, delay_max_raw = picked
+    domains_per_wallet = int(_parse_decimal_input(domains_per_wallet_raw))
+    bridge_delay_min = float(_parse_decimal_input(delay_min_raw))
+    bridge_delay_max = float(_parse_decimal_input(delay_max_raw))
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "DOMAIN_BRIDGE")
+    if not wallet_key_records:
+        raise ValueError(
+            "No wallet/private-key pairs available for domain bridge "
+            "(fill wallets.txt + keys.txt line-by-line or set valid PRIVATE_KEY in .env)"
+        )
+    wallet_key_records, wallet_start_offset, _ = _apply_wallet_start_selection(wallet_key_records)
+
+    bridge_csv = cfg.trades_csv_file.parent / DOMAIN_BRIDGE_CSV.name
+    ensure_csv(
+        bridge_csv,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "domain",
+            "token_address",
+            "token_id",
+            "source_chain",
+            "target_chain",
+            "target_owner",
+            "fee_native_raw",
+            "tx_hash",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    logger.info(
+        "[DOMAIN_BRIDGE] mode started | wallets=%s | start_wallet=%s | target=Base(%s) | domains_per_wallet=%s | delay=%s-%s sec",
+        len(wallet_key_records),
+        wallet_start_offset + 1,
+        BASE_CHAIN_CAIP2,
+        domains_per_wallet,
+        delay_min_raw,
+        delay_max_raw,
+    )
+
+    success_wallets = 0
+    failed_wallets = 0
+    skipped_wallets = 0
+    bridged_count = 0
+    failed_wallet_addresses: List[str] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "DOMAIN_BRIDGE")
+        if skip_wallet:
+            skipped_wallets += 1
+            continue
+        logger.info(
+            "[DOMAIN_BRIDGE] wallet %s",
+            _wallet_progress_label(idx + wallet_start_offset, len(wallet_key_records) + wallet_start_offset, wallet),
+        )
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_key=cfg.doma_api_key,
+                api_keys=cfg.doma_api_keys,
+                proxies=proxies,
+            )
+            all_domains = doma_api.fetch_owned_domains(wallet, chain_id=cfg.chain_id, listed=None)
+            listed_domains = doma_api.fetch_owned_domains(wallet, chain_id=cfg.chain_id, listed=True)
+            eligible_domains = _eligible_unlisted_domains(all_domains, listed_domains, cfg.chain_id)
+            if not eligible_domains:
+                skipped_wallets += 1
+                logger.info(
+                    "[DOMAIN_BRIDGE] wallet=%s no eligible domains | owned=%s listed=%s | proxy=%s",
+                    wallet,
+                    len(all_domains),
+                    len(listed_domains),
+                    "yes" if proxies else "no",
+                )
+                continue
+            selected_domains = eligible_domains[:domains_per_wallet]
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg,
+                logger,
+                wallet,
+                private_key,
+                proxies,
+                "[DOMAIN_BRIDGE] ",
+            )
+            wallet_success = 0
+            wallet_failed = 0
+            for domain_idx, domain in enumerate(selected_domains, start=1):
+                target_owner = f"{BASE_CHAIN_CAIP2}:{Web3.to_checksum_address(wallet)}"
+                logger.info(
+                    "[DOMAIN_BRIDGE] wallet=%s domain %s/%s %s | token_id=%s | target=%s",
+                    wallet,
+                    domain_idx,
+                    len(selected_domains),
+                    domain.name,
+                    domain.token_id,
+                    target_owner,
+                )
+                tx_hash = ""
+                fee_raw = 0
+                reason = ""
+                ok = False
+                try:
+                    if cfg.paper_mode or cfg.dry_run or not cfg.enable_execution:
+                        reason = "PAPER/DRY mode active. No transaction sent."
+                        ok = True
+                        logger.info("[DOMAIN_BRIDGE] wallet=%s domain=%s %s", wallet, domain.name, reason)
+                    else:
+                        tx_hash, fee_raw = exec_client.execute_domain_bridge(
+                            proxy_doma_record_address=PROXY_DOMA_RECORD_ADDRESS,
+                            token_id=domain.token_id,
+                            is_synthetic=False,
+                            target_chain_id=BASE_CHAIN_CAIP2,
+                            target_owner_address=target_owner,
+                        )
+                        logger.info(
+                            "[DOMAIN_BRIDGE] wallet=%s domain=%s bridge tx sent: %s | fee_native_raw=%s",
+                            wallet,
+                            domain.name,
+                            tx_hash,
+                            fee_raw,
+                        )
+                        ok = _wait_tx_receipt(exec_client, tx_hash, timeout_sec=240)
+                        if not ok:
+                            reason = "bridge tx failed or timed out"
+                except Exception as exc:
+                    reason = str(exc)
+                    logger.warning("[DOMAIN_BRIDGE] wallet=%s domain=%s bridge failed: %s", wallet, domain.name, exc)
+                append_csv(
+                    bridge_csv,
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        "ok" if ok else "failed",
+                        wallet,
+                        domain.name,
+                        domain.token_address,
+                        domain.token_id,
+                        f"eip155:{cfg.chain_id}",
+                        BASE_CHAIN_CAIP2,
+                        target_owner,
+                        str(fee_raw),
+                        tx_hash,
+                        reason,
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+                if ok:
+                    wallet_success += 1
+                    bridged_count += 1
+                    logger.info("[DOMAIN_BRIDGE] wallet=%s domain=%s bridged to Base", wallet, domain.name)
+                else:
+                    wallet_failed += 1
+                if domain_idx < len(selected_domains):
+                    delay_sec = random.uniform(bridge_delay_min, bridge_delay_max)
+                    logger.info("[DOMAIN_BRIDGE] delay before next domain: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+            if wallet_success > 0:
+                success_wallets += 1
+            if wallet_failed > 0:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[DOMAIN_BRIDGE] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+            logger.info("[DOMAIN_BRIDGE] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    logger.info("[DOMAIN_BRIDGE] bridged domains total=%s", bridged_count)
+    _print_mode_summary(
+        "DOMAIN_BRIDGE",
         len(wallet_key_records),
         success_wallets,
         failed_wallets,
@@ -5467,12 +5681,10 @@ def run_doma_quests_menu_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             )
             continue
         if choice == "7":
-            _run_not_implemented_quest(
-                logger,
-                "Bridge a domain from Doma to Base",
-                "current bridge mode uses Relay for fungible tokens; domain NFT bridge contract/API is not implemented.",
-            )
-            continue
+            validate_config(cfg)
+            run_domain_bridge_to_base_once(cfg, logger, state)
+            save_state(cfg.state_file, state)
+            return
         if choice == "8":
             _run_not_implemented_quest(
                 logger,
@@ -5691,11 +5903,14 @@ def main() -> None:
             )
             return
         if choice == "17":
-            _run_not_implemented_quest(
-                logger,
-                "Bridge a domain from Doma to Base",
-                "current bridge mode uses Relay for fungible tokens; domain NFT bridge contract/API is not implemented.",
-            )
+            validate_config(cfg)
+            try:
+                run_domain_bridge_to_base_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain bridge to Base failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
             return
         if choice == "18":
             _run_not_implemented_quest(
