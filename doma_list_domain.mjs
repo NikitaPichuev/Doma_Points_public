@@ -4,6 +4,8 @@ import { ApiClient, ListingHandler, OrderbookType } from '@doma-protocol/orderbo
 import axios from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
+const PUBLIC_DOMA_API_KEY = 'v1.c6e3f41019fb97237b7f192d49adb2ae464f2ba7ca6c0737fd6eab71ee01d1d4';
+
 function requireField(input, name) {
   const value = input[name];
   if (value === undefined || value === null || String(value).trim() === '') {
@@ -94,7 +96,7 @@ async function main() {
   const durationMs = Number(requireField(input, 'durationMs'));
   const source = String(input.source || 'doma-swap-bot-public');
   const baseUrl = String(input.orderbookBaseUrl || 'https://api.doma.xyz').replace(/\/+$/, '');
-  const apiKey = String(input.apiKey || '');
+  const apiKey = String(input.apiKey || PUBLIC_DOMA_API_KEY);
   const proxy = configureAxiosProxy(input.proxy || '');
 
   if (proxy) {
@@ -115,8 +117,6 @@ async function main() {
     defaultHeaders,
   });
 
-  // Avoid SDK preflight API calls that are often blocked by proxy Squid 503.
-  // The final create-listing POST still goes through Doma API with the proxy.
   apiClient.getSupportedCurrencies = async () => ({
     currencies: [
       {
@@ -126,6 +126,12 @@ async function main() {
       },
     ],
   });
+  const feeResponse = await apiClient.getOrderbookFee({
+    contractAddress: contract,
+    chainId: `eip155:${chainId}`,
+    orderbook: OrderbookType.DOMA,
+  });
+  const marketplaceFees = feeResponse.marketplaceFees || [];
 
   const config = {
     source,
@@ -147,7 +153,7 @@ async function main() {
       source,
       orderbook: OrderbookType.DOMA,
       cancelExisting: false,
-      marketplaceFees: [],
+      marketplaceFees,
       items: [
         {
           contract,
