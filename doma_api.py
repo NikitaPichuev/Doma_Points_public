@@ -1576,14 +1576,14 @@ class EvmExecutionClient:
 
     def execute_domain_bridge(
         self,
-        proxy_doma_record_address: str,
+        domain_record_address: str,
         token_id: str,
         target_chain_id: str,
         target_owner_address: str,
         is_synthetic: bool = False,
     ) -> Tuple[str, int]:
         record = self.web3.eth.contract(
-            address=Web3.to_checksum_address(proxy_doma_record_address),
+            address=Web3.to_checksum_address(domain_record_address),
             abi=PROXY_DOMA_RECORD_ABI,
         )
         fn = record.functions.bridge(
