@@ -131,6 +131,8 @@ def _is_proxy_connectivity_error(exc: Exception) -> bool:
         "squid software foundation",
         "service unavailable",
         "status 503",
+        "timeout",
+        "timed out",
     ]
     return any(marker in message for marker in markers)
 
@@ -149,6 +151,8 @@ def _is_proxy_connectivity_text(text: str) -> bool:
         "squid software foundation",
         "service unavailable",
         "status 503",
+        "timeout",
+        "timed out",
     ]
     return any(marker in message for marker in markers)
 

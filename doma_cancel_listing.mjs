@@ -17,12 +17,12 @@ function sleep(ms) {
 
 async function postCancelWithRetry(apiClient, payload) {
   let lastError;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
-      return await apiClient.cancelListing(payload, { timeout: 60000 });
+      return await apiClient.cancelListing(payload, { timeout: 25000 });
     } catch (error) {
       lastError = error;
-      if (attempt < 3) {
+      if (attempt < 2) {
         await sleep(1500 * attempt);
       }
     }
