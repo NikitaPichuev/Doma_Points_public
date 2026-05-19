@@ -3097,14 +3097,29 @@ def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str]]:
     return cancellation_type, delay_min_raw, delay_max_raw
 
 
-def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str]]:
+def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str, str]]:
     print("\nBridge domain NFTs to Base:")
-    domains_raw = input("Domains per wallet [1]: ").strip()
+    print("Domain selection:")
+    print("1) Listed domains")
+    print("2) Unlisted domains")
+    print("3) Any domains")
+    selection_raw = input("Select [1-3, default 2]: ").strip()
+    if not selection_raw:
+        selection_raw = "2"
+    selection_map = {
+        "1": "listed",
+        "2": "unlisted",
+        "3": "any",
+    }
+    selection = selection_map.get(selection_raw)
+    if not selection:
+        raise ValueError("Invalid domain bridge selection")
+    domains_raw = input("Domains to bridge per wallet [1]: ").strip()
     if not domains_raw:
         domains_raw = "1"
     domains_per_wallet = int(_parse_decimal_input(domains_raw))
     if domains_per_wallet <= 0:
-        raise ValueError("Domains per wallet must be > 0")
+        raise ValueError("Domains to bridge per wallet must be > 0")
     delay_min_raw = input(f"Minimum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
     delay_max_raw = input(f"Maximum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
     if not delay_min_raw:
@@ -3117,7 +3132,7 @@ def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str]]:
         raise ValueError("Domain bridge delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum domain bridge delay cannot be lower than minimum delay")
-    return str(domains_per_wallet), delay_min_raw, delay_max_raw
+    return selection, str(domains_per_wallet), delay_min_raw, delay_max_raw
 
 
 def _random_listing_price(min_price: Decimal, max_price: Decimal) -> Decimal:
@@ -3332,6 +3347,30 @@ def _eligible_unlisted_domains(all_domains: List[OwnedDomain], listed_domains: L
         if domain.network_id and domain.network_id != target_network:
             continue
         if domain.orderbook_disabled:
+            continue
+        out.append(domain)
+    return out
+
+
+def _eligible_bridge_domains(
+    all_domains: List[OwnedDomain],
+    listed_domains: List[OwnedDomain],
+    chain_id: int,
+    selection: str,
+) -> List[OwnedDomain]:
+    target_network = f"eip155:{chain_id}"
+    listed_names = {d.name.lower() for d in listed_domains}
+    source_domains = listed_domains if selection == "listed" else all_domains
+    out: List[OwnedDomain] = []
+    seen: set[str] = set()
+    for domain in source_domains:
+        name_key = domain.name.lower()
+        if name_key in seen:
+            continue
+        seen.add(name_key)
+        if domain.network_id and domain.network_id != target_network:
+            continue
+        if selection == "unlisted" and name_key in listed_names:
             continue
         out.append(domain)
     return out
@@ -3663,7 +3702,7 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
     if not picked:
         logger.info("[DOMAIN_BRIDGE] canceled by user.")
         return
-    domains_per_wallet_raw, delay_min_raw, delay_max_raw = picked
+    selection, domains_per_wallet_raw, delay_min_raw, delay_max_raw = picked
     domains_per_wallet = int(_parse_decimal_input(domains_per_wallet_raw))
     bridge_delay_min = float(_parse_decimal_input(delay_min_raw))
     bridge_delay_max = float(_parse_decimal_input(delay_max_raw))
@@ -3689,6 +3728,7 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
             "source_chain",
             "target_chain",
             "target_owner",
+            "selection",
             "fee_native_raw",
             "tx_hash",
             "reason",
@@ -3697,10 +3737,11 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
     )
 
     logger.info(
-        "[DOMAIN_BRIDGE] mode started | wallets=%s | start_wallet=%s | target=Base(%s) | domains_per_wallet=%s | delay=%s-%s sec",
+        "[DOMAIN_BRIDGE] mode started | wallets=%s | start_wallet=%s | target=Base(%s) | selection=%s | domains_per_wallet=%s | delay=%s-%s sec",
         len(wallet_key_records),
         wallet_start_offset + 1,
         BASE_CHAIN_CAIP2,
+        selection,
         domains_per_wallet,
         delay_min_raw,
         delay_max_raw,
@@ -3734,12 +3775,13 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
             )
             all_domains = doma_api.fetch_owned_domains(wallet, chain_id=cfg.chain_id, listed=None)
             listed_domains = doma_api.fetch_owned_domains(wallet, chain_id=cfg.chain_id, listed=True)
-            eligible_domains = _eligible_unlisted_domains(all_domains, listed_domains, cfg.chain_id)
+            eligible_domains = _eligible_bridge_domains(all_domains, listed_domains, cfg.chain_id, selection)
             if not eligible_domains:
                 skipped_wallets += 1
                 logger.info(
-                    "[DOMAIN_BRIDGE] wallet=%s no eligible domains | owned=%s listed=%s | proxy=%s",
+                    "[DOMAIN_BRIDGE] wallet=%s no eligible %s domains | owned=%s listed=%s | proxy=%s",
                     wallet,
+                    selection,
                     len(all_domains),
                     len(listed_domains),
                     "yes" if proxies else "no",
@@ -3809,6 +3851,7 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
                         f"eip155:{cfg.chain_id}",
                         BASE_CHAIN_CAIP2,
                         target_owner,
+                        selection,
                         str(fee_raw),
                         tx_hash,
                         reason,
