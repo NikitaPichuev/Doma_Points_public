@@ -5685,13 +5685,9 @@ def get_menu_choice() -> str:
     print("9) List unlisted domains for sale")
     print("10) Cancel active domain listings")
     print("11) Daily quest: $5+ swap on any domain token")
-    print("12) Season quest: add $10 liquidity to a domain token")
-    print("13) Season quest: add $50 liquidity to a domain token")
-    print("14) Season quest: bridge a domain from Doma to Base")
-    print("15) Season quest: mint 5 domain NFTs")
-    print("16) Season quest: stake 3 subdomains")
-    print("17) Exit")
-    return input("Select [1-17]: ").strip()
+    print("12) Season quest: bridge a domain from Doma to Base")
+    print("13) Exit")
+    return input("Select [1-13]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -5937,20 +5933,6 @@ def main() -> None:
                     input("\nPress Enter to return to menu...")
             return
         if choice == "12":
-            _run_not_implemented_quest(
-                logger,
-                "Add at least $10 in liquidity to a domain token",
-                "the codebase has only close/decrease/collect position logic; it does not have Uniswap V3 mint/increase-liquidity yet.",
-            )
-            return
-        if choice == "13":
-            _run_not_implemented_quest(
-                logger,
-                "Add at least $50 in liquidity to a domain token",
-                "the codebase has only close/decrease/collect position logic; it does not have Uniswap V3 mint/increase-liquidity yet.",
-            )
-            return
-        if choice == "14":
             validate_config(cfg)
             try:
                 run_domain_bridge_to_base_once(cfg, logger, state)
@@ -5959,20 +5941,6 @@ def main() -> None:
                 logger.exception("Domain bridge to Base failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
-            return
-        if choice == "15":
-            _run_not_implemented_quest(
-                logger,
-                "Mint 5 domain NFTs",
-                "registrar/checkout flow for domain NFT minting is not implemented.",
-            )
-            return
-        if choice == "16":
-            _run_not_implemented_quest(
-                logger,
-                "Stake 3 subdomains",
-                "subdomain staking contract/API is not implemented.",
-            )
             return
         logger.info("Exit selected.")
         return
