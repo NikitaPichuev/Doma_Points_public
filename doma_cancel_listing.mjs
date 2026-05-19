@@ -95,10 +95,7 @@ async function cancelListingOffChainDirect({ signer, chainId, orderId, baseUrl, 
 
   await postCancelWithRetry(apiClient, {
     orderId,
-    signature: {
-      orderHash: orderId,
-      signature,
-    },
+    signature,
   });
 
   return {
