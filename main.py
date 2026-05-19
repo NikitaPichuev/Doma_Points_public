@@ -5684,10 +5684,9 @@ def get_menu_choice() -> str:
     print("8) Domain quest volume")
     print("9) List unlisted domains for sale")
     print("10) Cancel active domain listings")
-    print("11) Daily quest: $5+ swap on any domain token")
-    print("12) Season quest: bridge a domain from Doma to Base")
-    print("13) Exit")
-    return input("Select [1-13]: ").strip()
+    print("11) Season quest: bridge a domain from Doma to Base")
+    print("12) Exit")
+    return input("Select [1-12]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -5918,21 +5917,6 @@ def main() -> None:
                     input("\nPress Enter to return to menu...")
             return
         if choice == "11":
-            validate_config(cfg)
-            try:
-                domain_name = get_domain_quest_token_choice()
-                if not domain_name:
-                    logger.info("Daily domain swap quest canceled by user.")
-                    return
-                print(f"\nDaily swap quest selected: {domain_name} target=$5")
-                run_domain_quest_volume_once(cfg, logger, state, preset=(domain_name, "95", "99", "5", "ETH"))
-                save_state(cfg.state_file, state)
-            except Exception as exc:
-                logger.exception("Daily domain swap quest failed: %s", exc)
-                if sys.stdin.isatty():
-                    input("\nPress Enter to return to menu...")
-            return
-        if choice == "12":
             validate_config(cfg)
             try:
                 run_domain_bridge_to_base_once(cfg, logger, state)
