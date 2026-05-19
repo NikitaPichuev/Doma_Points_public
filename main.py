@@ -5855,8 +5855,9 @@ def get_menu_choice() -> str:
     print("9) List unlisted domains for sale")
     print("10) Cancel active domain listings")
     print("11) Buy $0.01 cheap tokens + claim subdomain")
-    print("12) Exit")
-    return input("Select [1-12]: ").strip()
+    print("12) Season quest: bridge a domain from Doma to Base")
+    print("13) Exit")
+    return input("Select [1-13]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -6093,6 +6094,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Cheap token buy failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "12":
+            validate_config(cfg)
+            try:
+                run_domain_bridge_to_base_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain bridge to Base failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return
