@@ -3171,11 +3171,13 @@ def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str, str]
 
 
 
-def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
+def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str]]:
     print("\nBuy cheap domain tokens and claim subdomains:")
     max_price_raw = input("Maximum token price USD [0.01]: ").strip() or "0.01"
-    buy_amount_raw = input("USDC.E amount per buy [0.01]: ").strip() or "0.01"
-    tokens_raw = input("Tokens to buy per wallet [1]: ").strip() or "1"
+    buy_amount_min_raw = input("Minimum USDC.E amount per buy [0.01]: ").strip() or "0.01"
+    buy_amount_max_raw = input("Maximum USDC.E amount per buy [0.01]: ").strip() or "0.01"
+    tokens_min_raw = input("Minimum tokens to buy per wallet [1]: ").strip() or "1"
+    tokens_max_raw = input("Maximum tokens to buy per wallet [1]: ").strip() or "1"
     delay_min_raw = input(f"Minimum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
     delay_max_raw = input(f"Maximum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
     if not delay_min_raw:
@@ -3183,21 +3185,40 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str]]
     if not delay_max_raw:
         delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
     max_price = _parse_decimal_input(max_price_raw)
-    buy_amount = _parse_decimal_input(buy_amount_raw)
-    tokens_per_wallet = int(_parse_decimal_input(tokens_raw))
+    buy_amount_min = _parse_decimal_input(buy_amount_min_raw)
+    buy_amount_max = _parse_decimal_input(buy_amount_max_raw)
+    tokens_min = int(_parse_decimal_input(tokens_min_raw))
+    tokens_max = int(_parse_decimal_input(tokens_max_raw))
     delay_min = _parse_decimal_input(delay_min_raw)
     delay_max = _parse_decimal_input(delay_max_raw)
     if max_price <= 0:
         raise ValueError("Maximum token price must be > 0")
-    if buy_amount <= 0:
-        raise ValueError("USDC.E buy amount must be > 0")
-    if tokens_per_wallet <= 0:
-        raise ValueError("Tokens to buy per wallet must be > 0")
+    if buy_amount_min <= 0 or buy_amount_max <= 0:
+        raise ValueError("USDC.E buy amounts must be > 0")
+    if buy_amount_max < buy_amount_min:
+        raise ValueError("Maximum USDC.E buy amount cannot be lower than minimum")
+    if tokens_min <= 0 or tokens_max <= 0:
+        raise ValueError("Token counts per wallet must be > 0")
+    if tokens_max < tokens_min:
+        raise ValueError("Maximum tokens per wallet cannot be lower than minimum")
     if delay_min < 0 or delay_max < 0:
         raise ValueError("Buy delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum buy delay cannot be lower than minimum delay")
-    return max_price_raw, buy_amount_raw, str(tokens_per_wallet), delay_min_raw, delay_max_raw
+    return max_price_raw, buy_amount_min_raw, buy_amount_max_raw, str(tokens_min), str(tokens_max), delay_min_raw, delay_max_raw
+
+
+def _random_decimal_between(min_value: Decimal, max_value: Decimal, min_raw: str, max_raw: str) -> Decimal:
+    if min_value == max_value:
+        return min_value
+    precision = max(_decimal_places_from_raw(min_raw), _decimal_places_from_raw(max_raw), 2)
+    precision = min(precision, 8)
+    step = Decimal(1).scaleb(-precision)
+    min_units = int((min_value / step).to_integral_value(rounding=ROUND_CEILING))
+    max_units = int((max_value / step).to_integral_value(rounding=ROUND_FLOOR))
+    if max_units < min_units:
+        return min_value
+    return (Decimal(random.randint(min_units, max_units)) * step).quantize(step)
 
 def _random_listing_price(min_price: Decimal, max_price: Decimal) -> Decimal:
     if min_price == max_price:
@@ -3815,10 +3836,12 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     if not picked:
         logger.info("[CHEAP_BUY] mode canceled by user.")
         return
-    max_price_raw, buy_amount_raw, tokens_raw, delay_min_raw, delay_max_raw = picked
+    max_price_raw, buy_amount_min_raw, buy_amount_max_raw, tokens_min_raw, tokens_max_raw, delay_min_raw, delay_max_raw = picked
     max_price_usd = _parse_decimal_input(max_price_raw)
-    buy_amount_usdc = _parse_decimal_input(buy_amount_raw)
-    tokens_per_wallet = int(_parse_decimal_input(tokens_raw))
+    buy_amount_min_usdc = _parse_decimal_input(buy_amount_min_raw)
+    buy_amount_max_usdc = _parse_decimal_input(buy_amount_max_raw)
+    tokens_min_per_wallet = int(_parse_decimal_input(tokens_min_raw))
+    tokens_max_per_wallet = int(_parse_decimal_input(tokens_max_raw))
     delay_min = _parse_decimal_input(delay_min_raw)
     delay_max = _parse_decimal_input(delay_max_raw)
 
@@ -3827,7 +3850,18 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         raise RuntimeError("No wallet/private-key pairs available for cheap token buy")
     wallet_key_records, start_wallet, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
     quote_token = _usdce_token_from_config(cfg)
-    logger.info("[CHEAP_BUY] mode started | wallets=%s | start_wallet=%s | max_price<$%s | buy_amount=%s USDC.E | tokens_per_wallet=%s | delay=%s-%s sec", total_loaded_wallets, start_wallet, _format_decimal_plain(max_price_usd), _format_decimal_plain(buy_amount_usdc), tokens_per_wallet, _format_decimal_plain(delay_min), _format_decimal_plain(delay_max))
+    logger.info(
+        "[CHEAP_BUY] mode started | wallets=%s | start_wallet=%s | max_price<$%s | buy_amount=%s-%s USDC.E | tokens_per_wallet=%s-%s | delay=%s-%s sec",
+        total_loaded_wallets,
+        start_wallet,
+        _format_decimal_plain(max_price_usd),
+        _format_decimal_plain(buy_amount_min_usdc),
+        _format_decimal_plain(buy_amount_max_usdc),
+        tokens_min_per_wallet,
+        tokens_max_per_wallet,
+        _format_decimal_plain(delay_min),
+        _format_decimal_plain(delay_max),
+    )
 
     success_wallets = failed_wallets = skipped_wallets = 0
     buy_success_count = buy_failed_count = 0
@@ -3843,6 +3877,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         try:
             doma_api = DomaApiClient(cfg.doma_api_url, api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys], proxies=proxies)
             catalog = doma_api.fetch_fractional_tokens(take=250, max_pages=10)
+            tokens_per_wallet = random.randint(tokens_min_per_wallet, tokens_max_per_wallet)
             selected_tokens = _eligible_cheap_tokens(catalog, quote_token, max_price_usd)[:tokens_per_wallet]
             if not selected_tokens:
                 skipped_wallets += 1
@@ -3851,13 +3886,20 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
             usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-            if usdc_balance < buy_amount_usdc:
+            if usdc_balance < buy_amount_min_usdc:
                 skipped_wallets += 1
-                logger.warning("[CHEAP_BUY] wallet=%s skipped | USDC.E balance below buy amount (%s < %s)", wallet, _format_decimal_plain(usdc_balance), _format_decimal_plain(buy_amount_usdc))
+                logger.warning("[CHEAP_BUY] wallet=%s skipped | USDC.E balance below minimum buy amount (%s < %s)", wallet, _format_decimal_plain(usdc_balance), _format_decimal_plain(buy_amount_min_usdc))
                 continue
             wallet_success = wallet_failed = 0
             for token_idx, info in enumerate(selected_tokens, start=1):
                 domain_token = _token_from_launchpad_price(info, eth_price)
+                buy_amount_usdc = _random_decimal_between(buy_amount_min_usdc, buy_amount_max_usdc, buy_amount_min_raw, buy_amount_max_raw)
+                current_usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                if current_usdc_balance < buy_amount_usdc:
+                    wallet_failed += 1
+                    buy_failed_count += 1
+                    logger.warning("[CHEAP_BUY] wallet=%s token=%s skipped | USDC.E balance below selected buy amount (%s < %s)", wallet, domain_token.symbol, _format_decimal_plain(current_usdc_balance), _format_decimal_plain(buy_amount_usdc))
+                    break
                 expected_tokens = (buy_amount_usdc / info.price_usd) if info.price_usd > 0 else Decimal("0")
                 logger.info("[CHEAP_BUY] wallet=%s token %s/%s %s | token_price=$%s | buy=%s USDC.E | expected~%s %s", wallet, token_idx, len(selected_tokens), domain_token.symbol, _format_decimal_plain(info.price_usd), _format_decimal_plain(buy_amount_usdc), _format_decimal_plain(expected_tokens), domain_token.symbol)
                 ok = _execute_trade_via_doma_ui_route(cfg=cfg, logger=logger, state=state, doma_api=doma_api, exec_client=exec_client, token_in=quote_token, token_out=domain_token, display_in_symbol="USDC.E", display_out_symbol=domain_token.symbol, trade_amount_expr=f"${_format_decimal_plain(buy_amount_usdc)}", eth_price=eth_price, label=f"CHEAP_BUY {wallet} USDC.E>{domain_token.symbol}", wait_for_pre_tx=True)
