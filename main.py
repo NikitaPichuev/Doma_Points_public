@@ -1923,6 +1923,19 @@ def _token_from_config_override(cfg: BotConfig, symbol: str, decimals: int) -> T
     )
 
 
+
+
+def _usdce_token_from_config(cfg: BotConfig) -> Token:
+    address = cfg.token_address_overrides.get("USDC.E") or cfg.token_address_overrides.get("USDC")
+    if not address:
+        raise RuntimeError("USDC.E token address not found in contracts.json")
+    return Token(
+        address=address.lower(),
+        symbol="USDC.E",
+        decimals=6,
+        derived_eth=Decimal("0"),
+    )
+
 def _fetch_eth_price_via_doma_quote(cfg: BotConfig, doma_api: DomaApiClient, quote_token: Token) -> Decimal:
     quote = doma_api.fetch_universal_router_quote(
         token_in_address=DOMA_NATIVE_TOKEN_SENTINEL,
@@ -3156,6 +3169,36 @@ def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str, str]
     return selection, str(domains_per_wallet), delay_min_raw, delay_max_raw
 
 
+
+
+def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
+    print("\nBuy cheap domain tokens and claim subdomains:")
+    max_price_raw = input("Maximum token price USD [0.01]: ").strip() or "0.01"
+    buy_amount_raw = input("USDC.E amount per buy [0.01]: ").strip() or "0.01"
+    tokens_raw = input("Tokens to buy per wallet [1]: ").strip() or "1"
+    delay_min_raw = input(f"Minimum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    max_price = _parse_decimal_input(max_price_raw)
+    buy_amount = _parse_decimal_input(buy_amount_raw)
+    tokens_per_wallet = int(_parse_decimal_input(tokens_raw))
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if max_price <= 0:
+        raise ValueError("Maximum token price must be > 0")
+    if buy_amount <= 0:
+        raise ValueError("USDC.E buy amount must be > 0")
+    if tokens_per_wallet <= 0:
+        raise ValueError("Tokens to buy per wallet must be > 0")
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Buy delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum buy delay cannot be lower than minimum delay")
+    return max_price_raw, buy_amount_raw, str(tokens_per_wallet), delay_min_raw, delay_max_raw
+
 def _random_listing_price(min_price: Decimal, max_price: Decimal) -> Decimal:
     if min_price == max_price:
         return min_price.quantize(Decimal("0.1"))
@@ -3731,6 +3774,133 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         skipped_wallets,
         failed_wallet_addresses,
     )
+
+
+
+def _random_subdomain_label(length: int = 32) -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
+    return "".join(random.choice(alphabet) for _ in range(max(1, length)))
+
+
+def _pick_available_subdomain_label(exec_client: EvmExecutionClient, token_address: str, min_length: int = 32) -> str:
+    for _ in range(20):
+        label = _random_subdomain_label(min_length)
+        if exec_client.is_subdomain_claim_available(token_address, label):
+            return label
+    raise RuntimeError("Unable to find available subdomain label")
+
+
+def _eligible_cheap_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token, max_price_usd: Decimal) -> List[LaunchpadTokenInfo]:
+    quote_address = quote_token.address.lower()
+    eligible: List[LaunchpadTokenInfo] = []
+    seen: set[str] = set()
+    for token in catalog:
+        address = (token.address or "").strip().lower()
+        if not address or address in seen:
+            continue
+        if token.price_usd <= 0 or token.price_usd >= max_price_usd:
+            continue
+        if (token.quote_token_address or "").strip().lower() != quote_address:
+            continue
+        if not token.pool_address:
+            continue
+        seen.add(address)
+        eligible.append(token)
+    random.shuffle(eligible)
+    return eligible
+
+
+def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    picked = get_cheap_token_buy_menu_input()
+    if not picked:
+        logger.info("[CHEAP_BUY] mode canceled by user.")
+        return
+    max_price_raw, buy_amount_raw, tokens_raw, delay_min_raw, delay_max_raw = picked
+    max_price_usd = _parse_decimal_input(max_price_raw)
+    buy_amount_usdc = _parse_decimal_input(buy_amount_raw)
+    tokens_per_wallet = int(_parse_decimal_input(tokens_raw))
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "CHEAP_BUY")
+    if not wallet_key_records:
+        raise RuntimeError("No wallet/private-key pairs available for cheap token buy")
+    wallet_key_records, start_wallet, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
+    quote_token = _usdce_token_from_config(cfg)
+    logger.info("[CHEAP_BUY] mode started | wallets=%s | start_wallet=%s | max_price<$%s | buy_amount=%s USDC.E | tokens_per_wallet=%s | delay=%s-%s sec", total_loaded_wallets, start_wallet, _format_decimal_plain(max_price_usd), _format_decimal_plain(buy_amount_usdc), tokens_per_wallet, _format_decimal_plain(delay_min), _format_decimal_plain(delay_max))
+
+    success_wallets = failed_wallets = skipped_wallets = 0
+    buy_success_count = buy_failed_count = 0
+    subdomain_success_count = subdomain_failed_count = 0
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "CHEAP_BUY")
+        logger.info("[CHEAP_BUY] wallet %s", _wallet_progress_label(start_wallet + idx - 2, total_loaded_wallets, wallet))
+        if skip_wallet or not proxies:
+            skipped_wallets += 1
+            logger.warning("[CHEAP_BUY] wallet=%s skipped: proxy is required for cheap token buy", wallet)
+            continue
+        try:
+            doma_api = DomaApiClient(cfg.doma_api_url, api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys], proxies=proxies)
+            catalog = doma_api.fetch_fractional_tokens(take=250, max_pages=10)
+            selected_tokens = _eligible_cheap_tokens(catalog, quote_token, max_price_usd)[:tokens_per_wallet]
+            if not selected_tokens:
+                skipped_wallets += 1
+                logger.info("[CHEAP_BUY] wallet=%s no eligible tokens | catalog=%s | max_price<$%s | proxy=yes", wallet, len(catalog), _format_decimal_plain(max_price_usd))
+                continue
+            exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
+            eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+            usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+            if usdc_balance < buy_amount_usdc:
+                skipped_wallets += 1
+                logger.warning("[CHEAP_BUY] wallet=%s skipped | USDC.E balance below buy amount (%s < %s)", wallet, _format_decimal_plain(usdc_balance), _format_decimal_plain(buy_amount_usdc))
+                continue
+            wallet_success = wallet_failed = 0
+            for token_idx, info in enumerate(selected_tokens, start=1):
+                domain_token = _token_from_launchpad_price(info, eth_price)
+                expected_tokens = (buy_amount_usdc / info.price_usd) if info.price_usd > 0 else Decimal("0")
+                logger.info("[CHEAP_BUY] wallet=%s token %s/%s %s | token_price=$%s | buy=%s USDC.E | expected~%s %s", wallet, token_idx, len(selected_tokens), domain_token.symbol, _format_decimal_plain(info.price_usd), _format_decimal_plain(buy_amount_usdc), _format_decimal_plain(expected_tokens), domain_token.symbol)
+                ok = _execute_trade_via_doma_ui_route(cfg=cfg, logger=logger, state=state, doma_api=doma_api, exec_client=exec_client, token_in=quote_token, token_out=domain_token, display_in_symbol="USDC.E", display_out_symbol=domain_token.symbol, trade_amount_expr=f"${_format_decimal_plain(buy_amount_usdc)}", eth_price=eth_price, label=f"CHEAP_BUY {wallet} USDC.E>{domain_token.symbol}", wait_for_pre_tx=True)
+                if ok:
+                    buy_success_count += 1
+                    wallet_success += 1
+                    try:
+                        prices_raw = exec_client.get_subdomain_staking_prices(domain_token.address)
+                        label_length = max(32, len(prices_raw) if prices_raw else 32)
+                        label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
+                        label_price_index = 0 if len(prices_raw) == 1 else min(len(label) - 1, len(prices_raw) - 1)
+                        required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
+                        logger.info("[CHEAP_BUY] wallet=%s subdomain claim | %s.%s | required=%s %s", wallet, label, info.name, _format_decimal_plain(required_amount), domain_token.symbol)
+                        approve_hash, stake_hash, subdomain_id, dns_hash = exec_client.claim_subdomain_and_set_dns(domain_token.address, label, wallet)
+                        if approve_hash:
+                            logger.info("[CHEAP_BUY] wallet=%s subdomain approve tx sent: %s", wallet, approve_hash)
+                        logger.info("[CHEAP_BUY] wallet=%s subdomain stake tx sent: %s | subdomain_id=%s", wallet, stake_hash, subdomain_id if subdomain_id is not None else "unknown")
+                        if dns_hash:
+                            logger.info("[CHEAP_BUY] wallet=%s subdomain DNS save tx sent: %s", wallet, dns_hash)
+                        subdomain_success_count += 1
+                    except Exception as exc:
+                        subdomain_failed_count += 1
+                        logger.warning("[CHEAP_BUY] wallet=%s token=%s subdomain claim/save failed: %s", wallet, domain_token.symbol, exc)
+                else:
+                    buy_failed_count += 1
+                    wallet_failed += 1
+                if token_idx < len(selected_tokens):
+                    delay_sec = random.uniform(float(delay_min), float(delay_max))
+                    logger.info("[CHEAP_BUY] delay before next token: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+            if wallet_success > 0:
+                success_wallets += 1
+            elif wallet_failed > 0:
+                failed_wallets += 1
+        except Exception as exc:
+            failed_wallets += 1
+            logger.warning("[CHEAP_BUY] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records):
+            delay_sec = random.uniform(float(delay_min), float(delay_max))
+            logger.info("[CHEAP_BUY] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+    logger.info("[CHEAP_BUY] buys total | success=%s failed=%s | subdomains success=%s failed=%s", buy_success_count, buy_failed_count, subdomain_success_count, subdomain_failed_count)
+    _print_mode_summary("CHEAP_BUY", total=len(wallet_key_records), success=success_wallets, failed=failed_wallets, skipped=skipped_wallets)
 
 
 def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -5684,7 +5854,7 @@ def get_menu_choice() -> str:
     print("8) Domain quest volume")
     print("9) List unlisted domains for sale")
     print("10) Cancel active domain listings")
-    print("11) Season quest: bridge a domain from Doma to Base")
+    print("11) Buy $0.01 cheap tokens + claim subdomain")
     print("12) Exit")
     return input("Select [1-12]: ").strip()
 
@@ -5919,10 +6089,10 @@ def main() -> None:
         if choice == "11":
             validate_config(cfg)
             try:
-                run_domain_bridge_to_base_once(cfg, logger, state)
+                run_cheap_token_buy_once(cfg, logger, state)
                 save_state(cfg.state_file, state)
             except Exception as exc:
-                logger.exception("Domain bridge to Base failed: %s", exc)
+                logger.exception("Cheap token buy failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

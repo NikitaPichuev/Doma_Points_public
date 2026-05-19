@@ -22,6 +22,8 @@ PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 MAX_UINT256 = (1 << 256) - 1
 MAX_UINT160 = (1 << 160) - 1
 MAX_UINT48 = (1 << 48) - 1
+DOMA_FRACTIONALIZATION_ADDRESS = "0xd00000000004f450f1438cfA436587d8f8A55A29"
+PROXY_DOMA_RECORD_ADDRESS = "0xd0000000000067CB44aE7b6aC3AB5764dE20A3E2"
 
 
 ERC20_ABI = [
@@ -121,6 +123,76 @@ PROXY_DOMA_RECORD_ABI = [
         "name": "isTargetChainSupported",
         "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
         "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "string", "name": "label", "type": "string"}],
+        "name": "isLabelForbidden",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "subdomainId", "type": "uint256"},
+            {"internalType": "string", "name": "host", "type": "string"},
+            {"internalType": "string", "name": "recordType", "type": "string"},
+            {"internalType": "uint32", "name": "ttl", "type": "uint32"},
+            {"internalType": "string[]", "name": "records", "type": "string[]"},
+        ],
+        "name": "setDNSRRSet",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI = [
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "uint256", "name": "subdomainId", "type": "uint256"},
+            {"indexed": True, "internalType": "address", "name": "fractionalToken", "type": "address"},
+            {"indexed": True, "internalType": "address", "name": "staker", "type": "address"},
+            {"indexed": False, "internalType": "string", "name": "label", "type": "string"},
+            {"indexed": False, "internalType": "uint256", "name": "amount", "type": "uint256"},
+        ],
+        "name": "SubdomainStaked",
+        "type": "event",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "fractionalToken", "type": "address"}],
+        "name": "getSubdomainStakingPrices",
+        "outputs": [{"internalType": "uint256[]", "name": "prices", "type": "uint256[]"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "fractionalToken", "type": "address"}],
+        "name": "isSubdomainMintingAllowed",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "fractionalToken", "type": "address"},
+            {"internalType": "string", "name": "label", "type": "string"},
+        ],
+        "name": "isSubdomainTaken",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "fractionalToken", "type": "address"},
+            {"internalType": "string", "name": "label", "type": "string"},
+            {"internalType": "string[]", "name": "records", "type": "string[]"},
+        ],
+        "name": "stakeForSubdomain",
+        "outputs": [],
+        "stateMutability": "nonpayable",
         "type": "function",
     },
 ]
@@ -1590,6 +1662,110 @@ class EvmExecutionClient:
         }
         tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
         return self._send_tx(tx)
+
+    def get_subdomain_staking_prices(self, fractional_token_address: str) -> List[int]:
+        contract = self.web3.eth.contract(
+            address=Web3.to_checksum_address(DOMA_FRACTIONALIZATION_ADDRESS),
+            abi=DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI,
+        )
+        return [int(value) for value in contract.functions.getSubdomainStakingPrices(
+            Web3.to_checksum_address(fractional_token_address)
+        ).call()]
+
+    def is_subdomain_claim_available(self, fractional_token_address: str, label: str) -> bool:
+        fractionalization = self.web3.eth.contract(
+            address=Web3.to_checksum_address(DOMA_FRACTIONALIZATION_ADDRESS),
+            abi=DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI,
+        )
+        proxy_record = self.web3.eth.contract(
+            address=Web3.to_checksum_address(PROXY_DOMA_RECORD_ADDRESS),
+            abi=PROXY_DOMA_RECORD_ABI,
+        )
+        if not bool(fractionalization.functions.isSubdomainMintingAllowed(
+            Web3.to_checksum_address(fractional_token_address)
+        ).call()):
+            return False
+        try:
+            if bool(proxy_record.functions.isLabelForbidden(label.lower()).call()):
+                return False
+        except Exception:
+            pass
+        return not bool(fractionalization.functions.isSubdomainTaken(
+            Web3.to_checksum_address(fractional_token_address),
+            label.lower(),
+        ).call())
+
+    def claim_subdomain_and_set_dns(
+        self,
+        fractional_token_address: str,
+        label: str,
+        dns_wallet_address: str,
+    ) -> Tuple[Optional[str], str, Optional[int], Optional[str]]:
+        fractional_token = Web3.to_checksum_address(fractional_token_address)
+        label = label.lower().strip()
+        if not label:
+            raise RuntimeError("Subdomain label is empty")
+        fractionalization = self.web3.eth.contract(
+            address=Web3.to_checksum_address(DOMA_FRACTIONALIZATION_ADDRESS),
+            abi=DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI,
+        )
+        prices = [int(value) for value in fractionalization.functions.getSubdomainStakingPrices(fractional_token).call()]
+        if not prices:
+            raise RuntimeError("Subdomain staking prices are not configured")
+        if not bool(fractionalization.functions.isSubdomainMintingAllowed(fractional_token).call()):
+            raise RuntimeError("Subdomain minting is not enabled for this token")
+        label_price_index = 0 if len(prices) == 1 else min(len(label) - 1, len(prices) - 1)
+        if label_price_index < 0:
+            raise RuntimeError("Subdomain label length is invalid")
+        staking_amount_raw = int(prices[label_price_index])
+        if bool(fractionalization.functions.isSubdomainTaken(fractional_token, label).call()):
+            raise RuntimeError(f"Subdomain label already taken: {label}")
+
+        approve_hash = self.ensure_allowance(
+            fractional_token,
+            staking_amount_raw,
+            spender_address=DOMA_FRACTIONALIZATION_ADDRESS,
+            approve_max=False,
+        )
+        if approve_hash:
+            self.web3.eth.wait_for_transaction_receipt(approve_hash, timeout=180, poll_latency=2)
+
+        stake_tx = fractionalization.functions.stakeForSubdomain(
+            fractional_token,
+            label,
+            [],
+        ).build_transaction(self._base_tx())
+        stake_tx["gas"] = int(self.web3.eth.estimate_gas(stake_tx) * 1.2)
+        stake_hash = self._send_tx(stake_tx)
+        receipt = self.web3.eth.wait_for_transaction_receipt(stake_hash, timeout=180, poll_latency=2)
+
+        subdomain_id: Optional[int] = None
+        try:
+            events = fractionalization.events.SubdomainStaked().process_receipt(receipt)
+            if events:
+                subdomain_id = int(events[0]["args"]["subdomainId"])
+        except Exception:
+            subdomain_id = None
+
+        dns_hash: Optional[str] = None
+        if subdomain_id is not None:
+            proxy_record = self.web3.eth.contract(
+                address=Web3.to_checksum_address(PROXY_DOMA_RECORD_ADDRESS),
+                abi=PROXY_DOMA_RECORD_ABI,
+            )
+            record = f'"ENS1 dnsname.ens.eth {Web3.to_checksum_address(dns_wallet_address)}"'
+            dns_tx = proxy_record.functions.setDNSRRSet(
+                int(subdomain_id),
+                "",
+                "TXT",
+                3600,
+                [record],
+            ).build_transaction(self._base_tx())
+            dns_tx["gas"] = int(self.web3.eth.estimate_gas(dns_tx) * 1.2)
+            dns_hash = self._send_tx(dns_tx)
+            self.web3.eth.wait_for_transaction_receipt(dns_hash, timeout=180, poll_latency=2)
+
+        return approve_hash, stake_hash, subdomain_id, dns_hash
 
     def execute_domain_bridge(
         self,
