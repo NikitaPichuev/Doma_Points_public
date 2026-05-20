@@ -255,7 +255,12 @@ def _resolve_amount_raw_via_config(
             raise ValueError("Percent amount > 100")
         spendable_raw = bal_raw
         if token.address == NATIVE_ETH:
-            if eth_price_usd > 0:
+            native_reserve_by_chain = {
+                5000: Decimal("0.2"),  # Mantle gas is paid in MNT, not ETH-priced ETH.
+            }
+            if src_chain_id in native_reserve_by_chain:
+                reserve_dec = native_reserve_by_chain[src_chain_id]
+            elif eth_price_usd > 0:
                 reserve_dec = Decimal("0.05") / eth_price_usd
             else:
                 reserve_dec = Decimal("0.00002")
