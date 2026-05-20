@@ -3171,13 +3171,15 @@ def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str, str]
 
 
 
-def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str]]:
+def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str, str, str]]:
     print("\nBuy cheap domain tokens and claim subdomains:")
     max_price_raw = input("Maximum token price USD [0.01]: ").strip() or "0.01"
     buy_amount_min_raw = input("Minimum USDC.E amount per buy [0.01]: ").strip() or "0.01"
     buy_amount_max_raw = input("Maximum USDC.E amount per buy [0.01]: ").strip() or "0.01"
     tokens_min_raw = input("Minimum tokens to buy per wallet [1]: ").strip() or "1"
     tokens_max_raw = input("Maximum tokens to buy per wallet [1]: ").strip() or "1"
+    subdomains_min_raw = input("Minimum subdomains to claim per token [1]: ").strip() or "1"
+    subdomains_max_raw = input("Maximum subdomains to claim per token [1]: ").strip() or "1"
     delay_min_raw = input(f"Minimum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
     delay_max_raw = input(f"Maximum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
     if not delay_min_raw:
@@ -3189,6 +3191,8 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
     buy_amount_max = _parse_decimal_input(buy_amount_max_raw)
     tokens_min = int(_parse_decimal_input(tokens_min_raw).to_integral_value(rounding=ROUND_FLOOR))
     tokens_max = int(_parse_decimal_input(tokens_max_raw).to_integral_value(rounding=ROUND_CEILING))
+    subdomains_min = int(_parse_decimal_input(subdomains_min_raw).to_integral_value(rounding=ROUND_FLOOR))
+    subdomains_max = int(_parse_decimal_input(subdomains_max_raw).to_integral_value(rounding=ROUND_CEILING))
     delay_min = _parse_decimal_input(delay_min_raw)
     delay_max = _parse_decimal_input(delay_max_raw)
     if max_price <= 0:
@@ -3201,11 +3205,15 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
         raise ValueError("Token counts per wallet must be > 0")
     if tokens_max < tokens_min:
         raise ValueError("Maximum tokens per wallet cannot be lower than minimum")
+    if subdomains_min <= 0 or subdomains_max <= 0:
+        raise ValueError("Subdomain counts per token must be > 0")
+    if subdomains_max < subdomains_min:
+        raise ValueError("Maximum subdomains per token cannot be lower than minimum")
     if delay_min < 0 or delay_max < 0:
         raise ValueError("Buy delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum buy delay cannot be lower than minimum delay")
-    return max_price_raw, buy_amount_min_raw, buy_amount_max_raw, str(tokens_min), str(tokens_max), delay_min_raw, delay_max_raw
+    return max_price_raw, buy_amount_min_raw, buy_amount_max_raw, str(tokens_min), str(tokens_max), str(subdomains_min), str(subdomains_max), delay_min_raw, delay_max_raw
 
 
 def _random_decimal_between(min_value: Decimal, max_value: Decimal, min_raw: str, max_raw: str) -> Decimal:
@@ -3911,12 +3919,14 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     if not picked:
         logger.info("[CHEAP_BUY] mode canceled by user.")
         return
-    max_price_raw, buy_amount_min_raw, buy_amount_max_raw, tokens_min_raw, tokens_max_raw, delay_min_raw, delay_max_raw = picked
+    max_price_raw, buy_amount_min_raw, buy_amount_max_raw, tokens_min_raw, tokens_max_raw, subdomains_min_raw, subdomains_max_raw, delay_min_raw, delay_max_raw = picked
     max_price_usd = _parse_decimal_input(max_price_raw)
     buy_amount_min_usdc = _parse_decimal_input(buy_amount_min_raw)
     buy_amount_max_usdc = _parse_decimal_input(buy_amount_max_raw)
     tokens_min_per_wallet = int(_parse_decimal_input(tokens_min_raw).to_integral_value(rounding=ROUND_FLOOR))
     tokens_max_per_wallet = int(_parse_decimal_input(tokens_max_raw).to_integral_value(rounding=ROUND_CEILING))
+    subdomains_min_per_token = int(_parse_decimal_input(subdomains_min_raw).to_integral_value(rounding=ROUND_FLOOR))
+    subdomains_max_per_token = int(_parse_decimal_input(subdomains_max_raw).to_integral_value(rounding=ROUND_CEILING))
     delay_min = _parse_decimal_input(delay_min_raw)
     delay_max = _parse_decimal_input(delay_max_raw)
 
@@ -3927,7 +3937,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     quote_token = _usdce_token_from_config(cfg)
     weth_token = _token_from_config_override(cfg, "WETH", 18)
     logger.info(
-        "[CHEAP_BUY] mode started | wallets=%s | start_wallet=%s | max_price<$%s | buy_amount=%s-%s USDC.E | tokens_per_wallet=%s-%s | delay=%s-%s sec",
+        "[CHEAP_BUY] mode started | wallets=%s | start_wallet=%s | max_price<$%s | buy_amount=%s-%s USDC.E | tokens_per_wallet=%s-%s | subdomains_per_token=%s-%s | delay=%s-%s sec",
         total_loaded_wallets,
         wallet_start_offset + 1,
         _format_decimal_plain(max_price_usd),
@@ -3935,6 +3945,8 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         _format_decimal_plain(buy_amount_max_usdc),
         tokens_min_per_wallet,
         tokens_max_per_wallet,
+        subdomains_min_per_token,
+        subdomains_max_per_token,
         _format_decimal_plain(delay_min),
         _format_decimal_plain(delay_max),
     )
@@ -4021,18 +4033,33 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     wallet_success += 1
                     try:
                         prices_raw = exec_client.get_subdomain_staking_prices(domain_token.address)
-                        label_length = max(32, len(prices_raw) if prices_raw else 32)
-                        label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
-                        label_price_index = 0 if len(prices_raw) == 1 else min(len(label) - 1, len(prices_raw) - 1)
-                        required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
-                        logger.info("[CHEAP_BUY] wallet=%s subdomain claim | %s.%s | required=%s %s", wallet, label, info.name, _format_decimal_plain(required_amount), domain_token.symbol)
-                        approve_hash, stake_hash, subdomain_id, dns_hash = exec_client.claim_subdomain_and_set_dns(domain_token.address, label, wallet)
-                        if approve_hash:
-                            logger.info("[CHEAP_BUY] wallet=%s subdomain approve tx sent: %s", wallet, approve_hash)
-                        logger.info("[CHEAP_BUY] wallet=%s subdomain stake tx sent: %s | subdomain_id=%s", wallet, stake_hash, subdomain_id if subdomain_id is not None else "unknown")
-                        if dns_hash:
-                            logger.info("[CHEAP_BUY] wallet=%s subdomain DNS save tx sent: %s", wallet, dns_hash)
-                        subdomain_success_count += 1
+                        subdomains_to_claim = random.randint(subdomains_min_per_token, subdomains_max_per_token)
+                        for sub_idx in range(1, subdomains_to_claim + 1):
+                            label_length = max(32, len(prices_raw) if prices_raw else 32)
+                            label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
+                            label_price_index = 0 if len(prices_raw) == 1 else min(len(label) - 1, len(prices_raw) - 1)
+                            required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
+                            logger.info(
+                                "[CHEAP_BUY] wallet=%s subdomain %s/%s claim | %s.%s | required=%s %s",
+                                wallet,
+                                sub_idx,
+                                subdomains_to_claim,
+                                label,
+                                info.name,
+                                _format_decimal_plain(required_amount),
+                                domain_token.symbol,
+                            )
+                            approve_hash, stake_hash, subdomain_id, dns_hash = exec_client.claim_subdomain_and_set_dns(domain_token.address, label, wallet)
+                            if approve_hash:
+                                logger.info("[CHEAP_BUY] wallet=%s subdomain approve tx sent: %s", wallet, approve_hash)
+                            logger.info("[CHEAP_BUY] wallet=%s subdomain stake tx sent: %s | subdomain_id=%s", wallet, stake_hash, subdomain_id if subdomain_id is not None else "unknown")
+                            if dns_hash:
+                                logger.info("[CHEAP_BUY] wallet=%s subdomain DNS save tx sent: %s", wallet, dns_hash)
+                            subdomain_success_count += 1
+                            if sub_idx < subdomains_to_claim:
+                                delay_sec = random.uniform(float(delay_min), float(delay_max))
+                                logger.info("[CHEAP_BUY] delay before next subdomain: %.2f sec", delay_sec)
+                                time.sleep(delay_sec)
                     except Exception as exc:
                         subdomain_failed_count += 1
                         logger.warning("[CHEAP_BUY] wallet=%s token=%s subdomain claim/save failed: %s", wallet, domain_token.symbol, exc)
@@ -4056,10 +4083,8 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             time.sleep(delay_sec)
     logger.info("[CHEAP_BUY] buys total | success=%s failed=%s | subdomains success=%s failed=%s", buy_success_count, buy_failed_count, subdomain_success_count, subdomain_failed_count)
     if insufficient_balance_wallets:
-        logger.warning("[CHEAP_BUY] wallets with insufficient balance:")
         print("\n[CHEAP_BUY] wallets with insufficient balance:")
         for entry in insufficient_balance_wallets:
-            logger.warning("[CHEAP_BUY] insufficient balance | %s", entry)
             print(f"  {entry}")
     _print_mode_summary("CHEAP_BUY", total=len(wallet_key_records), success=success_wallets, failed=failed_wallets, skipped=skipped_wallets)
 
