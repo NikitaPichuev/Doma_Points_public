@@ -3376,6 +3376,7 @@ def _run_domain_listing_helper(
     payload = {
         "chainId": cfg.chain_id,
         "rpcUrl": cfg.rpc_url,
+        "rpcUrls": _doma_rpc_candidates(cfg),
         "privateKey": private_key,
         "contract": domain.token_address,
         "tokenId": domain.token_id,
@@ -3421,6 +3422,14 @@ def _run_domain_listing_helper(
                     event.get("state") or event.get("status") or "",
                     tx_hashes,
                 )
+        elif event.get("type") == "rpc_retry":
+            logger.info(
+                "[LIST] wallet=%s domain=%s rpc retry | url=%s | error=%s",
+                wallet,
+                domain.name,
+                event.get("rpc_url") or "",
+                event.get("error") or "",
+            )
         elif not event.get("ok", True):
             logger.warning("[LIST] wallet=%s domain=%s helper error: %s", wallet, domain.name, event.get("error"))
     if result.returncode != 0:
@@ -3532,6 +3541,7 @@ def _run_domain_place_offer_helper(
     payload = {
         "chainId": cfg.chain_id,
         "rpcUrl": cfg.rpc_url,
+        "rpcUrls": _doma_rpc_candidates(cfg),
         "privateKey": private_key,
         "contract": domain.token_address,
         "tokenId": domain.token_id,
@@ -3577,6 +3587,14 @@ def _run_domain_place_offer_helper(
                     event.get("state") or event.get("status") or "",
                     tx_hashes,
                 )
+        elif event.get("type") == "rpc_retry":
+            logger.info(
+                "[OFFER] wallet=%s domain=%s rpc retry | url=%s | error=%s",
+                wallet,
+                domain.name,
+                event.get("rpc_url") or "",
+                event.get("error") or "",
+            )
         elif not event.get("ok", True):
             logger.warning("[OFFER] wallet=%s domain=%s helper error: %s", wallet, domain.name, event.get("error"))
     if result.returncode != 0:

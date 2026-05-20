@@ -29,6 +29,31 @@ function buildDomaChain(chainId, rpcUrl) {
   };
 }
 
+function rpcUrlCandidates(input) {
+  const urls = [];
+  const append = (value) => {
+    const v = String(value || '').trim();
+    if (v && !urls.includes(v)) {
+      urls.push(v);
+    }
+  };
+  if (Array.isArray(input.rpcUrls)) {
+    input.rpcUrls.forEach(append);
+  }
+  append(input.rpcUrl);
+  return urls;
+}
+
+function summarizeError(error) {
+  const text = error && error.stack ? String(error.stack) : String(error);
+  const status = text.match(/server response\s+([0-9]{3}\s+[A-Za-z ]+)/i);
+  const url = text.match(/"requestUrl":\s*"([^"]+)"/i);
+  if (status && url) {
+    return `${status[1].trim()} at ${url[1]}`;
+  }
+  return text.split('\n')[0].slice(0, 600);
+}
+
 function emitProgress(steps) {
   const latest = steps[steps.length - 1];
   if (!latest) {
@@ -87,7 +112,10 @@ async function main() {
   const input = JSON.parse(inputRaw);
 
   const chainId = Number(requireField(input, 'chainId'));
-  const rpcUrl = String(requireField(input, 'rpcUrl'));
+  const rpcUrls = rpcUrlCandidates(input);
+  if (!rpcUrls.length) {
+    throw new Error('Missing required field: rpcUrl');
+  }
   const privateKey = String(requireField(input, 'privateKey'));
   const contract = String(requireField(input, 'contract'));
   const tokenId = String(requireField(input, 'tokenId'));
@@ -110,8 +138,6 @@ async function main() {
     defaultHeaders['x-api-key'] = apiKey;
   }
 
-  const provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: 'doma' });
-  const signer = new ethers.Wallet(privateKey, provider);
   const apiClient = new ApiClient({
     baseUrl,
     defaultHeaders,
@@ -133,23 +159,28 @@ async function main() {
   });
   const marketplaceFees = feeResponse.marketplaceFees || [];
 
-  const config = {
-    source,
-    chains: [buildDomaChain(chainId, rpcUrl)],
-    apiClientOptions: {
-      baseUrl,
-      defaultHeaders,
-    },
-  };
-  const handler = new ListingHandler(
-    config,
-    apiClient,
-    signer,
-    `eip155:${chainId}`,
-    emitProgress,
-  );
+  let lastError = null;
+  for (const rpcUrl of rpcUrls) {
+    try {
+      const provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: 'doma' });
+      const signer = new ethers.Wallet(privateKey, provider);
+      const config = {
+        source,
+        chains: [buildDomaChain(chainId, rpcUrl)],
+        apiClientOptions: {
+          baseUrl,
+          defaultHeaders,
+        },
+      };
+      const handler = new ListingHandler(
+        config,
+        apiClient,
+        signer,
+        `eip155:${chainId}`,
+        emitProgress,
+      );
 
-  const result = await handler.execute({
+      const result = await handler.execute({
       source,
       orderbook: OrderbookType.DOMA,
       cancelExisting: false,
@@ -163,9 +194,16 @@ async function main() {
           duration: durationMs,
         },
       ],
-  });
+      });
 
-  console.log(JSON.stringify({ ok: true, result }));
+      console.log(JSON.stringify({ ok: true, rpcUrl, result }));
+      return;
+    } catch (error) {
+      lastError = error;
+      console.error(JSON.stringify({ type: 'rpc_retry', rpc_url: rpcUrl, error: summarizeError(error) }));
+    }
+  }
+  throw new Error(`All listing RPC attempts failed: ${summarizeError(lastError)}`);
 }
 
 main().catch((error) => {
