@@ -4238,6 +4238,14 @@ def _top_up_usdce_from_eth_for_cheap_buy(
     return False, "usdc_after_bootstrap_below_required", refreshed_usdc, required_usdc
 
 
+def _has_spendable_eth_for_cheap_buy(exec_client: EvmExecutionClient, eth_price: Decimal) -> bool:
+    if eth_price <= 0:
+        return False
+    reserve_eth = Decimal("0.05") / eth_price
+    spendable_eth = exec_client.get_native_balance() - reserve_eth
+    return spendable_eth > 0 and (spendable_eth * eth_price) >= MIN_EXECUTABLE_TRADE_USD
+
+
 def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
     picked = get_cheap_token_buy_menu_input()
     if not picked:
@@ -4307,7 +4315,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
             required_usdc_for_wallet = buy_amount_max_usdc * Decimal(tokens_per_wallet)
-            topup_ok, _, _, _ = _top_up_usdce_from_eth_for_cheap_buy(
+            topup_ok, topup_reason, _, _ = _top_up_usdce_from_eth_for_cheap_buy(
                 cfg,
                 logger,
                 state,
@@ -4329,14 +4337,27 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     )
                 else:
                     skipped_wallets += 1
-                    _remember_insufficient(wallet_number, wallet)
-                    logger.warning("[CHEAP_BUY] wallet=%s skipped | USDC.E balance below minimum buy amount (%s < %s)", wallet, _format_decimal_plain(usdc_balance), _format_decimal_plain(buy_amount_min_usdc))
+                    if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price):
+                        _remember_insufficient(wallet_number, wallet)
+                        logger.warning("[CHEAP_BUY] wallet=%s skipped | insufficient USDC.E and spendable ETH", wallet)
+                    else:
+                        logger.warning(
+                            "[CHEAP_BUY] wallet=%s skipped | bootstrap failed (%s), but ETH balance exists; not marking as insufficient balance",
+                            wallet,
+                            topup_reason,
+                        )
                     continue
             usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
             if usdc_balance < buy_amount_min_usdc:
                 skipped_wallets += 1
-                _remember_insufficient(wallet_number, wallet)
-                logger.warning("[CHEAP_BUY] wallet=%s skipped | USDC.E balance below minimum buy amount (%s < %s)", wallet, _format_decimal_plain(usdc_balance), _format_decimal_plain(buy_amount_min_usdc))
+                if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price):
+                    _remember_insufficient(wallet_number, wallet)
+                    logger.warning("[CHEAP_BUY] wallet=%s skipped | insufficient USDC.E and spendable ETH", wallet)
+                else:
+                    logger.warning(
+                        "[CHEAP_BUY] wallet=%s skipped | USDC.E below minimum, but ETH balance exists; not marking as insufficient balance",
+                        wallet,
+                    )
                 continue
             wallet_success = wallet_failed = 0
             for token_idx, info in enumerate(selected_tokens, start=1):
@@ -4346,7 +4367,8 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 if current_usdc_balance < buy_amount_usdc:
                     wallet_failed += 1
                     buy_failed_count += 1
-                    _remember_insufficient(wallet_number, wallet)
+                    if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price):
+                        _remember_insufficient(wallet_number, wallet)
                     logger.warning("[CHEAP_BUY] wallet=%s token=%s skipped | USDC.E balance below selected buy amount (%s < %s)", wallet, domain_token.symbol, _format_decimal_plain(current_usdc_balance), _format_decimal_plain(buy_amount_usdc))
                     break
                 expected_tokens = (buy_amount_usdc / info.price_usd) if info.price_usd > 0 else Decimal("0")
