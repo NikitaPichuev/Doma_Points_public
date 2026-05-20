@@ -3242,7 +3242,7 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
 
 def get_domain_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str]]:
     print("\nPlace domain offers in USDC.E:")
-    buffer_raw = input("Offer amount USDC.E [0.23]: ").strip() or "0.23"
+    buffer_raw = input("Minimum offer amount USDC.E [0.23]: ").strip() or "0.23"
     max_offer_raw = input("Maximum offer amount USDC.E [0.25]: ").strip() or "0.25"
     duration_days_raw = input("Offer duration days [1]: ").strip() or "1"
     offers_min_raw = input("Minimum offers per wallet [1]: ").strip() or "1"
@@ -3261,9 +3261,11 @@ def get_domain_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str
     delay_min = _parse_decimal_input(delay_min_raw)
     delay_max = _parse_decimal_input(delay_max_raw)
     if buffer_amount <= 0:
-        raise ValueError("Offer amount must be > 0")
+        raise ValueError("Minimum offer amount must be > 0")
     if max_offer <= 0:
         raise ValueError("Maximum offer amount must be > 0")
+    if max_offer < buffer_amount:
+        raise ValueError("Maximum offer amount cannot be lower than minimum")
     if duration_days <= 0:
         raise ValueError("Offer duration must be > 0")
     if offers_min <= 0 or offers_max <= 0:
@@ -3993,7 +3995,7 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
     )
 
     logger.info(
-        "[OFFER] mode started | wallets=%s | start_wallet=%s | offer=%s USDC.E | max_offer=%s USDC.E | duration=%s days | offers_per_wallet=%s-%s | delay=%s-%s sec",
+        "[OFFER] mode started | wallets=%s | start_wallet=%s | offer=%s-%s USDC.E | duration=%s days | offers_per_wallet=%s-%s | delay=%s-%s sec",
         total_loaded_wallets,
         wallet_start_offset + 1,
         _format_decimal_plain(buffer_amount),
@@ -4027,16 +4029,6 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
                 proxies=proxies,
             )
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
-            offer_amount = Decimal(int((buffer_amount * Decimal("1000000")).to_integral_value(rounding=ROUND_CEILING))) / Decimal("1000000")
-            if offer_amount > max_offer_amount:
-                skipped_wallets += 1
-                logger.warning(
-                    "[OFFER] wallet=%s skipped | offer amount %s exceeds max %s",
-                    wallet,
-                    _format_decimal_plain(offer_amount),
-                    _format_decimal_plain(max_offer_amount),
-                )
-                continue
 
             candidates = doma_api.fetch_domain_offer_candidates(chain_id=cfg.chain_id, take=100, max_pages=5)
             owner_caip = f"eip155:{cfg.chain_id}:{wallet.lower()}"
@@ -4052,6 +4044,11 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
                 logger.info("[OFFER] wallet=%s no eligible offer candidates | fetched=%s", wallet, len(candidates))
                 continue
 
+            offer_amounts = [
+                Decimal(int((_random_decimal_between(buffer_amount, max_offer_amount, buffer_raw, max_offer_raw) * Decimal("1000000")).to_integral_value(rounding=ROUND_CEILING))) / Decimal("1000000")
+                for _ in range(offers_to_place)
+            ]
+
             exec_client = _build_exec_client_with_rpc_fallback(
                 cfg,
                 logger,
@@ -4060,7 +4057,7 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
                 proxies=proxies,
                 log_prefix="[OFFER] ",
             )
-            required_usdc = offer_amount * Decimal(offers_to_place)
+            required_usdc = sum(offer_amounts, Decimal("0"))
             usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
             if usdc_balance < required_usdc:
                 topup_ok = _top_up_usdce_from_eth_for_offer(
@@ -4091,13 +4088,16 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
             wallet_failed = 0
             selected_domains = eligible[:offers_to_place]
             logger.info(
-                "[OFFER] wallet=%s selected=%s/%s candidates | offer=%s USDC.E | proxy=yes",
+                "[OFFER] wallet=%s selected=%s/%s candidates | offer_range=%s-%s USDC.E | required=%s USDC.E | proxy=yes",
                 wallet,
                 len(selected_domains),
                 len(eligible),
-                _format_decimal_plain(offer_amount),
+                _format_decimal_plain(min(offer_amounts) if offer_amounts else Decimal("0")),
+                _format_decimal_plain(max(offer_amounts) if offer_amounts else Decimal("0")),
+                _format_decimal_plain(required_usdc),
             )
             for offer_idx, domain in enumerate(selected_domains, start=1):
+                offer_amount = offer_amounts[offer_idx - 1]
                 highest_offer = raw_to_decimal(int(domain.highest_offer_raw or "0"), domain.highest_offer_decimals or 6)
                 logger.info(
                     "[OFFER] wallet=%s domain %s/%s %s | offer=%s USDC.E | current_top=%s %s | active_offers=%s",
