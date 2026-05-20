@@ -3241,8 +3241,8 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
 
 
 def get_domain_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str]]:
-    print("\nPlace domain offers slightly above allowed minimum:")
-    buffer_raw = input("Buffer above minimum USDC.E [0.0001]: ").strip() or "0.0001"
+    print("\nPlace domain offers in USDC.E:")
+    buffer_raw = input("Offer amount USDC.E [0.23]: ").strip() or "0.23"
     max_offer_raw = input("Maximum offer amount USDC.E [0.25]: ").strip() or "0.25"
     duration_days_raw = input("Offer duration days [1]: ").strip() or "1"
     offers_min_raw = input("Minimum offers per wallet [1]: ").strip() or "1"
@@ -3260,8 +3260,8 @@ def get_domain_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str
     offers_max = int(_parse_decimal_input(offers_max_raw).to_integral_value(rounding=ROUND_CEILING))
     delay_min = _parse_decimal_input(delay_min_raw)
     delay_max = _parse_decimal_input(delay_max_raw)
-    if buffer_amount < 0:
-        raise ValueError("Offer buffer cannot be negative")
+    if buffer_amount <= 0:
+        raise ValueError("Offer amount must be > 0")
     if max_offer <= 0:
         raise ValueError("Maximum offer amount must be > 0")
     if duration_days <= 0:
@@ -3954,7 +3954,6 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
 
 
 def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
-    _ = state
     picked = get_domain_offer_menu_input()
     if not picked:
         logger.info("[OFFER] canceled by user.")
@@ -3973,6 +3972,7 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
         raise ValueError("No wallet/private-key pairs available for domain offers")
     wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
     quote_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
     offer_csv = cfg.trades_csv_file.parent / DOMAIN_OFFERS_CSV.name
     ensure_csv(
         offer_csv,
@@ -3993,7 +3993,7 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
     )
 
     logger.info(
-        "[OFFER] mode started | wallets=%s | start_wallet=%s | min_formula=0.0001 ETH + %s USDC.E | max_offer=%s USDC.E | duration=%s days | offers_per_wallet=%s-%s | delay=%s-%s sec",
+        "[OFFER] mode started | wallets=%s | start_wallet=%s | offer=%s USDC.E | max_offer=%s USDC.E | duration=%s days | offers_per_wallet=%s-%s | delay=%s-%s sec",
         total_loaded_wallets,
         wallet_start_offset + 1,
         _format_decimal_plain(buffer_amount),
@@ -4027,12 +4027,11 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
                 proxies=proxies,
             )
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
-            allowed_min_offer = (eth_price * DOMAIN_OFFER_MIN_ETH_EQUIVALENT) + buffer_amount
-            offer_amount = Decimal(int((allowed_min_offer * Decimal("1000000")).to_integral_value(rounding=ROUND_CEILING))) / Decimal("1000000")
+            offer_amount = Decimal(int((buffer_amount * Decimal("1000000")).to_integral_value(rounding=ROUND_CEILING))) / Decimal("1000000")
             if offer_amount > max_offer_amount:
                 skipped_wallets += 1
                 logger.warning(
-                    "[OFFER] wallet=%s skipped | allowed minimum offer %s exceeds max %s",
+                    "[OFFER] wallet=%s skipped | offer amount %s exceeds max %s",
                     wallet,
                     _format_decimal_plain(offer_amount),
                     _format_decimal_plain(max_offer_amount),
@@ -4061,14 +4060,30 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
                 proxies=proxies,
                 log_prefix="[OFFER] ",
             )
+            required_usdc = offer_amount * Decimal(offers_to_place)
             usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-            if usdc_balance < offer_amount:
+            if usdc_balance < required_usdc:
+                topup_ok = _top_up_usdce_from_eth_for_offer(
+                    cfg=cfg,
+                    logger=logger,
+                    state=state,
+                    doma_api=doma_api,
+                    exec_client=exec_client,
+                    quote_token=quote_token,
+                    weth_token=weth_token,
+                    wallet=wallet,
+                    eth_price=eth_price,
+                    required_usdc=required_usdc,
+                )
+                if topup_ok:
+                    usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+            if usdc_balance < required_usdc:
                 skipped_wallets += 1
                 logger.warning(
-                    "[OFFER] wallet=%s skipped | USDC.E balance below offer amount (%s < %s)",
+                    "[OFFER] wallet=%s skipped | USDC.E balance below required offers amount (%s < %s)",
                     wallet,
                     _format_decimal_plain(usdc_balance),
-                    _format_decimal_plain(offer_amount),
+                    _format_decimal_plain(required_usdc),
                 )
                 continue
 
@@ -4311,6 +4326,76 @@ def _top_up_usdce_from_eth_for_cheap_buy(
     if refreshed_usdc >= required_usdc:
         return True, "", refreshed_usdc, required_usdc
     return False, "usdc_after_bootstrap_below_required", refreshed_usdc, required_usdc
+
+
+def _top_up_usdce_from_eth_for_offer(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    state: BotState,
+    doma_api: DomaApiClient,
+    exec_client: EvmExecutionClient,
+    quote_token: Token,
+    weth_token: Token,
+    wallet: str,
+    eth_price: Decimal,
+    required_usdc: Decimal,
+) -> bool:
+    current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+    if current_usdc >= required_usdc:
+        return True
+    if eth_price <= 0:
+        logger.warning("[OFFER] wallet=%s cannot top up USDC.E from ETH: ETH price is unknown", wallet)
+        return False
+
+    reserve_eth = Decimal("0.05") / eth_price
+    native_eth = exec_client.get_native_balance()
+    spendable_eth = native_eth - reserve_eth
+    if spendable_eth <= 0:
+        logger.warning("[OFFER] wallet=%s skipped | no USDC.E and no spendable ETH", wallet)
+        return False
+
+    missing_usdc = required_usdc - current_usdc
+    target_usdc = max(missing_usdc * Decimal("1.03"), MIN_EXECUTABLE_TRADE_USD)
+    bootstrap_eth = min(target_usdc / eth_price, spendable_eth)
+    bootstrap_usd = bootstrap_eth * eth_price
+    if bootstrap_eth <= 0 or bootstrap_usd < MIN_EXECUTABLE_TRADE_USD:
+        logger.warning(
+            "[OFFER] wallet=%s skipped | ETH->USDC.E bootstrap below minimum executable amount (%s USD)",
+            wallet,
+            _format_decimal_plain(bootstrap_usd),
+        )
+        return False
+
+    logger.info(
+        "[OFFER] wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
+        wallet,
+        _format_decimal_plain(bootstrap_eth),
+        _format_decimal_plain(missing_usdc),
+    )
+    ok = _execute_trade_via_doma_ui_route(
+        cfg=cfg,
+        logger=logger,
+        state=state,
+        doma_api=doma_api,
+        exec_client=exec_client,
+        token_in=weth_token,
+        token_out=quote_token,
+        display_in_symbol="ETH",
+        display_out_symbol="USDC.E",
+        trade_amount_expr=_format_decimal_plain(bootstrap_eth),
+        eth_price=eth_price,
+        label=f"OFFER {wallet} ETH>USDC.E BOOTSTRAP",
+        is_eth_source=True,
+        unwrap_to_native=False,
+        wait_for_pre_tx=True,
+    )
+    if not ok or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+        logger.warning("[OFFER] wallet=%s ETH->USDC.E bootstrap failed", wallet)
+        return False
+
+    refreshed_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+    logger.info("[OFFER] wallet=%s USDC.E after bootstrap=%s", wallet, _format_decimal_plain(refreshed_usdc))
+    return refreshed_usdc >= required_usdc
 
 
 def _has_spendable_eth_for_cheap_buy(exec_client: EvmExecutionClient, eth_price: Decimal) -> bool:
