@@ -1220,7 +1220,14 @@ def run_points_check(cfg: BotConfig, logger: logging.Logger, state: BotState, ap
                 snapshot.snapshot_date,
             ],
         )
-        logger.info("Points: rank=%s points=%s volume=%s", snapshot.rank, snapshot.points, snapshot.trading_volume_usd)
+        logger.info(
+            "Points: rank=%s/%s weekly_pts=%s season_pts=%s meta=%s",
+            snapshot.rank,
+            snapshot.total_snapshot_entries,
+            snapshot.points,
+            snapshot.trading_volume_usd,
+            snapshot.snapshot_date,
+        )
     except Exception as exc:
         logger.warning("Points check failed: %s", exc)
 
@@ -1349,9 +1356,6 @@ def build_clients(cfg: BotConfig, state: BotState, create_exec: bool = True):
 
 
 def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
-    if not cfg.file_api_keys and not cfg.doma_api_key.strip():
-        logger.warning("Points check skipped: DOMA_API_KEY/API_KEYS_FILE is empty")
-        return
     wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
     if not wallets:
         logger.warning("Points check skipped: no wallets configured")
@@ -1397,12 +1401,14 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
                 delimiter=cfg.csv_delimiter,
             )
             logger.info(
-                "Points [%s] [line=%s]: rank=%s points=%s volume=%s",
+                "Points [%s] [line=%s]: rank=%s/%s weekly_pts=%s season_pts=%s meta=%s",
                 snapshot.wallet_address,
                 idx + 1,
                 snapshot.rank,
+                snapshot.total_snapshot_entries,
                 snapshot.points,
                 snapshot.trading_volume_usd,
+                snapshot.snapshot_date,
             )
         except Exception as exc:
             logger.warning("Points check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
@@ -6731,12 +6737,12 @@ def main() -> None:
             "timestamp_utc",
             "wallet",
             "rank",
-            "points",
-            "trading_volume_usd",
-            "liquid_amount_usd",
+            "weekly_points",
+            "season_points",
+            "points_multiplier",
             "referral_count",
             "total_snapshot_entries",
-            "snapshot_date",
+            "campaign_meta",
         ],
         delimiter=cfg.csv_delimiter,
     )

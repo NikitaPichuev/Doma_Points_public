@@ -630,10 +630,59 @@ class DomaApiClient:
         return resp.json()
 
     def fetch_points(self, wallet_address: str, rank_by: str = "POINTS") -> Optional[PointsSnapshot]:
+        caip_wallet = f"eip155:97477:{wallet_address}"
+        scope = "SEASON" if str(rank_by or "").strip().upper() in {"SEASON", "SEASON_POINTS"} else "WEEKLY"
+        query = """
+        query Leaderboard($walletAddress: AddressCAIP10!, $scope: LeaderboardScope) {
+          leaderboard(walletAddress: $walletAddress, scope: $scope) {
+            walletAddress
+            rank
+            previousDayRank
+            points
+            weeklyPoints
+            seasonPoints
+            totalEntries
+            weekNumber
+            scope
+            seasonNumber
+            referralCount
+            pointsMultiplier
+          }
+        }
+        """
+        try:
+            data = self._post(query, {"walletAddress": caip_wallet, "scope": scope})
+            item = data.get("leaderboard")
+            if item:
+                weekly_points = Decimal(str(item.get("weeklyPoints") or item.get("points") or "0"))
+                season_points = Decimal(str(item.get("seasonPoints") or "0"))
+                scope_value = str(item.get("scope") or scope)
+                week_number = item.get("weekNumber")
+                season_number = item.get("seasonNumber")
+                snapshot_label = f"{scope_value}"
+                if week_number is not None:
+                    snapshot_label += f":week={week_number}"
+                if season_number is not None:
+                    snapshot_label += f":season={season_number}"
+                previous_rank = item.get("previousDayRank")
+                if previous_rank is not None:
+                    snapshot_label += f":prev_rank={previous_rank}"
+                return PointsSnapshot(
+                    wallet_address=str(item.get("walletAddress") or wallet_address),
+                    rank=int(item.get("rank") or 0),
+                    points=weekly_points if scope_value == "WEEKLY" else Decimal(str(item.get("points") or season_points)),
+                    trading_volume_usd=season_points,
+                    liquid_amount_usd=Decimal(str(item.get("pointsMultiplier") or "0")),
+                    referral_count=int(item.get("referralCount") or 0),
+                    total_snapshot_entries=int(item.get("totalEntries") or 0),
+                    snapshot_date=snapshot_label,
+                )
+        except Exception:
+            pass
+
         order_by = str(rank_by or "POINTS").strip().upper()
         if order_by not in {"POINTS", "TRADING_VOLUME_USD"}:
             order_by = "POINTS"
-        caip_wallet = f"eip155:97477:{wallet_address}"
         query = """
         query Points($walletAddress: AddressCAIP10!, $orderBy: LegacyLeaderboardOrderBy) {
           legacyLeaderboard(walletAddress: $walletAddress, orderBy: $orderBy) {

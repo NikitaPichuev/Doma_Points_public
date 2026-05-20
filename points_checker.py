@@ -11,9 +11,6 @@ from doma_api import DomaApiClient
 
 def main() -> None:
     cfg = BotConfig()
-    if not cfg.file_api_keys and not cfg.doma_api_key.strip():
-        print("Points check skipped: DOMA_API_KEY/API_KEYS_FILE is empty")
-        return
     cli_wallets = [w.strip() for w in sys.argv[1:] if w.strip().startswith("0x")]
     wallets = cli_wallets or cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
     if not wallets:
@@ -52,8 +49,9 @@ def main() -> None:
             f"[{datetime.now(timezone.utc).isoformat()}] "
             f"line={idx + 1} "
             f"wallet={snapshot.wallet_address} rank={snapshot.rank} "
-            f"points={snapshot.points} volume={snapshot.trading_volume_usd} "
-            f"holdings={snapshot.liquid_amount_usd}"
+            f"total_entries={snapshot.total_snapshot_entries} "
+            f"weekly_points={snapshot.points} season_points={snapshot.trading_volume_usd} "
+            f"meta={snapshot.snapshot_date}"
         )
         if idx < len(wallets) - 1 and cfg.wallet_delay_max_sec > 0:
             delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
