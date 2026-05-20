@@ -4164,6 +4164,60 @@ def _pick_available_subdomain_label(exec_client: EvmExecutionClient, token_addre
     raise RuntimeError("Unable to find available subdomain label")
 
 
+def _claim_subdomains_for_domain_token(
+    logger: logging.Logger,
+    exec_client: EvmExecutionClient,
+    wallet: str,
+    domain_token: Token,
+    domain_name: str,
+    subdomains_min_per_token: int,
+    subdomains_max_per_token: int,
+    delay_min: Decimal,
+    delay_max: Decimal,
+    max_claims: Optional[int] = None,
+) -> Tuple[int, int]:
+    prices_raw = exec_client.get_subdomain_staking_prices(domain_token.address)
+    subdomains_to_claim = random.randint(subdomains_min_per_token, subdomains_max_per_token)
+    if max_claims is not None:
+        subdomains_to_claim = min(subdomains_to_claim, max(0, max_claims))
+    if subdomains_to_claim <= 0:
+        return 0, 0
+
+    success_count = 0
+    failed_count = 0
+    for sub_idx in range(1, subdomains_to_claim + 1):
+        label_length = max(32, len(prices_raw) if prices_raw else 32)
+        label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
+        label_price_index = 0 if len(prices_raw) == 1 else min(len(label) - 1, len(prices_raw) - 1)
+        required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
+        logger.info(
+            "[CHEAP_BUY] wallet=%s subdomain %s/%s claim | %s.%s | required=%s %s",
+            wallet,
+            sub_idx,
+            subdomains_to_claim,
+            label,
+            domain_name,
+            _format_decimal_plain(required_amount),
+            domain_token.symbol,
+        )
+        try:
+            approve_hash, stake_hash, subdomain_id, dns_hash = exec_client.claim_subdomain_and_set_dns(domain_token.address, label, wallet)
+            if approve_hash:
+                logger.info("[CHEAP_BUY] wallet=%s subdomain approve tx sent: %s", wallet, approve_hash)
+            logger.info("[CHEAP_BUY] wallet=%s subdomain stake tx sent: %s | subdomain_id=%s", wallet, stake_hash, subdomain_id if subdomain_id is not None else "unknown")
+            if dns_hash:
+                logger.info("[CHEAP_BUY] wallet=%s subdomain DNS save tx sent: %s", wallet, dns_hash)
+            success_count += 1
+        except Exception as exc:
+            failed_count += 1
+            logger.warning("[CHEAP_BUY] wallet=%s token=%s subdomain claim/save failed: %s", wallet, domain_token.symbol, exc)
+        if sub_idx < subdomains_to_claim:
+            delay_sec = random.uniform(float(delay_min), float(delay_max))
+            logger.info("[CHEAP_BUY] delay before next subdomain: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+    return success_count, failed_count
+
+
 def _eligible_cheap_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token, max_price_usd: Decimal) -> List[LaunchpadTokenInfo]:
     quote_address = quote_token.address.lower()
     eligible: List[LaunchpadTokenInfo] = []
@@ -4328,14 +4382,76 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             doma_api = DomaApiClient(cfg.doma_api_url, api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys], proxies=proxies)
             catalog = doma_api.fetch_fractional_tokens(take=250, max_pages=10)
             tokens_per_wallet = random.randint(tokens_min_per_wallet, tokens_max_per_wallet)
-            selected_tokens = _eligible_cheap_tokens(catalog, quote_token, max_price_usd)[:tokens_per_wallet]
-            if not selected_tokens:
-                skipped_wallets += 1
-                logger.info("[CHEAP_BUY] wallet=%s no eligible tokens | catalog=%s | max_price<$%s | proxy=yes", wallet, len(catalog), _format_decimal_plain(max_price_usd))
-                continue
             exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
-            required_usdc_for_wallet = buy_amount_max_usdc * Decimal(tokens_per_wallet)
+            wallet_success = wallet_failed = 0
+            existing_token_addresses: set[str] = set()
+            existing_tokens_processed = 0
+            for info in catalog:
+                if existing_tokens_processed >= tokens_per_wallet:
+                    break
+                token_address = (info.address or "").strip().lower()
+                if not token_address or token_address in existing_token_addresses:
+                    continue
+                domain_token = _token_from_launchpad_price(info, eth_price)
+                try:
+                    held_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
+                    if held_balance <= 0:
+                        continue
+                    prices_raw = exec_client.get_subdomain_staking_prices(domain_token.address)
+                    label_length = max(32, len(prices_raw) if prices_raw else 32)
+                    label_price_index = 0 if len(prices_raw) == 1 else min(label_length - 1, len(prices_raw) - 1)
+                    required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
+                    if required_amount <= 0 or held_balance < required_amount:
+                        continue
+                    max_claims = int((held_balance / required_amount).to_integral_value(rounding=ROUND_FLOOR))
+                    logger.info(
+                        "[CHEAP_BUY] wallet=%s existing token found | %s balance=%s | required=%s | claim_from_balance=yes",
+                        wallet,
+                        domain_token.symbol,
+                        _format_decimal_plain(held_balance),
+                        _format_decimal_plain(required_amount),
+                    )
+                    claimed_ok, claimed_failed = _claim_subdomains_for_domain_token(
+                        logger=logger,
+                        exec_client=exec_client,
+                        wallet=wallet,
+                        domain_token=domain_token,
+                        domain_name=info.name,
+                        subdomains_min_per_token=subdomains_min_per_token,
+                        subdomains_max_per_token=subdomains_max_per_token,
+                        delay_min=delay_min,
+                        delay_max=delay_max,
+                        max_claims=max_claims,
+                    )
+                    subdomain_success_count += claimed_ok
+                    subdomain_failed_count += claimed_failed
+                    existing_token_addresses.add(token_address)
+                    if claimed_ok > 0:
+                        wallet_success += 1
+                        existing_tokens_processed += 1
+                    elif claimed_failed > 0:
+                        wallet_failed += 1
+                except Exception as exc:
+                    logger.warning("[CHEAP_BUY] wallet=%s token=%s existing balance check failed: %s", wallet, domain_token.symbol, exc)
+
+            tokens_to_buy = max(0, tokens_per_wallet - existing_tokens_processed)
+            selected_tokens = [
+                t for t in _eligible_cheap_tokens(catalog, quote_token, max_price_usd)
+                if (t.address or "").strip().lower() not in existing_token_addresses
+            ][:tokens_to_buy]
+            if tokens_to_buy <= 0:
+                success_wallets += 1
+                logger.info("[CHEAP_BUY] wallet=%s target satisfied from existing token balances | claimed_tokens=%s", wallet, existing_tokens_processed)
+                continue
+            if not selected_tokens:
+                if wallet_success > 0:
+                    success_wallets += 1
+                else:
+                    skipped_wallets += 1
+                logger.info("[CHEAP_BUY] wallet=%s no eligible tokens to buy | catalog=%s | max_price<$%s | proxy=yes", wallet, len(catalog), _format_decimal_plain(max_price_usd))
+                continue
+            required_usdc_for_wallet = buy_amount_max_usdc * Decimal(tokens_to_buy)
             topup_ok, topup_reason, _, _ = _top_up_usdce_from_eth_for_cheap_buy(
                 cfg,
                 logger,
@@ -4380,7 +4496,6 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                         wallet,
                     )
                 continue
-            wallet_success = wallet_failed = 0
             for token_idx, info in enumerate(selected_tokens, start=1):
                 domain_token = _token_from_launchpad_price(info, eth_price)
                 buy_amount_usdc = _random_decimal_between(buy_amount_min_usdc, buy_amount_max_usdc, buy_amount_min_raw, buy_amount_max_raw)
@@ -4398,38 +4513,19 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 if ok:
                     buy_success_count += 1
                     wallet_success += 1
-                    try:
-                        prices_raw = exec_client.get_subdomain_staking_prices(domain_token.address)
-                        subdomains_to_claim = random.randint(subdomains_min_per_token, subdomains_max_per_token)
-                        for sub_idx in range(1, subdomains_to_claim + 1):
-                            label_length = max(32, len(prices_raw) if prices_raw else 32)
-                            label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
-                            label_price_index = 0 if len(prices_raw) == 1 else min(len(label) - 1, len(prices_raw) - 1)
-                            required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
-                            logger.info(
-                                "[CHEAP_BUY] wallet=%s subdomain %s/%s claim | %s.%s | required=%s %s",
-                                wallet,
-                                sub_idx,
-                                subdomains_to_claim,
-                                label,
-                                info.name,
-                                _format_decimal_plain(required_amount),
-                                domain_token.symbol,
-                            )
-                            approve_hash, stake_hash, subdomain_id, dns_hash = exec_client.claim_subdomain_and_set_dns(domain_token.address, label, wallet)
-                            if approve_hash:
-                                logger.info("[CHEAP_BUY] wallet=%s subdomain approve tx sent: %s", wallet, approve_hash)
-                            logger.info("[CHEAP_BUY] wallet=%s subdomain stake tx sent: %s | subdomain_id=%s", wallet, stake_hash, subdomain_id if subdomain_id is not None else "unknown")
-                            if dns_hash:
-                                logger.info("[CHEAP_BUY] wallet=%s subdomain DNS save tx sent: %s", wallet, dns_hash)
-                            subdomain_success_count += 1
-                            if sub_idx < subdomains_to_claim:
-                                delay_sec = random.uniform(float(delay_min), float(delay_max))
-                                logger.info("[CHEAP_BUY] delay before next subdomain: %.2f sec", delay_sec)
-                                time.sleep(delay_sec)
-                    except Exception as exc:
-                        subdomain_failed_count += 1
-                        logger.warning("[CHEAP_BUY] wallet=%s token=%s subdomain claim/save failed: %s", wallet, domain_token.symbol, exc)
+                    claimed_ok, claimed_failed = _claim_subdomains_for_domain_token(
+                        logger=logger,
+                        exec_client=exec_client,
+                        wallet=wallet,
+                        domain_token=domain_token,
+                        domain_name=info.name,
+                        subdomains_min_per_token=subdomains_min_per_token,
+                        subdomains_max_per_token=subdomains_max_per_token,
+                        delay_min=delay_min,
+                        delay_max=delay_max,
+                    )
+                    subdomain_success_count += claimed_ok
+                    subdomain_failed_count += claimed_failed
                 else:
                     buy_failed_count += 1
                     wallet_failed += 1
