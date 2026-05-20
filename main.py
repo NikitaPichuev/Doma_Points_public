@@ -4386,9 +4386,9 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
             wallet_success = wallet_failed = 0
             existing_token_addresses: set[str] = set()
-            existing_tokens_processed = 0
+            existing_subdomains_claimed = 0
             for info in catalog:
-                if existing_tokens_processed >= tokens_per_wallet:
+                if existing_subdomains_claimed >= tokens_per_wallet:
                     break
                 token_address = (info.address or "").strip().lower()
                 if not token_address or token_address in existing_token_addresses:
@@ -4429,20 +4429,20 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     existing_token_addresses.add(token_address)
                     if claimed_ok > 0:
                         wallet_success += 1
-                        existing_tokens_processed += 1
+                        existing_subdomains_claimed += claimed_ok
                     elif claimed_failed > 0:
                         wallet_failed += 1
                 except Exception as exc:
                     logger.warning("[CHEAP_BUY] wallet=%s token=%s existing balance check failed: %s", wallet, domain_token.symbol, exc)
 
-            tokens_to_buy = max(0, tokens_per_wallet - existing_tokens_processed)
+            tokens_to_buy = max(0, tokens_per_wallet - existing_subdomains_claimed)
             selected_tokens = [
                 t for t in _eligible_cheap_tokens(catalog, quote_token, max_price_usd)
                 if (t.address or "").strip().lower() not in existing_token_addresses
             ][:tokens_to_buy]
             if tokens_to_buy <= 0:
                 success_wallets += 1
-                logger.info("[CHEAP_BUY] wallet=%s target satisfied from existing token balances | claimed_tokens=%s", wallet, existing_tokens_processed)
+                logger.info("[CHEAP_BUY] wallet=%s target satisfied from existing token balances | claimed_subdomains=%s", wallet, existing_subdomains_claimed)
                 continue
             if not selected_tokens:
                 if wallet_success > 0:
