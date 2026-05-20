@@ -1954,6 +1954,27 @@ def _fetch_eth_price_via_doma_quote(cfg: BotConfig, doma_api: DomaApiClient, quo
     return quote.quote_decimals
 
 
+def _fallback_eth_usdce_pool_for_ui_route(cfg: BotConfig, doma_api: DomaApiClient) -> Tuple[Pool, Decimal]:
+    usdc_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
+    eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, usdc_token)
+    if eth_price <= 0:
+        raise RuntimeError("Failed to resolve ETH/USD via Doma quote")
+    return (
+        Pool(
+            address="",
+            fee_tier=0,
+            tvl_usd=Decimal("0"),
+            volume_24h_usd=Decimal("0"),
+            token0=usdc_token,
+            token1=weth_token,
+            token0_price=Decimal("1"),
+            token1_price=eth_price,
+        ),
+        eth_price,
+    )
+
+
 def _execute_launchpad_buy(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -5817,9 +5838,19 @@ def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) 
                 if not pool:
                     raise RuntimeError(f"No pool route found for {src_symbol}->{dst_symbol}")
             except Exception as exc:
-                _fail_wallet()
-                logger.warning("[PAIR] wallet=%s init failed: %s", wallet, exc)
-                continue
+                logger.warning("[PAIR] wallet=%s subgraph init failed, using Doma quote fallback: %s", wallet, exc)
+                try:
+                    doma_api = DomaApiClient(
+                        cfg.doma_api_url,
+                        api_key=cfg.doma_api_key,
+                        api_keys=cfg.doma_api_keys,
+                        proxies=proxies,
+                    )
+                    pool, eth_price = _fallback_eth_usdce_pool_for_ui_route(cfg, doma_api)
+                except Exception as fallback_exc:
+                    _fail_wallet()
+                    logger.warning("[PAIR] wallet=%s init failed: %s", wallet, fallback_exc)
+                    continue
 
             if amount_mode == "percent":
                 amount_expr = f"{amount_raw}%"
