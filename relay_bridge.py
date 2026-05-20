@@ -152,6 +152,10 @@ def _rpc_urls_for_chain(relay: RelayBridgeClient, chain_id: int) -> List[str]:
         urls.extend(["https://mainnet.base.org", "https://base.drpc.org"])
     if chain_id == 97477:
         urls.extend(["https://doma.drpc.org", "https://rpc.doma.xyz"])
+    if chain_id == 5000:
+        urls.extend(["https://rpc.mantle.xyz"])
+    if chain_id == 81457:
+        urls.extend(["https://rpc.blast.io/"])
     dedup: List[str] = []
     for u in urls:
         if u and u not in dedup:
@@ -249,7 +253,15 @@ def _resolve_amount_raw_via_config(
     if mode == "percent":
         if value > 100:
             raise ValueError("Percent amount > 100")
-        out_raw = int((Decimal(bal_raw) * value / Decimal("100")).to_integral_value())
+        spendable_raw = bal_raw
+        if token.address == NATIVE_ETH:
+            if eth_price_usd > 0:
+                reserve_dec = Decimal("0.05") / eth_price_usd
+            else:
+                reserve_dec = Decimal("0.00002")
+            reserve_raw = int((reserve_dec * (Decimal(10) ** token.decimals)).to_integral_value())
+            spendable_raw = max(0, bal_raw - reserve_raw)
+        out_raw = int((Decimal(spendable_raw) * value / Decimal("100")).to_integral_value())
         if out_raw <= 0:
             raise ValueError("Calculated amount is too small")
         return out_raw

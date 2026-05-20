@@ -1482,9 +1482,10 @@ def run_bridge_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     need_eth_price = False
     for raw in bridge_tasks:
         try:
-            _left, _pair, amount_expr = [x.strip() for x in raw.split(":", 2)]
+            _left, pair, amount_expr = [x.strip() for x in raw.split(":", 2)]
             mode, _ = parse_trade_amount_expression(amount_expr)
-            if mode == "usd":
+            src_symbol = pair.split(">", 1)[0].strip().upper()
+            if mode == "usd" or (mode == "percent" and src_symbol == "ETH"):
                 need_eth_price = True
                 break
         except Exception:
@@ -6309,12 +6310,19 @@ def get_bridge_tasks_from_menu(state: BotState) -> Optional[List[str]]:
     print("\nBridge routes (Relay):")
     print("1) Base -> Doma | ETH -> ETH")
     print("2) Base -> Doma | ETH -> USDC.E")
-    print("3) Back")
-    route = input("Select [1-3]: ").strip()
-    if route == "3":
+    print("3) Mantle + Blast -> Doma | all native ETH -> ETH")
+    print("4) Back")
+    route = input("Select [1-4]: ").strip()
+    if route == "4":
         return None
-    if route not in {"1", "2"}:
+    if route not in {"1", "2", "3"}:
         raise ValueError("Invalid bridge route selection")
+
+    if route == "3":
+        return [
+            "mantle>doma:ETH>ETH:100%",
+            "blast>doma:ETH>ETH:100%",
+        ]
 
     print("\nAmount mode:")
     print("1) Number (ETH)")
