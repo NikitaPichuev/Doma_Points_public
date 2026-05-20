@@ -4018,6 +4018,7 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
     skipped_wallets = 0
     placed_total = 0
     failed_wallet_addresses: List[str] = []
+    skipped_wallet_details: List[Tuple[int, str, str]] = []
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "OFFER")
@@ -4026,6 +4027,7 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
         logger.info("[OFFER] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
         if skip_wallet or not proxies:
             skipped_wallets += 1
+            skipped_wallet_details.append((wallet_number, wallet, "proxy is required"))
             logger.warning("[OFFER] wallet=%s skipped: proxy is required for domain offers", wallet)
             continue
         try:
@@ -4047,6 +4049,7 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
             offers_to_place = min(random.randint(offers_min, offers_max), len(eligible))
             if offers_to_place <= 0:
                 skipped_wallets += 1
+                skipped_wallet_details.append((wallet_number, wallet, "no eligible offer candidates"))
                 logger.info("[OFFER] wallet=%s no eligible offer candidates | fetched=%s", wallet, len(candidates))
                 continue
 
@@ -4082,6 +4085,7 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
                     usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
             if usdc_balance < required_usdc:
                 skipped_wallets += 1
+                skipped_wallet_details.append((wallet_number, wallet, "USDC.E balance below required offers amount"))
                 logger.warning(
                     "[OFFER] wallet=%s skipped | USDC.E balance below required offers amount (%s < %s)",
                     wallet,
@@ -4168,6 +4172,13 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
             logger.info("[OFFER] delay before next wallet: %.2f sec", delay_sec)
             time.sleep(delay_sec)
     logger.info("[OFFER] placed offers total=%s", placed_total)
+    if skipped_wallet_details:
+        logger.warning("[OFFER] skipped wallets:")
+        print("\n[OFFER] skipped wallets:")
+        for wallet_number, wallet, reason in skipped_wallet_details:
+            line = f"  #{wallet_number} {wallet} | {reason}"
+            logger.warning("[OFFER] skipped | #%s %s | %s", wallet_number, wallet, reason)
+            print(line)
     _print_mode_summary("OFFER", len(wallet_key_records), success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses)
 
 
