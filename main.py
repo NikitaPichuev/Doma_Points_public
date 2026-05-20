@@ -21,6 +21,7 @@ from web3 import Web3
 from config import BotConfig
 from doma_api import (
     DomainListing,
+    DomainOfferCandidate,
     DomaApiClient,
     DomaSubgraphClient,
     DOMA_INTERFACE_PORTION_BIPS,
@@ -104,12 +105,14 @@ DOMAIN_QUEST_TOKENS = [
 DOMAIN_LISTING_CSV = Path("domain_listings.csv")
 DOMAIN_DELISTING_CSV = Path("domain_delistings.csv")
 DOMAIN_BRIDGE_CSV = Path("domain_bridges.csv")
+DOMAIN_OFFERS_CSV = Path("domain_offers.csv")
 DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
 DOMAIN_LISTING_SOURCE = "doma-swap-bot-public"
 PROXY_DOMA_RECORD_ADDRESS = "0xd0000000000067CB44aE7b6aC3AB5764dE20A3E2"
 BASE_CHAIN_CAIP2 = "eip155:8453"
+DOMAIN_OFFER_MIN_ETH_EQUIVALENT = Decimal("0.0001")
 
 
 def _color(text: str, code: str) -> str:
@@ -3216,6 +3219,43 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
     return max_price_raw, buy_amount_min_raw, buy_amount_max_raw, str(tokens_min), str(tokens_max), str(subdomains_min), str(subdomains_max), delay_min_raw, delay_max_raw
 
 
+def get_domain_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str]]:
+    print("\nPlace domain offers slightly above allowed minimum:")
+    buffer_raw = input("Buffer above minimum USDC.E [0.0001]: ").strip() or "0.0001"
+    max_offer_raw = input("Maximum offer amount USDC.E [0.25]: ").strip() or "0.25"
+    duration_days_raw = input("Offer duration days [1]: ").strip() or "1"
+    offers_min_raw = input("Minimum offers per wallet [1]: ").strip() or "1"
+    offers_max_raw = input("Maximum offers per wallet [1]: ").strip() or "1"
+    delay_min_raw = input(f"Minimum delay between offers sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between offers sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    buffer_amount = _parse_decimal_input(buffer_raw)
+    max_offer = _parse_decimal_input(max_offer_raw)
+    duration_days = _parse_decimal_input(duration_days_raw)
+    offers_min = int(_parse_decimal_input(offers_min_raw).to_integral_value(rounding=ROUND_FLOOR))
+    offers_max = int(_parse_decimal_input(offers_max_raw).to_integral_value(rounding=ROUND_CEILING))
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if buffer_amount < 0:
+        raise ValueError("Offer buffer cannot be negative")
+    if max_offer <= 0:
+        raise ValueError("Maximum offer amount must be > 0")
+    if duration_days <= 0:
+        raise ValueError("Offer duration must be > 0")
+    if offers_min <= 0 or offers_max <= 0:
+        raise ValueError("Offer counts per wallet must be > 0")
+    if offers_max < offers_min:
+        raise ValueError("Maximum offers per wallet cannot be lower than minimum")
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Offer delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum offer delay cannot be lower than minimum delay")
+    return buffer_raw, max_offer_raw, duration_days_raw, str(offers_min), str(offers_max), delay_min_raw, delay_max_raw
+
+
 def _random_decimal_between(min_value: Decimal, max_value: Decimal, min_raw: str, max_raw: str) -> Decimal:
     if min_value == max_value:
         return min_value
@@ -3274,6 +3314,10 @@ def _domain_listing_helper_path() -> Path:
 
 def _domain_cancel_listing_helper_path() -> Path:
     return Path(__file__).with_name("doma_cancel_listing.mjs")
+
+
+def _domain_place_offer_helper_path() -> Path:
+    return Path(__file__).with_name("doma_place_offer.mjs")
 
 
 def _domain_listing_loader_path() -> Path:
@@ -3434,6 +3478,89 @@ def _run_domain_cancel_listing_helper(
         return False, "", str(data.get("error") or "unknown helper error")
     tx_hash = str(((data.get("result") or {}).get("transactionHash")) or "")
     return True, tx_hash, ""
+
+
+def _run_domain_place_offer_helper(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    private_key: str,
+    domain: DomainOfferCandidate,
+    offer_amount: Decimal,
+    duration_days: Decimal,
+    proxy: Optional[str],
+) -> Tuple[bool, str, str]:
+    helper_path = _domain_place_offer_helper_path()
+    if not helper_path.exists():
+        raise FileNotFoundError(f"Place offer helper not found: {helper_path}")
+    loader_path = _domain_listing_loader_path()
+    if not loader_path.exists():
+        raise FileNotFoundError(f"Node ESM loader not found: {loader_path}")
+    price_raw = int((offer_amount * (Decimal(10) ** 6)).to_integral_value(rounding=ROUND_CEILING))
+    if price_raw <= 0:
+        raise ValueError(f"Offer amount is too small after USDC.E conversion: {offer_amount}")
+    duration_ms = int(duration_days * Decimal("86400000"))
+    payload = {
+        "chainId": cfg.chain_id,
+        "rpcUrl": cfg.rpc_url,
+        "privateKey": private_key,
+        "contract": domain.token_address,
+        "tokenId": domain.token_id,
+        "priceRaw": str(price_raw),
+        "currencyContractAddress": _listing_currency_address(cfg),
+        "durationMs": duration_ms,
+        "source": DOMAIN_LISTING_SOURCE,
+        "orderbookBaseUrl": _doma_orderbook_base_url(cfg),
+        "apiKey": _first_doma_api_key(cfg),
+        "proxy": proxy or "",
+    }
+    env = dict(os.environ)
+    if proxy:
+        env["HTTP_PROXY"] = proxy
+        env["HTTPS_PROXY"] = proxy
+    env["NODE_NO_WARNINGS"] = "1"
+    result = subprocess.run(
+        ["node", "--loader", loader_path.as_uri(), str(helper_path)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=str(helper_path.parent),
+        env=env,
+        timeout=600,
+    )
+    for line in result.stderr.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            logger.info("[OFFER] wallet=%s domain=%s helper: %s", wallet, domain.name, line)
+            continue
+        if event.get("type") == "progress":
+            tx_hashes = event.get("tx_hashes") or ""
+            if tx_hashes:
+                logger.info(
+                    "[OFFER] wallet=%s domain=%s progress | action=%s state=%s tx=%s",
+                    wallet,
+                    domain.name,
+                    event.get("action") or "",
+                    event.get("state") or event.get("status") or "",
+                    tx_hashes,
+                )
+        elif not event.get("ok", True):
+            logger.warning("[OFFER] wallet=%s domain=%s helper error: %s", wallet, domain.name, event.get("error"))
+    if result.returncode != 0:
+        return False, "", (result.stderr or result.stdout or f"node exited with {result.returncode}").strip()
+    try:
+        data = json.loads(result.stdout.splitlines()[-1])
+    except Exception as exc:
+        return False, "", f"failed to parse helper output: {exc}; stdout={result.stdout.strip()}"
+    if not data.get("ok"):
+        return False, "", str(data.get("error") or "unknown helper error")
+    orders = (data.get("result") or {}).get("orders") or []
+    order_id = str((orders[0] or {}).get("orderId") or "") if orders else ""
+    return True, order_id, ""
 
 
 def _eligible_unlisted_domains(all_domains: List[OwnedDomain], listed_domains: List[OwnedDomain], chain_id: int) -> List[OwnedDomain]:
@@ -3803,6 +3930,203 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         skipped_wallets,
         failed_wallet_addresses,
     )
+
+
+def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    picked = get_domain_offer_menu_input()
+    if not picked:
+        logger.info("[OFFER] canceled by user.")
+        return
+    buffer_raw, max_offer_raw, duration_days_raw, offers_min_raw, offers_max_raw, delay_min_raw, delay_max_raw = picked
+    buffer_amount = _parse_decimal_input(buffer_raw)
+    max_offer_amount = _parse_decimal_input(max_offer_raw)
+    duration_days = _parse_decimal_input(duration_days_raw)
+    offers_min = int(_parse_decimal_input(offers_min_raw))
+    offers_max = int(_parse_decimal_input(offers_max_raw))
+    offer_delay_min = float(_parse_decimal_input(delay_min_raw))
+    offer_delay_max = float(_parse_decimal_input(delay_max_raw))
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "OFFER")
+    if not wallet_key_records:
+        raise ValueError("No wallet/private-key pairs available for domain offers")
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
+    quote_token = _usdce_token_from_config(cfg)
+    offer_csv = cfg.trades_csv_file.parent / DOMAIN_OFFERS_CSV.name
+    ensure_csv(
+        offer_csv,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "domain",
+            "offer_usdce",
+            "duration_days",
+            "token_address",
+            "token_id",
+            "highest_offer_usdce",
+            "order_id",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    logger.info(
+        "[OFFER] mode started | wallets=%s | start_wallet=%s | min_formula=0.0001 ETH + %s USDC.E | max_offer=%s USDC.E | duration=%s days | offers_per_wallet=%s-%s | delay=%s-%s sec",
+        total_loaded_wallets,
+        wallet_start_offset + 1,
+        _format_decimal_plain(buffer_amount),
+        _format_decimal_plain(max_offer_amount),
+        _format_decimal_plain(duration_days),
+        offers_min,
+        offers_max,
+        delay_min_raw,
+        delay_max_raw,
+    )
+
+    success_wallets = 0
+    failed_wallets = 0
+    skipped_wallets = 0
+    placed_total = 0
+    failed_wallet_addresses: List[str] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "OFFER")
+        proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+        wallet_number = wallet_start_offset + idx
+        logger.info("[OFFER] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        if skip_wallet or not proxies:
+            skipped_wallets += 1
+            logger.warning("[OFFER] wallet=%s skipped: proxy is required for domain offers", wallet)
+            continue
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+                proxies=proxies,
+            )
+            eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+            allowed_min_offer = (eth_price * DOMAIN_OFFER_MIN_ETH_EQUIVALENT) + buffer_amount
+            offer_amount = Decimal(int((allowed_min_offer * Decimal("1000000")).to_integral_value(rounding=ROUND_CEILING))) / Decimal("1000000")
+            if offer_amount > max_offer_amount:
+                skipped_wallets += 1
+                logger.warning(
+                    "[OFFER] wallet=%s skipped | allowed minimum offer %s exceeds max %s",
+                    wallet,
+                    _format_decimal_plain(offer_amount),
+                    _format_decimal_plain(max_offer_amount),
+                )
+                continue
+
+            candidates = doma_api.fetch_domain_offer_candidates(chain_id=cfg.chain_id, take=100, max_pages=5)
+            owner_caip = f"eip155:{cfg.chain_id}:{wallet.lower()}"
+            eligible = [
+                c
+                for c in candidates
+                if c.owner_address.lower() != owner_caip and c.token_address and c.token_id
+            ]
+            random.shuffle(eligible)
+            offers_to_place = min(random.randint(offers_min, offers_max), len(eligible))
+            if offers_to_place <= 0:
+                skipped_wallets += 1
+                logger.info("[OFFER] wallet=%s no eligible offer candidates | fetched=%s", wallet, len(candidates))
+                continue
+
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg,
+                logger,
+                wallet,
+                private_key,
+                proxies=proxies,
+                log_prefix="[OFFER] ",
+            )
+            usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+            if usdc_balance < offer_amount:
+                skipped_wallets += 1
+                logger.warning(
+                    "[OFFER] wallet=%s skipped | USDC.E balance below offer amount (%s < %s)",
+                    wallet,
+                    _format_decimal_plain(usdc_balance),
+                    _format_decimal_plain(offer_amount),
+                )
+                continue
+
+            wallet_success = 0
+            wallet_failed = 0
+            selected_domains = eligible[:offers_to_place]
+            logger.info(
+                "[OFFER] wallet=%s selected=%s/%s candidates | offer=%s USDC.E | proxy=yes",
+                wallet,
+                len(selected_domains),
+                len(eligible),
+                _format_decimal_plain(offer_amount),
+            )
+            for offer_idx, domain in enumerate(selected_domains, start=1):
+                highest_offer = raw_to_decimal(int(domain.highest_offer_raw or "0"), domain.highest_offer_decimals or 6)
+                logger.info(
+                    "[OFFER] wallet=%s domain %s/%s %s | offer=%s USDC.E | current_top=%s %s | active_offers=%s",
+                    wallet,
+                    offer_idx,
+                    len(selected_domains),
+                    domain.name,
+                    _format_decimal_plain(offer_amount),
+                    _format_decimal_plain(highest_offer),
+                    domain.highest_offer_symbol or "USDC.E",
+                    domain.active_offers_count,
+                )
+                ok, order_id, reason = _run_domain_place_offer_helper(
+                    cfg=cfg,
+                    logger=logger,
+                    wallet=wallet,
+                    private_key=private_key,
+                    domain=domain,
+                    offer_amount=offer_amount,
+                    duration_days=duration_days,
+                    proxy=proxy,
+                )
+                append_csv(
+                    offer_csv,
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        "ok" if ok else "failed",
+                        wallet,
+                        domain.name,
+                        _format_decimal_plain(offer_amount),
+                        _format_decimal_plain(duration_days),
+                        domain.token_address,
+                        domain.token_id,
+                        _format_decimal_plain(highest_offer),
+                        order_id,
+                        reason,
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+                if ok:
+                    wallet_success += 1
+                    placed_total += 1
+                    logger.info("[OFFER] wallet=%s domain=%s offer placed | order_id=%s", wallet, domain.name, order_id)
+                else:
+                    wallet_failed += 1
+                    logger.warning("[OFFER] wallet=%s domain=%s offer failed: %s", wallet, domain.name, reason)
+                if offer_idx < len(selected_domains):
+                    delay_sec = random.uniform(offer_delay_min, offer_delay_max)
+                    logger.info("[OFFER] delay before next offer: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+            if wallet_success > 0:
+                success_wallets += 1
+            if wallet_failed > 0:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[OFFER] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records):
+            delay_sec = random.uniform(offer_delay_min, offer_delay_max)
+            logger.info("[OFFER] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+    logger.info("[OFFER] placed offers total=%s", placed_total)
+    _print_mode_summary("OFFER", len(wallet_key_records), success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses)
 
 
 
@@ -6042,8 +6366,9 @@ def get_menu_choice() -> str:
     print("10) Cancel active domain listings")
     print("11) Buy $0.01 cheap tokens + claim subdomain")
     print("12) Season quest: bridge a domain from Doma to Base")
-    print("13) Exit")
-    return input("Select [1-13]: ").strip()
+    print("13) Place domain offers")
+    print("14) Exit")
+    return input("Select [1-14]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -6290,6 +6615,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Domain bridge to Base failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "13":
+            validate_config(cfg)
+            try:
+                run_domain_place_offer_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain offer mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return
