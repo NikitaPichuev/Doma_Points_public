@@ -1482,10 +1482,9 @@ def run_bridge_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     need_eth_price = False
     for raw in bridge_tasks:
         try:
-            _left, pair, amount_expr = [x.strip() for x in raw.split(":", 2)]
+            _left, _pair, amount_expr = [x.strip() for x in raw.split(":", 2)]
             mode, _ = parse_trade_amount_expression(amount_expr)
-            src_symbol = pair.split(">", 1)[0].strip().upper()
-            if mode == "usd" or (mode == "percent" and src_symbol == "ETH"):
+            if mode == "usd":
                 need_eth_price = True
                 break
         except Exception:
