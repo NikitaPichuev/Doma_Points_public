@@ -1412,8 +1412,8 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             )
         except Exception as exc:
             logger.warning("Points check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
-        if idx < len(wallets) - 1 and cfg.wallet_delay_max_sec > 0:
-            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+        if idx < len(wallets) - 1:
+            delay_sec = random.uniform(2, 5)
             logger.info("Delay before next wallet: %.2f sec", delay_sec)
             time.sleep(delay_sec)
 

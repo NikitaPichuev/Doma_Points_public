@@ -53,8 +53,8 @@ def main() -> None:
             f"weekly_points={snapshot.points} season_points={snapshot.trading_volume_usd} "
             f"meta={snapshot.snapshot_date}"
         )
-        if idx < len(wallets) - 1 and cfg.wallet_delay_max_sec > 0:
-            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+        if idx < len(wallets) - 1:
+            delay_sec = random.uniform(2, 5)
             print(f"Delay before next wallet: {delay_sec:.2f} sec")
             time.sleep(delay_sec)
 
