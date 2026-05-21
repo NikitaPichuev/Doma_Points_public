@@ -54,6 +54,10 @@ function summarizeError(error) {
   return text.split('\n')[0].slice(0, 600);
 }
 
+function stringifyJson(value) {
+  return JSON.stringify(value, (_key, v) => (typeof v === 'bigint' ? v.toString() : v));
+}
+
 function emitProgress(steps) {
   const latest = steps[steps.length - 1];
   if (!latest) {
@@ -61,7 +65,7 @@ function emitProgress(steps) {
   }
   const hashes = (latest.txHashes || []).map((x) => x.txHash).join(',');
   console.error(
-    JSON.stringify({
+    stringifyJson({
       type: 'progress',
       status: latest.status,
       action: latest.action,
@@ -154,11 +158,11 @@ async function main() {
       };
       const handler = new AcceptOfferHandler(config, apiClient, signer, `eip155:${chainId}`, emitProgress);
       const result = await handler.execute({ orderId });
-      console.log(JSON.stringify({ ok: true, rpcUrl, result }));
+      console.log(stringifyJson({ ok: true, rpcUrl, result }));
       return;
     } catch (error) {
       lastError = error;
-      console.error(JSON.stringify({ type: 'rpc_retry', rpc_url: rpcUrl, error: summarizeError(error) }));
+      console.error(stringifyJson({ type: 'rpc_retry', rpc_url: rpcUrl, error: summarizeError(error) }));
     }
   }
   throw new Error(`All accept-offer RPC attempts failed: ${summarizeError(lastError)}`);
@@ -169,6 +173,6 @@ main().catch((error) => {
     ok: false,
     error: error && error.stack ? error.stack : String(error),
   };
-  console.error(JSON.stringify(payload));
+  console.error(stringifyJson(payload));
   process.exit(1);
 });
