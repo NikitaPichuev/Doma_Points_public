@@ -22,6 +22,7 @@ from config import BotConfig
 from doma_api import (
     DomainListing,
     DomainOfferCandidate,
+    DomainReceivedOffer,
     DomaApiClient,
     DomaSubgraphClient,
     DOMA_INTERFACE_PORTION_BIPS,
@@ -106,6 +107,7 @@ DOMAIN_LISTING_CSV = Path("domain_listings.csv")
 DOMAIN_DELISTING_CSV = Path("domain_delistings.csv")
 DOMAIN_BRIDGE_CSV = Path("domain_bridges.csv")
 DOMAIN_OFFERS_CSV = Path("domain_offers.csv")
+DOMAIN_ACCEPTED_OFFERS_CSV = Path("domain_accepted_offers.csv")
 DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
@@ -3285,6 +3287,41 @@ def get_domain_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str
     return buffer_raw, max_offer_raw, duration_days_raw, str(offers_min), str(offers_max), delay_min_raw, delay_max_raw
 
 
+def get_domain_accept_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str]]:
+    print("\nAccept received top domain offers:")
+    min_offer_raw = input("Minimum top offer to accept USDC.E [0.01]: ").strip() or "0.01"
+    max_offer_raw = input("Maximum top offer to accept USDC.E [0.10]: ").strip() or "0.10"
+    accepts_min_raw = input("Minimum accepts per wallet [1]: ").strip() or "1"
+    accepts_max_raw = input("Maximum accepts per wallet [1]: ").strip() or "1"
+    delay_min_raw = input(f"Minimum delay between accepts sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between accepts sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    min_offer = _parse_decimal_input(min_offer_raw)
+    max_offer = _parse_decimal_input(max_offer_raw)
+    accepts_min = int(_parse_decimal_input(accepts_min_raw).to_integral_value(rounding=ROUND_FLOOR))
+    accepts_max = int(_parse_decimal_input(accepts_max_raw).to_integral_value(rounding=ROUND_CEILING))
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if min_offer < 0:
+        raise ValueError("Minimum accepted offer cannot be negative")
+    if max_offer <= 0:
+        raise ValueError("Maximum accepted offer must be > 0")
+    if max_offer < min_offer:
+        raise ValueError("Maximum accepted offer cannot be lower than minimum")
+    if accepts_min <= 0 or accepts_max <= 0:
+        raise ValueError("Accept counts per wallet must be > 0")
+    if accepts_max < accepts_min:
+        raise ValueError("Maximum accepts per wallet cannot be lower than minimum")
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Accept delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum accept delay cannot be lower than minimum delay")
+    return min_offer_raw, max_offer_raw, str(accepts_min), str(accepts_max), delay_min_raw, delay_max_raw
+
+
 def _random_decimal_between(min_value: Decimal, max_value: Decimal, min_raw: str, max_raw: str) -> Decimal:
     if min_value == max_value:
         return min_value
@@ -3347,6 +3384,10 @@ def _domain_cancel_listing_helper_path() -> Path:
 
 def _domain_place_offer_helper_path() -> Path:
     return Path(__file__).with_name("doma_place_offer.mjs")
+
+
+def _domain_accept_offer_helper_path() -> Path:
+    return Path(__file__).with_name("doma_accept_offer.mjs")
 
 
 def _domain_listing_loader_path() -> Path:
@@ -3608,6 +3649,90 @@ def _run_domain_place_offer_helper(
     orders = (data.get("result") or {}).get("orders") or []
     order_id = str((orders[0] or {}).get("orderId") or "") if orders else ""
     return True, order_id, ""
+
+
+def _run_domain_accept_offer_helper(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    private_key: str,
+    offer: DomainReceivedOffer,
+    proxy: Optional[str],
+) -> Tuple[bool, str, str]:
+    helper_path = _domain_accept_offer_helper_path()
+    if not helper_path.exists():
+        raise FileNotFoundError(f"Accept offer helper not found: {helper_path}")
+    loader_path = _domain_listing_loader_path()
+    if not loader_path.exists():
+        raise FileNotFoundError(f"Node ESM loader not found: {loader_path}")
+    payload = {
+        "chainId": cfg.chain_id,
+        "rpcUrl": cfg.rpc_url,
+        "rpcUrls": _doma_rpc_candidates(cfg),
+        "privateKey": private_key,
+        "orderId": offer.order_id,
+        "source": DOMAIN_LISTING_SOURCE,
+        "orderbookBaseUrl": _doma_orderbook_base_url(cfg),
+        "apiKey": _first_doma_api_key(cfg),
+        "proxy": proxy or "",
+    }
+    env = dict(os.environ)
+    if proxy:
+        env["HTTP_PROXY"] = proxy
+        env["HTTPS_PROXY"] = proxy
+    env["NODE_NO_WARNINGS"] = "1"
+    result = subprocess.run(
+        ["node", "--loader", loader_path.as_uri(), str(helper_path)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=str(helper_path.parent),
+        env=env,
+        timeout=600,
+    )
+    for line in result.stderr.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            logger.info("[ACCEPT_OFFER] wallet=%s domain=%s helper: %s", wallet, offer.name, line)
+            continue
+        if event.get("type") == "progress":
+            tx_hashes = event.get("tx_hashes") or ""
+            if tx_hashes:
+                logger.info(
+                    "[ACCEPT_OFFER] wallet=%s domain=%s progress | action=%s state=%s tx=%s",
+                    wallet,
+                    offer.name,
+                    event.get("action") or "",
+                    event.get("state") or event.get("status") or "",
+                    tx_hashes,
+                )
+        elif event.get("type") == "rpc_retry":
+            logger.info(
+                "[ACCEPT_OFFER] wallet=%s domain=%s rpc retry | url=%s | error=%s",
+                wallet,
+                offer.name,
+                event.get("rpc_url") or "",
+                event.get("error") or "",
+            )
+        elif not event.get("ok", True):
+            logger.warning("[ACCEPT_OFFER] wallet=%s domain=%s helper error: %s", wallet, offer.name, event.get("error"))
+    if result.returncode != 0:
+        return False, "", (result.stderr or result.stdout or f"node exited with {result.returncode}").strip()
+    try:
+        data = json.loads(result.stdout.splitlines()[-1])
+    except Exception as exc:
+        return False, "", f"failed to parse helper output: {exc}; stdout={result.stdout.strip()}"
+    if not data.get("ok"):
+        return False, "", str(data.get("error") or "unknown helper error")
+    tx_hash = str(((data.get("result") or {}).get("transactionHash")) or "")
+    status = str(((data.get("result") or {}).get("status")) or "")
+    if status and status != "success":
+        return False, tx_hash, f"transaction status={status}"
+    return True, tx_hash, ""
 
 
 def _eligible_unlisted_domains(all_domains: List[OwnedDomain], listed_domains: List[OwnedDomain], chain_id: int) -> List[OwnedDomain]:
@@ -4198,6 +4323,190 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
             logger.warning("[OFFER] skipped | #%s %s | %s", wallet_number, wallet, reason)
             print(line)
     _print_mode_summary("OFFER", len(wallet_key_records), success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses)
+
+
+def run_domain_accept_offer_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    picked = get_domain_accept_offer_menu_input()
+    if not picked:
+        logger.info("[ACCEPT_OFFER] canceled by user.")
+        return
+    min_offer_raw, max_offer_raw, accepts_min_raw, accepts_max_raw, delay_min_raw, delay_max_raw = picked
+    min_offer_amount = _parse_decimal_input(min_offer_raw)
+    max_offer_amount = _parse_decimal_input(max_offer_raw)
+    accepts_min = int(_parse_decimal_input(accepts_min_raw))
+    accepts_max = int(_parse_decimal_input(accepts_max_raw))
+    accept_delay_min = float(_parse_decimal_input(delay_min_raw))
+    accept_delay_max = float(_parse_decimal_input(delay_max_raw))
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "ACCEPT_OFFER")
+    if not wallet_key_records:
+        raise ValueError("No wallet/private-key pairs available for accepting domain offers")
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
+    accept_csv = cfg.trades_csv_file.parent / DOMAIN_ACCEPTED_OFFERS_CSV.name
+    ensure_csv(
+        accept_csv,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "domain",
+            "accepted_usdce",
+            "token_address",
+            "token_id",
+            "offerer_address",
+            "active_offers_count",
+            "order_id",
+            "tx_hash",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    logger.info(
+        "[ACCEPT_OFFER] mode started | wallets=%s | start_wallet=%s | accept_range=%s-%s USDC.E | accepts_per_wallet=%s-%s | delay=%s-%s sec",
+        total_loaded_wallets,
+        wallet_start_offset + 1,
+        _format_decimal_plain(min_offer_amount),
+        _format_decimal_plain(max_offer_amount),
+        accepts_min,
+        accepts_max,
+        delay_min_raw,
+        delay_max_raw,
+    )
+
+    success_wallets = 0
+    failed_wallets = 0
+    skipped_wallets = 0
+    accepted_total = 0
+    failed_wallet_addresses: List[str] = []
+    skipped_wallet_details: List[Tuple[int, str, str]] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "ACCEPT_OFFER")
+        proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+        wallet_number = wallet_start_offset + idx
+        logger.info("[ACCEPT_OFFER] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        if skip_wallet or not proxies:
+            skipped_wallets += 1
+            skipped_wallet_details.append((wallet_number, wallet, "proxy is required"))
+            logger.warning("[ACCEPT_OFFER] wallet=%s skipped: proxy is required for accepting offers", wallet)
+            continue
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+                proxies=proxies,
+            )
+            offers = doma_api.fetch_wallet_received_top_offers(wallet, chain_id=cfg.chain_id, take=100, max_pages=10)
+            owner_caip = f"eip155:{cfg.chain_id}:{wallet.lower()}"
+            eligible: List[Tuple[DomainReceivedOffer, Decimal]] = []
+            for offer in offers:
+                if offer.owner_address.lower() != owner_caip:
+                    continue
+                if offer.offerer_address.lower() == owner_caip:
+                    continue
+                amount = raw_to_decimal(int(offer.price_raw or "0"), offer.currency_decimals or 6)
+                if amount < min_offer_amount or amount > max_offer_amount:
+                    continue
+                if (offer.currency_symbol or "").lower() not in {"usdc.e", "usdce"}:
+                    continue
+                eligible.append((offer, amount))
+            eligible.sort(key=lambda item: item[1], reverse=True)
+            accepts_to_make = min(random.randint(accepts_min, accepts_max), len(eligible))
+            if accepts_to_make <= 0:
+                skipped_wallets += 1
+                skipped_wallet_details.append((wallet_number, wallet, "no received top offers in accepted range"))
+                logger.info(
+                    "[ACCEPT_OFFER] wallet=%s no eligible received offers | fetched=%s | range=%s-%s USDC.E",
+                    wallet,
+                    len(offers),
+                    _format_decimal_plain(min_offer_amount),
+                    _format_decimal_plain(max_offer_amount),
+                )
+                continue
+
+            wallet_success = 0
+            wallet_failed = 0
+            selected_offers = eligible[:accepts_to_make]
+            logger.info(
+                "[ACCEPT_OFFER] wallet=%s selected=%s/%s received top offers | range=%s-%s USDC.E | proxy=yes",
+                wallet,
+                len(selected_offers),
+                len(eligible),
+                _format_decimal_plain(min_offer_amount),
+                _format_decimal_plain(max_offer_amount),
+            )
+            for offer_idx, (offer, amount) in enumerate(selected_offers, start=1):
+                logger.info(
+                    "[ACCEPT_OFFER] wallet=%s domain %s/%s %s | accept=%s %s | active_offers=%s | order_id=%s",
+                    wallet,
+                    offer_idx,
+                    len(selected_offers),
+                    offer.name,
+                    _format_decimal_plain(amount),
+                    offer.currency_symbol or "USDC.E",
+                    offer.active_offers_count,
+                    offer.order_id,
+                )
+                ok, tx_hash, reason = _run_domain_accept_offer_helper(
+                    cfg=cfg,
+                    logger=logger,
+                    wallet=wallet,
+                    private_key=private_key,
+                    offer=offer,
+                    proxy=proxy,
+                )
+                append_csv(
+                    accept_csv,
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        "ok" if ok else "failed",
+                        wallet,
+                        offer.name,
+                        _format_decimal_plain(amount),
+                        offer.token_address,
+                        offer.token_id,
+                        offer.offerer_address,
+                        str(offer.active_offers_count),
+                        offer.order_id,
+                        tx_hash,
+                        reason,
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+                if ok:
+                    wallet_success += 1
+                    accepted_total += 1
+                    logger.info("[ACCEPT_OFFER] wallet=%s domain=%s offer accepted | tx=%s", wallet, offer.name, tx_hash)
+                else:
+                    wallet_failed += 1
+                    logger.warning("[ACCEPT_OFFER] wallet=%s domain=%s accept failed: %s", wallet, offer.name, reason)
+                if offer_idx < len(selected_offers):
+                    delay_sec = random.uniform(accept_delay_min, accept_delay_max)
+                    logger.info("[ACCEPT_OFFER] delay before next accept: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+            if wallet_success > 0:
+                success_wallets += 1
+            if wallet_failed > 0:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[ACCEPT_OFFER] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records):
+            delay_sec = random.uniform(accept_delay_min, accept_delay_max)
+            logger.info("[ACCEPT_OFFER] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+    logger.info("[ACCEPT_OFFER] accepted offers total=%s", accepted_total)
+    if skipped_wallet_details:
+        logger.warning("[ACCEPT_OFFER] skipped wallets:")
+        print("\n[ACCEPT_OFFER] skipped wallets:")
+        for wallet_number, wallet, reason in skipped_wallet_details:
+            line = f"  #{wallet_number} {wallet} | {reason}"
+            logger.warning("[ACCEPT_OFFER] skipped | #%s %s | %s", wallet_number, wallet, reason)
+            print(line)
+    _print_mode_summary("ACCEPT_OFFER", len(wallet_key_records), success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses)
 
 
 
@@ -6643,8 +6952,9 @@ def get_menu_choice() -> str:
     print("11) Buy $0.01 cheap tokens + claim subdomain")
     print("12) Season quest: bridge a domain from Doma to Base")
     print("13) Place domain offers")
-    print("14) Exit")
-    return input("Select [1-14]: ").strip()
+    print("14) Accept received domain offers")
+    print("15) Exit")
+    return input("Select [1-15]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -6901,6 +7211,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Domain offer mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "14":
+            validate_config(cfg)
+            try:
+                run_domain_accept_offer_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain accept-offer mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

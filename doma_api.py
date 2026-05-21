@@ -445,6 +445,22 @@ class DomainOfferCandidate:
 
 
 @dataclass
+class DomainReceivedOffer:
+    name: str
+    order_id: str
+    token_id: str
+    token_address: str
+    network_id: str
+    owner_address: str
+    offerer_address: str
+    price_raw: str
+    currency_symbol: str
+    currency_decimals: int
+    expires_at: str
+    active_offers_count: int
+
+
+@dataclass
 class UniversalRouterQuote:
     to: str
     calldata: str
@@ -1085,6 +1101,112 @@ class DomaApiClient:
                 )
             if not names_page.get("hasNextPage"):
                 break
+        return out
+
+    def fetch_wallet_received_top_offers(
+        self,
+        wallet_address: str,
+        chain_id: int = 97477,
+        take: int = 100,
+        max_pages: int = 50,
+    ) -> List[DomainReceivedOffer]:
+        query = """
+        query WalletReceivedOffers(
+          $ownedBy: [AddressCAIP10!]
+          $networkIds: [String!]
+          $statuses: [NameOrderbookStatusFilter!]
+          $skip: Int
+          $take: Int
+        ) {
+          names(
+            ownedBy: $ownedBy
+            networkIds: $networkIds
+            statuses: $statuses
+            skip: $skip
+            take: $take
+            includeDetokenized: false
+          ) {
+            items {
+              name
+              activeOffersCount
+              highestOffer {
+                id
+                externalId
+                price
+                offererAddress
+                expiresAt
+                currency {
+                  symbol
+                  decimals
+                }
+              }
+              ownershipToken {
+                tokenId
+                tokenAddress
+                networkId
+                ownerAddress
+                orderbookDisabled
+              }
+            }
+            hasNextPage
+          }
+        }
+        """
+        wallet_caip = f"eip155:{chain_id}:{wallet_address.lower()}"
+        target_network = f"eip155:{chain_id}"
+        out: List[DomainReceivedOffer] = []
+        seen: set[str] = set()
+        page_take = max(1, min(int(take), 500))
+        skip = 0
+        for _ in range(max_pages):
+            data = self._post(
+                query,
+                {
+                    "ownedBy": [wallet_caip],
+                    "networkIds": [target_network],
+                    "statuses": ["OFFERS_RECEIVED"],
+                    "skip": skip,
+                    "take": page_take,
+                },
+            )
+            names_page = data.get("names") or {}
+            items = names_page.get("items") or []
+            for item in items:
+                token = item.get("ownershipToken") or {}
+                highest_offer = item.get("highestOffer") or {}
+                if bool(token.get("orderbookDisabled") or False):
+                    continue
+                name = str(item.get("name") or "").strip().lower()
+                token_id = str(token.get("tokenId") or "").strip()
+                token_address = str(token.get("tokenAddress") or "").strip().lower()
+                network_id = str(token.get("networkId") or "").strip()
+                owner_address = str(token.get("ownerAddress") or "").strip().lower()
+                order_id = str(highest_offer.get("externalId") or highest_offer.get("id") or "").strip()
+                if not name or not token_id or not token_address or network_id != target_network:
+                    continue
+                if not order_id or order_id in seen:
+                    continue
+                seen.add(order_id)
+                currency = highest_offer.get("currency") or {}
+                out.append(
+                    DomainReceivedOffer(
+                        name=name,
+                        order_id=order_id,
+                        token_id=token_id,
+                        token_address=token_address,
+                        network_id=network_id,
+                        owner_address=owner_address,
+                        offerer_address=str(highest_offer.get("offererAddress") or "").strip().lower(),
+                        price_raw=str(highest_offer.get("price") or "0"),
+                        currency_symbol=str(currency.get("symbol") or ""),
+                        currency_decimals=int(currency.get("decimals") or 6),
+                        expires_at=str(highest_offer.get("expiresAt") or ""),
+                        active_offers_count=int(item.get("activeOffersCount") or 0),
+                    )
+                )
+            if not names_page.get("hasNextPage"):
+                break
+            skip += len(items) if items else page_take
         return out
 
     def fetch_wallet_fractional_token_volume_usd(

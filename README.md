@@ -108,7 +108,8 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 11) Buy $0.01 cheap tokens + claim subdomain
 12) Season quest: bridge a domain from Doma to Base
 13) Place domain offers
-14) Exit
+14) Accept received domain offers
+15) Exit
 ```
 
 ## 1) Bridge
@@ -286,6 +287,31 @@ Start from wallet number
 - результаты пишутся в `domain_offers.csv`;
 - используется `@doma-protocol/orderbook-sdk` через Node helper.
 
+## 14) Accept received domain offers
+
+Принимает входящие top offer по доменам кошелька через Doma orderbook SDK.
+
+Параметры:
+
+```text
+Minimum top offer to accept USDC.E
+Maximum top offer to accept USDC.E
+Minimum accepts per wallet
+Maximum accepts per wallet
+Minimum delay between accepts sec
+Maximum delay between accepts sec
+Start from wallet number
+```
+
+Текущая логика:
+
+- берет только домены текущего кошелька со статусом `OFFERS_RECEIVED`;
+- принимает только `highestOffer.externalId`, то есть top offer по домену;
+- фильтрует офферы по диапазону min/max USDC.E;
+- один accepted offer продает/передает домен покупателю;
+- результаты пишутся в `domain_accepted_offers.csv`;
+- пропущенные кошельки печатаются в конце, чтобы их можно было доделать вручную.
+
 ## Doma Quests
 
 Практическое соответствие режимов:
@@ -343,6 +369,7 @@ badges_parser.py         badge holder parser and export tool
 doma_list_domain.mjs     Doma orderbook listing helper
 doma_cancel_listing.mjs  Doma orderbook cancel helper
 doma_place_offer.mjs     Doma orderbook offer helper
+doma_accept_offer.mjs    Doma orderbook accept-offer helper
 doma_node_esm_loader.mjs Node ESM compatibility loader for Doma SDK
 ```
 
@@ -355,6 +382,7 @@ trades.csv
 points.csv
 domain_listings.csv
 domain_offers.csv
+domain_accepted_offers.csv
 bot.log
 state.json
 ```
