@@ -294,10 +294,6 @@ Start from wallet number
 Параметры:
 
 ```text
-Minimum top offer to accept USDC.E
-Maximum top offer to accept USDC.E
-Minimum accepts per wallet
-Maximum accepts per wallet
 Minimum delay between accepts sec
 Maximum delay between accepts sec
 Start from wallet number
@@ -307,7 +303,7 @@ Start from wallet number
 
 - берет только домены текущего кошелька со статусом `OFFERS_RECEIVED`;
 - принимает только `highestOffer.externalId`, то есть top offer по домену;
-- фильтрует офферы по диапазону min/max USDC.E;
+- сортирует входящие top offers по цене и принимает самый дорогой на кошельке;
 - один accepted offer продает/передает домен покупателю;
 - результаты пишутся в `domain_accepted_offers.csv`;
 - пропущенные кошельки печатаются в конце, чтобы их можно было доделать вручную.

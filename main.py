@@ -3287,39 +3287,21 @@ def get_domain_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str
     return buffer_raw, max_offer_raw, duration_days_raw, str(offers_min), str(offers_max), delay_min_raw, delay_max_raw
 
 
-def get_domain_accept_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str]]:
+def get_domain_accept_offer_menu_input() -> Optional[Tuple[str, str]]:
     print("\nAccept received top domain offers:")
-    min_offer_raw = input("Minimum top offer to accept USDC.E [0.01]: ").strip() or "0.01"
-    max_offer_raw = input("Maximum top offer to accept USDC.E [0.10]: ").strip() or "0.10"
-    accepts_min_raw = input("Minimum accepts per wallet [1]: ").strip() or "1"
-    accepts_max_raw = input("Maximum accepts per wallet [1]: ").strip() or "1"
     delay_min_raw = input(f"Minimum delay between accepts sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
     delay_max_raw = input(f"Maximum delay between accepts sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
     if not delay_min_raw:
         delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
     if not delay_max_raw:
         delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
-    min_offer = _parse_decimal_input(min_offer_raw)
-    max_offer = _parse_decimal_input(max_offer_raw)
-    accepts_min = int(_parse_decimal_input(accepts_min_raw).to_integral_value(rounding=ROUND_FLOOR))
-    accepts_max = int(_parse_decimal_input(accepts_max_raw).to_integral_value(rounding=ROUND_CEILING))
     delay_min = _parse_decimal_input(delay_min_raw)
     delay_max = _parse_decimal_input(delay_max_raw)
-    if min_offer < 0:
-        raise ValueError("Minimum accepted offer cannot be negative")
-    if max_offer <= 0:
-        raise ValueError("Maximum accepted offer must be > 0")
-    if max_offer < min_offer:
-        raise ValueError("Maximum accepted offer cannot be lower than minimum")
-    if accepts_min <= 0 or accepts_max <= 0:
-        raise ValueError("Accept counts per wallet must be > 0")
-    if accepts_max < accepts_min:
-        raise ValueError("Maximum accepts per wallet cannot be lower than minimum")
     if delay_min < 0 or delay_max < 0:
         raise ValueError("Accept delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum accept delay cannot be lower than minimum delay")
-    return min_offer_raw, max_offer_raw, str(accepts_min), str(accepts_max), delay_min_raw, delay_max_raw
+    return delay_min_raw, delay_max_raw
 
 
 def _random_decimal_between(min_value: Decimal, max_value: Decimal, min_raw: str, max_raw: str) -> Decimal:
@@ -4330,11 +4312,7 @@ def run_domain_accept_offer_once(cfg: BotConfig, logger: logging.Logger, state: 
     if not picked:
         logger.info("[ACCEPT_OFFER] canceled by user.")
         return
-    min_offer_raw, max_offer_raw, accepts_min_raw, accepts_max_raw, delay_min_raw, delay_max_raw = picked
-    min_offer_amount = _parse_decimal_input(min_offer_raw)
-    max_offer_amount = _parse_decimal_input(max_offer_raw)
-    accepts_min = int(_parse_decimal_input(accepts_min_raw))
-    accepts_max = int(_parse_decimal_input(accepts_max_raw))
+    delay_min_raw, delay_max_raw = picked
     accept_delay_min = float(_parse_decimal_input(delay_min_raw))
     accept_delay_max = float(_parse_decimal_input(delay_max_raw))
 
@@ -4363,13 +4341,9 @@ def run_domain_accept_offer_once(cfg: BotConfig, logger: logging.Logger, state: 
     )
 
     logger.info(
-        "[ACCEPT_OFFER] mode started | wallets=%s | start_wallet=%s | accept_range=%s-%s USDC.E | accepts_per_wallet=%s-%s | delay=%s-%s sec",
+        "[ACCEPT_OFFER] mode started | wallets=%s | start_wallet=%s | accepting highest received top offer per wallet | delay=%s-%s sec",
         total_loaded_wallets,
         wallet_start_offset + 1,
-        _format_decimal_plain(min_offer_amount),
-        _format_decimal_plain(max_offer_amount),
-        accepts_min,
-        accepts_max,
         delay_min_raw,
         delay_max_raw,
     )
@@ -4406,35 +4380,28 @@ def run_domain_accept_offer_once(cfg: BotConfig, logger: logging.Logger, state: 
                 if offer.offerer_address.lower() == owner_caip:
                     continue
                 amount = raw_to_decimal(int(offer.price_raw or "0"), offer.currency_decimals or 6)
-                if amount < min_offer_amount or amount > max_offer_amount:
-                    continue
                 if (offer.currency_symbol or "").lower() not in {"usdc.e", "usdce"}:
                     continue
                 eligible.append((offer, amount))
             eligible.sort(key=lambda item: item[1], reverse=True)
-            accepts_to_make = min(random.randint(accepts_min, accepts_max), len(eligible))
-            if accepts_to_make <= 0:
+            if not eligible:
                 skipped_wallets += 1
-                skipped_wallet_details.append((wallet_number, wallet, "no received top offers in accepted range"))
+                skipped_wallet_details.append((wallet_number, wallet, "no received top offers"))
                 logger.info(
-                    "[ACCEPT_OFFER] wallet=%s no eligible received offers | fetched=%s | range=%s-%s USDC.E",
+                    "[ACCEPT_OFFER] wallet=%s no eligible received offers | fetched=%s",
                     wallet,
                     len(offers),
-                    _format_decimal_plain(min_offer_amount),
-                    _format_decimal_plain(max_offer_amount),
                 )
                 continue
 
             wallet_success = 0
             wallet_failed = 0
-            selected_offers = eligible[:accepts_to_make]
+            selected_offers = eligible[:1]
             logger.info(
-                "[ACCEPT_OFFER] wallet=%s selected=%s/%s received top offers | range=%s-%s USDC.E | proxy=yes",
+                "[ACCEPT_OFFER] wallet=%s selected highest=%s/%s received top offers | proxy=yes",
                 wallet,
                 len(selected_offers),
                 len(eligible),
-                _format_decimal_plain(min_offer_amount),
-                _format_decimal_plain(max_offer_amount),
             )
             for offer_idx, (offer, amount) in enumerate(selected_offers, start=1):
                 logger.info(
