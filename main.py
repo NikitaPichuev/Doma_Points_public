@@ -2347,10 +2347,21 @@ def run_domain_quest_volume_once(
         )
     wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
 
+    metadata_proxies: Optional[Dict[str, str]] = None
+    for metadata_line_idx, _, _ in wallet_key_records:
+        candidate_proxies, skip_metadata_proxy = _proxy_for_line(cfg, metadata_line_idx, None, "QUEST_METADATA")
+        if not skip_metadata_proxy:
+            metadata_proxies = candidate_proxies
+            break
+    if metadata_proxies:
+        logger.info(_quest_log("metadata API will use proxy from first available wallet after start"))
+    else:
+        logger.info(_quest_log("metadata API will use direct connection"))
+
     shared_doma_api = DomaApiClient(
         cfg.doma_api_url,
-        api_key=cfg.doma_api_key,
-        api_keys=cfg.doma_api_keys,
+        api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+        proxies=metadata_proxies,
     )
     launchpad_info = shared_doma_api.fetch_fractional_token_by_name(domain_name)
     if not launchpad_info:
