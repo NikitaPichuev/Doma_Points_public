@@ -328,7 +328,9 @@ Current logic:
 - fetches top 10 pools by TVL from the Doma API, with subgraph fallback;
 - picks one of those pools randomly per wallet;
 - chooses total liquidity randomly inside min/max USD;
-- splits target USD 50/50 between token0 and token1;
+- treats min/max as the target UI liquidity range;
+- adds an internal 1.18x mint buffer because full-range mint/UI valuation can consume/show less than the pre-mint USD estimate;
+- splits buffered mint budget 50/50 between token0 and token1;
 - tops up missing tokens via USDC.E or ETH using Doma UI route;
 - wraps ETH to WETH when WETH is required;
 - approves token0/token1 to the position manager;

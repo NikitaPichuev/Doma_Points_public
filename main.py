@@ -109,6 +109,7 @@ DOMAIN_BRIDGE_CSV = Path("domain_bridges.csv")
 DOMAIN_OFFERS_CSV = Path("domain_offers.csv")
 DOMAIN_ACCEPTED_OFFERS_CSV = Path("domain_accepted_offers.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
+DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.18")
 DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
@@ -4716,12 +4717,13 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         raise RuntimeError("No top TVL pools available")
 
     logger.info(
-        "[LIQUIDITY] mode started | wallets=%s | start_wallet=%s | top_pools=%s | target=%s-%s USD | delay=%s-%s sec",
+        "[LIQUIDITY] mode started | wallets=%s | start_wallet=%s | top_pools=%s | target=%s-%s USD | mint_buffer=%sx | delay=%s-%s sec",
         total_loaded_wallets,
         wallet_start_offset + 1,
         len(top_pools),
         _format_decimal_plain(min_usd),
         _format_decimal_plain(max_usd),
+        _format_decimal_plain(DOMAIN_LIQUIDITY_MINT_BUFFER),
         delay_min_raw,
         delay_max_raw,
     )
@@ -4743,7 +4745,9 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
 
         target_usd = _random_decimal_between(min_usd, max_usd, min_usd_raw, max_usd_raw)
         pool = random.choice(top_pools)
+        mint_target_usd = (target_usd * DOMAIN_LIQUIDITY_MINT_BUFFER).quantize(Decimal("0.000001"))
         half_usd = target_usd / Decimal("2")
+        half_mint_usd = mint_target_usd / Decimal("2")
         token0_price = pick_token_usd_price(pool.token0, eth_price)
         token1_price = pick_token_usd_price(pool.token1, eth_price)
         if token0_price <= 0 or token1_price <= 0:
@@ -4776,7 +4780,7 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             )
 
             logger.info(
-                "[LIQUIDITY] wallet=%s pool=%s %s/%s fee=%s target=%s USD split=%s/%s USD tvl=%s",
+                "[LIQUIDITY] wallet=%s pool=%s %s/%s fee=%s target=%s USD split=%s/%s USD | mint_budget=%s USD split=%s/%s USD | tvl=%s",
                 wallet,
                 pool.address,
                 pool.token0.symbol,
@@ -4785,6 +4789,9 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 _format_decimal_plain(target_usd),
                 _format_decimal_plain(half_usd),
                 _format_decimal_plain(half_usd),
+                _format_decimal_plain(mint_target_usd),
+                _format_decimal_plain(half_mint_usd),
+                _format_decimal_plain(half_mint_usd),
                 _format_decimal_plain(pool.tvl_usd),
             )
 
@@ -4800,7 +4807,7 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 quote_token,
                 weth_token,
                 eth_price,
-                half_usd,
+                half_mint_usd,
                 label,
             )
             if ok0 and state.last_tx_hash and state.last_tx_hash != prev_tx_hash:
@@ -4817,7 +4824,7 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 quote_token,
                 weth_token,
                 eth_price,
-                half_usd,
+                half_mint_usd,
                 label,
             )
             if ok1 and state.last_tx_hash and state.last_tx_hash != prev_tx_hash:
@@ -4825,8 +4832,8 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             if not ok0 or not ok1:
                 raise RuntimeError("failed to prepare token balances for liquidity")
 
-            desired0 = _token_amount_for_usd(pool.token0, half_usd, eth_price)
-            desired1 = _token_amount_for_usd(pool.token1, half_usd, eth_price)
+            desired0 = _token_amount_for_usd(pool.token0, half_mint_usd, eth_price)
+            desired1 = _token_amount_for_usd(pool.token1, half_mint_usd, eth_price)
             bal0 = exec_client.get_erc20_balance(pool.token0.address, pool.token0.decimals)
             bal1 = exec_client.get_erc20_balance(pool.token1.address, pool.token1.decimals)
             amount0 = min(bal0, desired0)
