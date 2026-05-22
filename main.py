@@ -1405,81 +1405,82 @@ def build_clients(cfg: BotConfig, state: BotState, create_exec: bool = True):
     return proxies, subgraph, points_api, exec_client
 
 
-def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
-    wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
-    if not wallets:
-        logger.warning("Points check skipped: no wallets configured")
+def _wallet_api_context(
+    cfg: BotConfig,
+    idx: int,
+    logger: logging.Logger,
+    mode: str,
+) -> Optional[Tuple[str, Optional[Dict[str, str]]]]:
+    api_key = cfg.file_api_keys[idx].strip() if idx < len(cfg.file_api_keys) else ""
+    if not api_key and cfg.file_api_keys:
+        logger.warning("%s skipped for line %s: no API key on same line", mode, idx + 1)
+        return None
+    if not api_key and cfg.doma_api_key.strip():
+        api_key = cfg.doma_api_key.strip()
+
+    proxy = cfg.file_proxies[idx].strip() if idx < len(cfg.file_proxies) else ""
+    if cfg.file_proxies and idx >= len(cfg.file_proxies):
+        logger.warning("%s skipped for line %s: no proxy on same line", mode, idx + 1)
+        return None
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    return api_key, proxies
+
+
+def _write_points_snapshot(cfg: BotConfig, logger: logging.Logger, wallet: str, line_no: int, api: DomaApiClient) -> None:
+    snapshot: Optional[PointsSnapshot] = api.fetch_points(wallet, cfg.leaderboard_rank_by)
+    if not snapshot:
+        logger.info("Points: no leaderboard row for wallet %s", wallet)
         return
-    for idx, wallet in enumerate(wallets):
-        api_key = cfg.file_api_keys[idx].strip() if idx < len(cfg.file_api_keys) else ""
-        if not api_key and cfg.file_api_keys:
-            logger.warning("Points check skipped for line %s: no API key on same line", idx + 1)
-            continue
-        if not api_key and cfg.doma_api_key.strip():
-            api_key = cfg.doma_api_key.strip()
+    append_csv(
+        cfg.points_csv_file,
+        [
+            datetime.now(timezone.utc).isoformat(),
+            snapshot.wallet_address,
+            snapshot.rank,
+            str(snapshot.points),
+            str(snapshot.trading_volume_usd),
+            str(snapshot.liquid_amount_usd),
+            snapshot.referral_count,
+            snapshot.total_snapshot_entries,
+            snapshot.snapshot_date,
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+    logger.info(
+        "Points [%s] [line=%s]: rank=%s/%s weekly_pts=%s season_pts=%s meta=%s",
+        snapshot.wallet_address,
+        line_no,
+        snapshot.rank,
+        snapshot.total_snapshot_entries,
+        snapshot.points,
+        snapshot.trading_volume_usd,
+        snapshot.snapshot_date,
+    )
 
-        proxy = cfg.file_proxies[idx].strip() if idx < len(cfg.file_proxies) else ""
-        if cfg.file_proxies and idx >= len(cfg.file_proxies):
-            logger.warning("Points check skipped for line %s: no proxy on same line", idx + 1)
-            continue
 
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        points_api = DomaApiClient(
-            cfg.doma_api_url,
-            api_key=api_key,
-            api_keys=[api_key] if api_key else [],
-            proxies=proxies,
+def _log_quests_column(logger: logging.Logger, wallet: str, line_no: int, quests: List[QuestStatus]) -> None:
+    lines = [f"Quests [{wallet}] [line={line_no}]"]
+    for period in ("DAILY", "WEEKLY", "SEASON"):
+        period_quests = sorted(
+            [q for q in quests if q.reset_period.upper() == period],
+            key=lambda q: (q.priority, q.quest_id),
         )
-        try:
-            snapshot: Optional[PointsSnapshot] = points_api.fetch_points(wallet, cfg.leaderboard_rank_by)
-            if not snapshot:
-                logger.info("Points: no leaderboard row for wallet %s", wallet)
-                continue
-            append_csv(
-                cfg.points_csv_file,
-                [
-                    datetime.now(timezone.utc).isoformat(),
-                    snapshot.wallet_address,
-                    snapshot.rank,
-                    str(snapshot.points),
-                    str(snapshot.trading_volume_usd),
-                    str(snapshot.liquid_amount_usd),
-                    snapshot.referral_count,
-                    snapshot.total_snapshot_entries,
-                    snapshot.snapshot_date,
-                ],
-                delimiter=cfg.csv_delimiter,
-            )
-            logger.info(
-                "Points [%s] [line=%s]: rank=%s/%s weekly_pts=%s season_pts=%s meta=%s",
-                snapshot.wallet_address,
-                idx + 1,
-                snapshot.rank,
-                snapshot.total_snapshot_entries,
-                snapshot.points,
-                snapshot.trading_volume_usd,
-                snapshot.snapshot_date,
-            )
-        except Exception as exc:
-            logger.warning("Points check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
-        if idx < len(wallets) - 1:
-            delay_sec = random.uniform(2, 5)
-            logger.info("Delay before next wallet: %.2f sec", delay_sec)
-            time.sleep(delay_sec)
+        done = sum(1 for q in period_quests if q.completed)
+        lines.append(f"  {period}: {done}/{len(period_quests)}")
+        for quest in period_quests:
+            marker = "DONE" if quest.completed else "MISS"
+            completed_at = f" | {quest.completed_at}" if quest.completed_at else ""
+            lines.append(f"    [{marker}] {quest.description} (+{_format_decimal_plain(quest.points_to_award)} pts){completed_at}")
+    logger.info("\n".join(lines))
 
 
-def _quest_period_summary(quests: List[QuestStatus], period: str) -> Tuple[int, int, List[str]]:
-    period_quests = [q for q in quests if q.reset_period.upper() == period]
-    completed = sum(1 for q in period_quests if q.completed)
-    missing = [q.description for q in period_quests if not q.completed]
-    return completed, len(period_quests), missing
-
-
-def run_quest_check_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
-    wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
-    if not wallets:
-        logger.warning("Quest check skipped: no wallets configured")
-        return
+def _write_quest_statuses(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    line_no: int,
+    api: DomaApiClient,
+) -> None:
     quests_csv = cfg.points_csv_file.parent / DOMAIN_QUESTS_CSV.name
     ensure_csv(
         quests_csv,
@@ -1497,66 +1498,50 @@ def run_quest_check_once(cfg: BotConfig, logger: logging.Logger, state: BotState
         ],
         delimiter=cfg.csv_delimiter,
     )
+    quests = api.fetch_quests(wallet, cfg.chain_id)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for quest in sorted(quests, key=lambda q: (q.reset_period, q.priority, q.quest_id)):
+        append_csv(
+            quests_csv,
+            [
+                now_iso,
+                wallet,
+                line_no,
+                quest.reset_period,
+                quest.quest_type,
+                quest.description,
+                str(quest.points_to_award),
+                "yes" if quest.completed else "no",
+                quest.completed_at,
+                quest.available_at,
+            ],
+            delimiter=cfg.csv_delimiter,
+        )
+    _log_quests_column(logger, wallet, line_no, quests)
+
+
+def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
+    if not wallets:
+        logger.warning("Points check skipped: no wallets configured")
+        return
     for idx, wallet in enumerate(wallets):
-        api_key = cfg.file_api_keys[idx].strip() if idx < len(cfg.file_api_keys) else ""
-        if not api_key and cfg.file_api_keys:
-            logger.warning("Quest check skipped for line %s: no API key on same line", idx + 1)
+        ctx = _wallet_api_context(cfg, idx, logger, "Points/quests check")
+        if ctx is None:
             continue
-        if not api_key and cfg.doma_api_key.strip():
-            api_key = cfg.doma_api_key.strip()
-
-        proxy = cfg.file_proxies[idx].strip() if idx < len(cfg.file_proxies) else ""
-        if cfg.file_proxies and idx >= len(cfg.file_proxies):
-            logger.warning("Quest check skipped for line %s: no proxy on same line", idx + 1)
-            continue
-
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        quests_api = DomaApiClient(
+        api_key, proxies = ctx
+        api = DomaApiClient(
             cfg.doma_api_url,
             api_key=api_key,
             api_keys=[api_key] if api_key else [],
             proxies=proxies,
         )
         try:
-            quests = quests_api.fetch_quests(wallet, cfg.chain_id)
-            now_iso = datetime.now(timezone.utc).isoformat()
-            for quest in sorted(quests, key=lambda q: (q.reset_period, q.priority, q.quest_id)):
-                append_csv(
-                    quests_csv,
-                    [
-                        now_iso,
-                        wallet,
-                        idx + 1,
-                        quest.reset_period,
-                        quest.quest_type,
-                        quest.description,
-                        str(quest.points_to_award),
-                        "yes" if quest.completed else "no",
-                        quest.completed_at,
-                        quest.available_at,
-                    ],
-                    delimiter=cfg.csv_delimiter,
-                )
-
-            daily_done, daily_total, daily_missing = _quest_period_summary(quests, "DAILY")
-            weekly_done, weekly_total, weekly_missing = _quest_period_summary(quests, "WEEKLY")
-            season_done, season_total, season_missing = _quest_period_summary(quests, "SEASON")
-            logger.info(
-                "Quests [%s] [line=%s]: daily=%s/%s weekly=%s/%s season=%s/%s",
-                wallet,
-                idx + 1,
-                daily_done,
-                daily_total,
-                weekly_done,
-                weekly_total,
-                season_done,
-                season_total,
-            )
-            for period, missing in (("daily", daily_missing), ("weekly", weekly_missing), ("season", season_missing)):
-                if missing:
-                    shown = "; ".join(missing[:6])
-                    suffix = f"; +{len(missing) - 6} more" if len(missing) > 6 else ""
-                    logger.info("Quests [%s] %s missing: %s%s", wallet, period, shown, suffix)
+            _write_points_snapshot(cfg, logger, wallet, idx + 1, api)
+        except Exception as exc:
+            logger.warning("Points check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
+        try:
+            _write_quest_statuses(cfg, logger, wallet, idx + 1, api)
         except Exception as exc:
             logger.warning("Quest check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
         if idx < len(wallets) - 1:
@@ -7666,7 +7651,6 @@ def main() -> None:
             return
         if choice == "2":
             run_points_once(cfg, logger, state)
-            run_quest_check_once(cfg, logger, state)
             save_state(cfg.state_file, state)
             return
         if choice == "3":

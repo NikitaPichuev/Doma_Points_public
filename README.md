@@ -144,10 +144,18 @@ Relay bridge mode.
 - `WEEKLY`
 - `SEASON`
 
-Для каждого кошелька в лог пишется summary вида:
+Для каждого кошелька сразу после points в лог пишется блок заданий в столбик:
 
 ```text
-daily=1/2 weekly=2/4 season=3/8
+Quests [0x...] [line=1]
+  DAILY: 1/1
+    [DONE] Make a $5+ swap on any domain token (+300 pts)
+  WEEKLY: 1/3
+    [DONE] List any domain on the marketplace. (+400 pts)
+    [MISS] Trade $100 total volume (+700 pts)
+  SEASON: 3/5
+    [DONE] Stake 3 subdomains (+750 pts)
+    [MISS] Add at least $50 in liquidity to a domain token. (+1500 pts)
 ```
 
 Детализация по каждому заданию пишется в `quests.csv`.
