@@ -1867,11 +1867,41 @@ def run_close_position_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     deadline_sec=600,
                 )
                 logger.info("[POSITION] decreaseLiquidity wallet=%s tokenId=%s tx=%s", wallet, token_id, tx1)
+                if not _wait_tx_receipt(client, tx1, timeout_sec=240):
+                    raise RuntimeError(f"decreaseLiquidity tx failed or timed out: {tx1}")
                 tx2 = client.collect_all(token_id=token_id, recipient=wallet)
                 logger.info("[POSITION] collect wallet=%s tokenId=%s tx=%s", wallet, token_id, tx2)
+                if not _wait_tx_receipt(client, tx2, timeout_sec=240):
+                    raise RuntimeError(f"collect tx failed or timed out: {tx2}")
                 try:
-                    tx3 = client.burn(token_id=token_id)
-                    logger.info("[POSITION] burn wallet=%s tokenId=%s tx=%s", wallet, token_id, tx3)
+                    fresh = client.get_position_info(token_id)
+                    if fresh.tokens_owed0 > 0 or fresh.tokens_owed1 > 0:
+                        logger.info(
+                            "[POSITION] tokenId=%s has owed tokens after collect | owed0=%s owed1=%s | collecting again",
+                            token_id,
+                            fresh.tokens_owed0,
+                            fresh.tokens_owed1,
+                        )
+                        tx2b = client.collect_all(token_id=token_id, recipient=wallet)
+                        logger.info("[POSITION] collect retry wallet=%s tokenId=%s tx=%s", wallet, token_id, tx2b)
+                        if not _wait_tx_receipt(client, tx2b, timeout_sec=240):
+                            raise RuntimeError(f"collect retry tx failed or timed out: {tx2b}")
+                        fresh = client.get_position_info(token_id)
+                    if fresh.liquidity > 0:
+                        logger.info("[POSITION] burn skipped wallet=%s tokenId=%s | remaining liquidity=%s", wallet, token_id, fresh.liquidity)
+                    elif fresh.tokens_owed0 > 0 or fresh.tokens_owed1 > 0:
+                        logger.info(
+                            "[POSITION] burn skipped wallet=%s tokenId=%s | owed0=%s owed1=%s",
+                            wallet,
+                            token_id,
+                            fresh.tokens_owed0,
+                            fresh.tokens_owed1,
+                        )
+                    else:
+                        tx3 = client.burn(token_id=token_id)
+                        logger.info("[POSITION] burn wallet=%s tokenId=%s tx=%s", wallet, token_id, tx3)
+                        if not _wait_tx_receipt(client, tx3, timeout_sec=240):
+                            raise RuntimeError(f"burn tx failed or timed out: {tx3}")
                 except Exception as exc:
                     logger.warning("[POSITION] burn skipped/failed wallet=%s tokenId=%s: %s", wallet, token_id, exc)
             except Exception as exc:

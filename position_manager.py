@@ -10,6 +10,7 @@ from web3 import Web3
 MAX_UINT256 = (1 << 256) - 1
 MIN_TICK = -887272
 MAX_TICK = 887272
+POSITION_TX_GAS_MULTIPLIER = 1.6
 FEE_TICK_SPACING = {
     100: 1,
     500: 10,
@@ -286,7 +287,7 @@ class PositionManagerClient:
             return None
         amount = MAX_UINT256 if approve_max else int(required_amount_raw)
         tx = token.functions.approve(self.position_manager_address, amount).build_transaction(self._base_tx())
-        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * POSITION_TX_GAS_MULTIPLIER)
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = int(self.web3.eth.gas_price)
         return self._send_tx(tx)
@@ -318,7 +319,7 @@ class PositionManagerClient:
             int(time.time()) + int(deadline_sec),
         )
         tx = self.contract.functions.mint(params).build_transaction(self._base_tx())
-        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * POSITION_TX_GAS_MULTIPLIER)
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = int(self.web3.eth.gas_price)
         return self._send_tx(tx)
@@ -332,7 +333,7 @@ class PositionManagerClient:
             int(time.time()) + int(deadline_sec),
         )
         tx = self.contract.functions.decreaseLiquidity(params).build_transaction(self._base_tx())
-        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * POSITION_TX_GAS_MULTIPLIER)
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = int(self.web3.eth.gas_price)
         return self._send_tx(tx)
@@ -346,14 +347,14 @@ class PositionManagerClient:
             int(max_u128),
         )
         tx = self.contract.functions.collect(params).build_transaction(self._base_tx())
-        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * POSITION_TX_GAS_MULTIPLIER)
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = int(self.web3.eth.gas_price)
         return self._send_tx(tx)
 
     def burn(self, token_id: int) -> str:
         tx = self.contract.functions.burn(int(token_id)).build_transaction(self._base_tx())
-        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * POSITION_TX_GAS_MULTIPLIER)
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = int(self.web3.eth.gas_price)
         return self._send_tx(tx)
