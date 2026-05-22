@@ -331,6 +331,8 @@ Current logic:
 - treats min/max as the target UI liquidity range;
 - adds an internal 1.18x mint buffer because full-range mint/UI valuation can consume/show less than the pre-mint USD estimate;
 - splits buffered mint budget 50/50 between token0 and token1;
+- reserves the USDC.E side of USDC.E/token pools so it is not spent while buying the other token;
+- refuses to mint if either prepared token balance is below 97% of the buffered target;
 - tops up missing tokens via USDC.E or ETH using Doma UI route;
 - wraps ETH to WETH when WETH is required;
 - approves token0/token1 to the position manager;

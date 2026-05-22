@@ -110,6 +110,7 @@ DOMAIN_OFFERS_CSV = Path("domain_offers.csv")
 DOMAIN_ACCEPTED_OFFERS_CSV = Path("domain_accepted_offers.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.18")
+DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
 DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
@@ -4577,6 +4578,7 @@ def _top_up_liquidity_token(
     eth_price: Decimal,
     target_usd: Decimal,
     label: str,
+    reserve_quote_usd: Decimal = Decimal("0"),
 ) -> bool:
     token_price = pick_token_usd_price(token, eth_price)
     if token_price <= 0:
@@ -4604,7 +4606,10 @@ def _top_up_liquidity_token(
             logger.info("[%s] WETH direct wrap unavailable, trying swap route: %s", label, exc)
 
     usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-    if token.address.lower() != quote_token.address.lower() and usdc_balance >= buy_usd:
+    spendable_usdc = usdc_balance
+    if token.address.lower() != quote_token.address.lower() and reserve_quote_usd > 0:
+        spendable_usdc = max(Decimal("0"), usdc_balance - reserve_quote_usd)
+    if token.address.lower() != quote_token.address.lower() and spendable_usdc >= buy_usd:
         return _execute_trade_via_doma_ui_route(
             cfg=cfg,
             logger=logger,
@@ -4795,6 +4800,12 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 _format_decimal_plain(pool.tvl_usd),
             )
 
+            quote_addr = quote_token.address.lower()
+            token0_addr = pool.token0.address.lower()
+            token1_addr = pool.token1.address.lower()
+            token0_reserve_quote = half_mint_usd if token0_addr != quote_addr and token1_addr == quote_addr else Decimal("0")
+            token1_reserve_quote = half_mint_usd if token1_addr != quote_addr and token0_addr == quote_addr else Decimal("0")
+
             prev_tx_hash = state.last_tx_hash
             ok0 = _top_up_liquidity_token(
                 cfg,
@@ -4809,6 +4820,7 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 eth_price,
                 half_mint_usd,
                 label,
+                reserve_quote_usd=token0_reserve_quote,
             )
             if ok0 and state.last_tx_hash and state.last_tx_hash != prev_tx_hash:
                 _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
@@ -4826,6 +4838,7 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 eth_price,
                 half_mint_usd,
                 label,
+                reserve_quote_usd=token1_reserve_quote,
             )
             if ok1 and state.last_tx_hash and state.last_tx_hash != prev_tx_hash:
                 _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
@@ -4836,6 +4849,12 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             desired1 = _token_amount_for_usd(pool.token1, half_mint_usd, eth_price)
             bal0 = exec_client.get_erc20_balance(pool.token0.address, pool.token0.decimals)
             bal1 = exec_client.get_erc20_balance(pool.token1.address, pool.token1.decimals)
+            if bal0 < desired0 * DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO or bal1 < desired1 * DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO:
+                raise RuntimeError(
+                    "prepared token balances below liquidity target "
+                    f"({pool.token0.symbol}={_format_decimal_plain(bal0)}/{_format_decimal_plain(desired0)}, "
+                    f"{pool.token1.symbol}={_format_decimal_plain(bal1)}/{_format_decimal_plain(desired1)})"
+                )
             amount0 = min(bal0, desired0)
             amount1 = min(bal1, desired1)
             amount0_raw = decimal_to_raw(amount0, pool.token0.decimals)
