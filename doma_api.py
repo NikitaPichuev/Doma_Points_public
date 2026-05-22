@@ -1103,6 +1103,67 @@ class DomaApiClient:
                 break
         return out
 
+    def fetch_top_pools_by_tvl(self, limit: int = 10, eth_price_usd: Decimal = Decimal("0")) -> List[Pool]:
+        query = """
+        query ApiTopPools($take: Int!, $sortBy: PoolsSortBy!, $sortOrder: SortOrderType!) {
+          pools(take: $take, sortBy: $sortBy, sortOrder: $sortOrder) {
+            items {
+              address
+              feeTier
+              tvlUsd
+              volume24hUsd
+              token0Address
+              token1Address
+              token0Info {
+                symbol
+                decimals
+                usdExchangeRate
+              }
+              token1Info {
+                symbol
+                decimals
+                usdExchangeRate
+              }
+            }
+          }
+        }
+        """
+        data = self._post(query, {"take": int(limit), "sortBy": "TVL", "sortOrder": "DESC"})
+        items = ((data.get("pools") or {}).get("items")) or []
+        pools: List[Pool] = []
+        for item in items:
+            t0 = item.get("token0Info") or {}
+            t1 = item.get("token1Info") or {}
+            t0_usd = Decimal(str(t0.get("usdExchangeRate") or "0"))
+            t1_usd = Decimal(str(t1.get("usdExchangeRate") or "0"))
+            token0 = Token(
+                address=str(item.get("token0Address") or "").lower(),
+                symbol=canonical_symbol_for_api(str(t0.get("symbol") or "")),
+                decimals=int(t0.get("decimals") or 18),
+                derived_eth=(t0_usd / eth_price_usd) if t0_usd > 0 and eth_price_usd > 0 else Decimal("0"),
+            )
+            token1 = Token(
+                address=str(item.get("token1Address") or "").lower(),
+                symbol=canonical_symbol_for_api(str(t1.get("symbol") or "")),
+                decimals=int(t1.get("decimals") or 18),
+                derived_eth=(t1_usd / eth_price_usd) if t1_usd > 0 and eth_price_usd > 0 else Decimal("0"),
+            )
+            if not token0.address or not token1.address:
+                continue
+            pools.append(
+                Pool(
+                    address=str(item.get("address") or "").lower(),
+                    fee_tier=int(item.get("feeTier") or 0),
+                    tvl_usd=Decimal(str(item.get("tvlUsd") or "0")),
+                    volume_24h_usd=Decimal(str(item.get("volume24hUsd") or "0")),
+                    token0=token0,
+                    token1=token1,
+                    token0_price=Decimal("0"),
+                    token1_price=Decimal("0"),
+                )
+            )
+        return pools
+
     def fetch_wallet_received_top_offers(
         self,
         wallet_address: str,
@@ -2117,6 +2178,11 @@ def decimal_to_raw(amount: Decimal, decimals: int) -> int:
 
 def raw_to_decimal(amount_raw: int, decimals: int) -> Decimal:
     return Decimal(amount_raw) / (Decimal(10) ** decimals)
+
+
+def canonical_symbol_for_api(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    return "WETH" if s == "ETH" else s
 
 
 def pick_token_usd_price(

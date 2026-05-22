@@ -108,6 +108,7 @@ DOMAIN_DELISTING_CSV = Path("domain_delistings.csv")
 DOMAIN_BRIDGE_CSV = Path("domain_bridges.csv")
 DOMAIN_OFFERS_CSV = Path("domain_offers.csv")
 DOMAIN_ACCEPTED_OFFERS_CSV = Path("domain_accepted_offers.csv")
+DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
@@ -221,6 +222,49 @@ def _build_exec_client_with_rpc_fallback(
             except Exception as exc:
                 errors.append(f"{rpc_url} ({proxy_label}): {exc}")
     raise RuntimeError("All RPC attempts failed: " + " | ".join(errors))
+
+
+def _build_position_manager_client_with_rpc_fallback(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    private_key: str,
+    proxies: Optional[Dict[str, str]],
+    log_prefix: str,
+) -> PositionManagerClient:
+    errors: List[str] = []
+    proxy_variants: List[Tuple[str, Optional[Dict[str, str]]]]
+    if proxies:
+        proxy_variants = [("proxy", proxies)]
+    else:
+        proxy_variants = [("direct", None)]
+
+    for rpc_url in _doma_rpc_candidates(cfg):
+        for proxy_label, request_proxies in proxy_variants:
+            try:
+                client = PositionManagerClient(
+                    rpc_url=rpc_url,
+                    chain_id=cfg.chain_id,
+                    account_address=wallet,
+                    private_key=private_key,
+                    position_manager_address=cfg.position_manager_address,
+                    request_proxies=request_proxies,
+                )
+                actual_chain_id = int(client.web3.eth.chain_id)
+                if actual_chain_id != cfg.chain_id:
+                    raise RuntimeError(f"chain_id mismatch: rpc={actual_chain_id} cfg={cfg.chain_id}")
+                if rpc_url != cfg.rpc_url or proxy_label == "direct":
+                    logger.info(
+                        "%s wallet=%s position RPC selected | url=%s | mode=%s",
+                        log_prefix,
+                        wallet,
+                        rpc_url,
+                        proxy_label,
+                    )
+                return client
+            except Exception as exc:
+                errors.append(f"{rpc_url} ({proxy_label}): {exc}")
+    raise RuntimeError("All position manager RPC attempts failed: " + " | ".join(errors))
 
 
 def _cleanup_weth_balance(
@@ -3315,6 +3359,31 @@ def get_domain_accept_offer_menu_input() -> Optional[Tuple[str, str]]:
     return delay_min_raw, delay_max_raw
 
 
+def get_domain_liquidity_menu_input() -> Optional[Tuple[str, str, str, str]]:
+    print("\nCreate full-range liquidity positions:")
+    min_usd_raw = input("Minimum total liquidity USD [5]: ").strip() or "5"
+    max_usd_raw = input("Maximum total liquidity USD [5.5]: ").strip() or "5.5"
+    delay_min_raw = input(f"Minimum delay between wallets sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between wallets sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    min_usd = _parse_decimal_input(min_usd_raw)
+    max_usd = _parse_decimal_input(max_usd_raw)
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if min_usd <= 0 or max_usd <= 0:
+        raise ValueError("Liquidity USD amounts must be > 0")
+    if max_usd < min_usd:
+        raise ValueError("Maximum liquidity USD cannot be lower than minimum")
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Liquidity delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum liquidity delay cannot be lower than minimum delay")
+    return min_usd_raw, max_usd_raw, delay_min_raw, delay_max_raw
+
+
 def _random_decimal_between(min_value: Decimal, max_value: Decimal, min_raw: str, max_raw: str) -> Decimal:
     if min_value == max_value:
         return min_value
@@ -4485,6 +4554,368 @@ def run_domain_accept_offer_once(cfg: BotConfig, logger: logging.Logger, state: 
             logger.warning("[ACCEPT_OFFER] skipped | #%s %s | %s", wallet_number, wallet, reason)
             print(line)
     _print_mode_summary("ACCEPT_OFFER", len(wallet_key_records), success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses)
+
+
+def _token_amount_for_usd(token: Token, usd_amount: Decimal, eth_price: Decimal) -> Decimal:
+    price = pick_token_usd_price(token, eth_price)
+    if price <= 0:
+        raise RuntimeError(f"Unknown USD price for {token.symbol}")
+    return usd_amount / price
+
+
+def _top_up_liquidity_token(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    state: BotState,
+    doma_api: DomaApiClient,
+    exec_client: EvmExecutionClient,
+    wallet: str,
+    token: Token,
+    quote_token: Token,
+    weth_token: Token,
+    eth_price: Decimal,
+    target_usd: Decimal,
+    label: str,
+) -> bool:
+    token_price = pick_token_usd_price(token, eth_price)
+    if token_price <= 0:
+        logger.warning("[%s] cannot top up %s: unknown token price", label, token.symbol)
+        return False
+    balance = exec_client.get_erc20_balance(token.address, token.decimals)
+    balance_usd = balance * token_price
+    missing_usd = target_usd - balance_usd
+    if missing_usd <= Decimal("0.05"):
+        return True
+
+    buy_usd = (missing_usd * Decimal("1.08")).quantize(Decimal("0.000001"))
+    if token.address.lower() == weth_token.address.lower():
+        required_raw = decimal_to_raw(target_usd / eth_price, weth_token.decimals)
+        try:
+            wrap_tx = exec_client.ensure_weth_balance(weth_token.address, required_raw)
+            if wrap_tx:
+                state.last_tx_hash = wrap_tx
+                logger.info("[%s] WETH wrap tx sent: %s", label, wrap_tx)
+                if not _wait_tx_receipt(exec_client, wrap_tx, timeout_sec=180):
+                    logger.warning("[%s] WETH wrap did not confirm", label)
+                    return False
+            return True
+        except Exception as exc:
+            logger.info("[%s] WETH direct wrap unavailable, trying swap route: %s", label, exc)
+
+    usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+    if token.address.lower() != quote_token.address.lower() and usdc_balance >= buy_usd:
+        return _execute_trade_via_doma_ui_route(
+            cfg=cfg,
+            logger=logger,
+            state=state,
+            doma_api=doma_api,
+            exec_client=exec_client,
+            token_in=quote_token,
+            token_out=token,
+            display_in_symbol="USDC.E",
+            display_out_symbol=token.symbol,
+            trade_amount_expr=f"${_format_decimal_plain(buy_usd)}",
+            eth_price=eth_price,
+            label=f"{label} USDC.E>{token.symbol} TOPUP",
+            wait_for_pre_tx=True,
+        )
+
+    native_balance = exec_client.get_native_balance()
+    if native_balance * eth_price < buy_usd + Decimal("0.10"):
+        logger.warning(
+            "[%s] insufficient source balance for %s topup | missing=%s USD | native=%s ETH | USDC.E=%s",
+            label,
+            token.symbol,
+            _format_decimal_plain(missing_usd),
+            _format_decimal_plain(native_balance),
+            _format_decimal_plain(usdc_balance),
+        )
+        return False
+    return _execute_trade_via_doma_ui_route(
+        cfg=cfg,
+        logger=logger,
+        state=state,
+        doma_api=doma_api,
+        exec_client=exec_client,
+        token_in=weth_token,
+        token_out=token,
+        display_in_symbol="ETH",
+        display_out_symbol=token.symbol,
+        trade_amount_expr=f"${_format_decimal_plain(buy_usd)}",
+        eth_price=eth_price,
+        label=f"{label} ETH>{token.symbol} TOPUP",
+        is_eth_source=True,
+        wait_for_pre_tx=True,
+    )
+
+
+def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    picked = get_domain_liquidity_menu_input()
+    if not picked:
+        logger.info("[LIQUIDITY] canceled by user.")
+        return
+    min_usd_raw, max_usd_raw, delay_min_raw, delay_max_raw = picked
+    min_usd = _parse_decimal_input(min_usd_raw)
+    max_usd = _parse_decimal_input(max_usd_raw)
+    delay_min = float(_parse_decimal_input(delay_min_raw))
+    delay_max = float(_parse_decimal_input(delay_max_raw))
+
+    if not cfg.position_manager_address or cfg.position_manager_address == "0x0000000000000000000000000000000000000000":
+        raise ValueError("Set position_manager_address in contracts.json")
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "LIQUIDITY")
+    if not wallet_key_records:
+        raise ValueError("No wallet/private-key pairs available for liquidity mode")
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
+
+    liquidity_csv = cfg.trades_csv_file.parent / DOMAIN_LIQUIDITY_CSV.name
+    ensure_csv(
+        liquidity_csv,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "pool",
+            "token0",
+            "token1",
+            "fee_tier",
+            "target_usd",
+            "amount0",
+            "amount1",
+            "tx_hash",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    metadata_proxies: Optional[Dict[str, str]] = None
+    for metadata_line_idx, _, _ in wallet_key_records:
+        candidate_proxies, skip_metadata_proxy = _proxy_for_line(cfg, metadata_line_idx, None, "LIQUIDITY_METADATA")
+        if not skip_metadata_proxy:
+            metadata_proxies = candidate_proxies
+            break
+
+    doma_api_shared = DomaApiClient(
+        cfg.doma_api_url,
+        api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+        proxies=metadata_proxies,
+    )
+    quote_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
+    eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api_shared, quote_token)
+    if eth_price <= 0:
+        raise RuntimeError("Failed to resolve ETH price")
+    try:
+        top_pools = doma_api_shared.fetch_top_pools_by_tvl(limit=10, eth_price_usd=eth_price)
+    except Exception as exc:
+        logger.warning("[LIQUIDITY] Doma API pools failed, falling back to subgraph: %s", exc)
+        subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=metadata_proxies)
+        pools = subgraph.fetch_top_pools(limit=10)
+        top_pools = [p for p in pools if p.token0.address and p.token1.address][:10]
+    if not top_pools:
+        raise RuntimeError("No top TVL pools available")
+
+    logger.info(
+        "[LIQUIDITY] mode started | wallets=%s | start_wallet=%s | top_pools=%s | target=%s-%s USD | delay=%s-%s sec",
+        total_loaded_wallets,
+        wallet_start_offset + 1,
+        len(top_pools),
+        _format_decimal_plain(min_usd),
+        _format_decimal_plain(max_usd),
+        delay_min_raw,
+        delay_max_raw,
+    )
+
+    success_wallets = 0
+    failed_wallets = 0
+    skipped_wallets = 0
+    failed_wallet_addresses: List[str] = []
+    skipped_wallet_details: List[Tuple[int, str, str]] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
+        wallet_number = wallet_start_offset + idx
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "LIQUIDITY")
+        logger.info("[LIQUIDITY] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        if skip_wallet:
+            skipped_wallets += 1
+            skipped_wallet_details.append((wallet_number, wallet, "proxy is required"))
+            continue
+
+        target_usd = _random_decimal_between(min_usd, max_usd, min_usd_raw, max_usd_raw)
+        pool = random.choice(top_pools)
+        half_usd = target_usd / Decimal("2")
+        token0_price = pick_token_usd_price(pool.token0, eth_price)
+        token1_price = pick_token_usd_price(pool.token1, eth_price)
+        if token0_price <= 0 or token1_price <= 0:
+            skipped_wallets += 1
+            skipped_wallet_details.append((wallet_number, wallet, f"unknown token price for pool {pool.address}"))
+            continue
+
+        label = f"LIQUIDITY {wallet} {pool.token0.symbol}/{pool.token1.symbol}"
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+                proxies=proxies,
+            )
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg,
+                logger,
+                wallet,
+                private_key,
+                proxies=proxies,
+                log_prefix="[LIQUIDITY] ",
+            )
+            position_client = _build_position_manager_client_with_rpc_fallback(
+                cfg,
+                logger,
+                wallet,
+                private_key,
+                proxies=proxies,
+                log_prefix="[LIQUIDITY] ",
+            )
+
+            logger.info(
+                "[LIQUIDITY] wallet=%s pool=%s %s/%s fee=%s target=%s USD split=%s/%s USD tvl=%s",
+                wallet,
+                pool.address,
+                pool.token0.symbol,
+                pool.token1.symbol,
+                pool.fee_tier,
+                _format_decimal_plain(target_usd),
+                _format_decimal_plain(half_usd),
+                _format_decimal_plain(half_usd),
+                _format_decimal_plain(pool.tvl_usd),
+            )
+
+            prev_tx_hash = state.last_tx_hash
+            ok0 = _top_up_liquidity_token(
+                cfg,
+                logger,
+                state,
+                doma_api,
+                exec_client,
+                wallet,
+                pool.token0,
+                quote_token,
+                weth_token,
+                eth_price,
+                half_usd,
+                label,
+            )
+            if ok0 and state.last_tx_hash and state.last_tx_hash != prev_tx_hash:
+                _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+            prev_tx_hash = state.last_tx_hash
+            ok1 = _top_up_liquidity_token(
+                cfg,
+                logger,
+                state,
+                doma_api,
+                exec_client,
+                wallet,
+                pool.token1,
+                quote_token,
+                weth_token,
+                eth_price,
+                half_usd,
+                label,
+            )
+            if ok1 and state.last_tx_hash and state.last_tx_hash != prev_tx_hash:
+                _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+            if not ok0 or not ok1:
+                raise RuntimeError("failed to prepare token balances for liquidity")
+
+            desired0 = _token_amount_for_usd(pool.token0, half_usd, eth_price)
+            desired1 = _token_amount_for_usd(pool.token1, half_usd, eth_price)
+            bal0 = exec_client.get_erc20_balance(pool.token0.address, pool.token0.decimals)
+            bal1 = exec_client.get_erc20_balance(pool.token1.address, pool.token1.decimals)
+            amount0 = min(bal0, desired0)
+            amount1 = min(bal1, desired1)
+            amount0_raw = decimal_to_raw(amount0, pool.token0.decimals)
+            amount1_raw = decimal_to_raw(amount1, pool.token1.decimals)
+            if amount0_raw <= 0 or amount1_raw <= 0:
+                raise RuntimeError(f"prepared token amount is zero ({pool.token0.symbol}={amount0}, {pool.token1.symbol}={amount1})")
+
+            if cfg.paper_mode or cfg.dry_run or not cfg.enable_execution:
+                tx_hash = ""
+                logger.info("[LIQUIDITY] PAPER/DRY mode: wallet=%s no mint tx sent", wallet)
+            else:
+                approve0 = position_client.ensure_allowance(pool.token0.address, amount0_raw, approve_max=True)
+                if approve0:
+                    logger.info("[LIQUIDITY] wallet=%s approve %s tx=%s", wallet, pool.token0.symbol, approve0)
+                    _wait_tx_receipt(exec_client, approve0, timeout_sec=180)
+                approve1 = position_client.ensure_allowance(pool.token1.address, amount1_raw, approve_max=True)
+                if approve1:
+                    logger.info("[LIQUIDITY] wallet=%s approve %s tx=%s", wallet, pool.token1.symbol, approve1)
+                    _wait_tx_receipt(exec_client, approve1, timeout_sec=180)
+                tx_hash = position_client.mint_full_range(
+                    token0=pool.token0.address,
+                    token1=pool.token1.address,
+                    fee_tier=pool.fee_tier,
+                    amount0_desired=amount0_raw,
+                    amount1_desired=amount1_raw,
+                    recipient=wallet,
+                    deadline_sec=600,
+                )
+                state.last_tx_hash = tx_hash
+                logger.info("[LIQUIDITY] wallet=%s full-range mint tx=%s", wallet, tx_hash)
+                if not _wait_tx_receipt(exec_client, tx_hash, timeout_sec=240):
+                    raise RuntimeError("mint tx failed or timed out")
+
+            append_csv(
+                liquidity_csv,
+                [
+                    datetime.now(timezone.utc).isoformat(),
+                    "ok",
+                    wallet,
+                    pool.address,
+                    pool.token0.symbol,
+                    pool.token1.symbol,
+                    str(pool.fee_tier),
+                    _format_decimal_plain(target_usd),
+                    _format_decimal_plain(amount0),
+                    _format_decimal_plain(amount1),
+                    tx_hash,
+                    "",
+                ],
+                delimiter=cfg.csv_delimiter,
+            )
+            success_wallets += 1
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[LIQUIDITY] wallet=%s failed: %s", wallet, exc)
+            append_csv(
+                liquidity_csv,
+                [
+                    datetime.now(timezone.utc).isoformat(),
+                    "failed",
+                    wallet,
+                    pool.address,
+                    pool.token0.symbol,
+                    pool.token1.symbol,
+                    str(pool.fee_tier),
+                    _format_decimal_plain(target_usd),
+                    "",
+                    "",
+                    "",
+                    str(exc),
+                ],
+                delimiter=cfg.csv_delimiter,
+            )
+        if idx < len(wallet_key_records):
+            delay_sec = random.uniform(delay_min, delay_max)
+            logger.info("[LIQUIDITY] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    if skipped_wallet_details:
+        logger.warning("[LIQUIDITY] skipped wallets:")
+        print("\n[LIQUIDITY] skipped wallets:")
+        for wallet_number, wallet, reason in skipped_wallet_details:
+            line = f"  #{wallet_number} {wallet} | {reason}"
+            logger.warning("[LIQUIDITY] skipped | #%s %s | %s", wallet_number, wallet, reason)
+            print(line)
+    _print_mode_summary("LIQUIDITY", len(wallet_key_records), success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses)
 
 
 
@@ -6931,8 +7362,9 @@ def get_menu_choice() -> str:
     print("12) Season quest: bridge a domain from Doma to Base")
     print("13) Place domain offers")
     print("14) Accept received domain offers")
-    print("15) Exit")
-    return input("Select [1-15]: ").strip()
+    print("15) Create full-range liquidity")
+    print("16) Exit")
+    return input("Select [1-16]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -7199,6 +7631,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Domain accept-offer mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "15":
+            validate_config(cfg)
+            try:
+                run_domain_liquidity_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain liquidity mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

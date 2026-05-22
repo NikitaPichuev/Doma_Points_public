@@ -109,7 +109,8 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 12) Season quest: bridge a domain from Doma to Base
 13) Place domain offers
 14) Accept received domain offers
-15) Exit
+15) Create full-range liquidity
+16) Exit
 ```
 
 ## 1) Bridge
@@ -308,6 +309,32 @@ Start from wallet number
 - результаты пишутся в `domain_accepted_offers.csv`;
 - пропущенные кошельки печатаются в конце, чтобы их можно было доделать вручную.
 
+## 15) Create full-range liquidity
+
+Creates Uniswap V3 full-range liquidity positions through the configured NonfungiblePositionManager.
+
+Parameters:
+
+```text
+Minimum total liquidity USD
+Maximum total liquidity USD
+Minimum delay between wallets sec
+Maximum delay between wallets sec
+Start from wallet number
+```
+
+Current logic:
+
+- fetches top 10 pools by TVL from the Doma API, with subgraph fallback;
+- picks one of those pools randomly per wallet;
+- chooses total liquidity randomly inside min/max USD;
+- splits target USD 50/50 between token0 and token1;
+- tops up missing tokens via USDC.E or ETH using Doma UI route;
+- wraps ETH to WETH when WETH is required;
+- approves token0/token1 to the position manager;
+- mints full-range position using fee-tier tick spacing;
+- results are written to `domain_liquidity_positions.csv`.
+
 ## Doma Quests
 
 Практическое соответствие режимов:
@@ -379,6 +406,7 @@ points.csv
 domain_listings.csv
 domain_offers.csv
 domain_accepted_offers.csv
+domain_liquidity_positions.csv
 bot.log
 state.json
 ```

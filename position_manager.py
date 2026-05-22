@@ -7,6 +7,41 @@ from typing import Dict, List, Optional
 from web3 import Web3
 
 
+MAX_UINT256 = (1 << 256) - 1
+MIN_TICK = -887272
+MAX_TICK = 887272
+FEE_TICK_SPACING = {
+    100: 1,
+    500: 10,
+    3000: 60,
+    10000: 200,
+}
+
+
+ERC20_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "owner", "type": "address"},
+            {"internalType": "address", "name": "spender", "type": "address"},
+        ],
+        "name": "allowance",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "spender", "type": "address"},
+            {"internalType": "uint256", "name": "amount", "type": "uint256"},
+        ],
+        "name": "approve",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+
 POSITION_MANAGER_ABI = [
     {
         "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
@@ -104,7 +139,47 @@ POSITION_MANAGER_ABI = [
         "stateMutability": "payable",
         "type": "function",
     },
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "address", "name": "token0", "type": "address"},
+                    {"internalType": "address", "name": "token1", "type": "address"},
+                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
+                    {"internalType": "int24", "name": "tickLower", "type": "int24"},
+                    {"internalType": "int24", "name": "tickUpper", "type": "int24"},
+                    {"internalType": "uint256", "name": "amount0Desired", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amount1Desired", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amount0Min", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amount1Min", "type": "uint256"},
+                    {"internalType": "address", "name": "recipient", "type": "address"},
+                    {"internalType": "uint256", "name": "deadline", "type": "uint256"},
+                ],
+                "internalType": "struct INonfungiblePositionManager.MintParams",
+                "name": "params",
+                "type": "tuple",
+            }
+        ],
+        "name": "mint",
+        "outputs": [
+            {"internalType": "uint256", "name": "tokenId", "type": "uint256"},
+            {"internalType": "uint128", "name": "liquidity", "type": "uint128"},
+            {"internalType": "uint256", "name": "amount0", "type": "uint256"},
+            {"internalType": "uint256", "name": "amount1", "type": "uint256"},
+        ],
+        "stateMutability": "payable",
+        "type": "function",
+    },
 ]
+
+
+def full_range_ticks(fee_tier: int) -> tuple[int, int]:
+    spacing = FEE_TICK_SPACING.get(int(fee_tier))
+    if not spacing:
+        raise ValueError(f"Unsupported Uniswap V3 fee tier for full range: {fee_tier}")
+    tick_lower = ((MIN_TICK + spacing - 1) // spacing) * spacing
+    tick_upper = (MAX_TICK // spacing) * spacing
+    return tick_lower, tick_upper
 
 
 class PositionManagerClient:
@@ -200,6 +275,53 @@ class PositionManagerClient:
         signed = self.web3.eth.account.sign_transaction(tx, private_key=self.private_key)
         tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
         return tx_hash.hex()
+
+    def ensure_allowance(self, token_address: str, required_amount_raw: int, approve_max: bool = True) -> Optional[str]:
+        token = self.web3.eth.contract(
+            address=Web3.to_checksum_address(token_address),
+            abi=ERC20_ABI,
+        )
+        current = int(token.functions.allowance(self.account_address, self.position_manager_address).call())
+        if current >= int(required_amount_raw):
+            return None
+        amount = MAX_UINT256 if approve_max else int(required_amount_raw)
+        tx = token.functions.approve(self.position_manager_address, amount).build_transaction(self._base_tx())
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
+            tx["gasPrice"] = int(self.web3.eth.gas_price)
+        return self._send_tx(tx)
+
+    def mint_full_range(
+        self,
+        token0: str,
+        token1: str,
+        fee_tier: int,
+        amount0_desired: int,
+        amount1_desired: int,
+        recipient: Optional[str] = None,
+        amount0_min: int = 0,
+        amount1_min: int = 0,
+        deadline_sec: int = 600,
+    ) -> str:
+        tick_lower, tick_upper = full_range_ticks(int(fee_tier))
+        params = (
+            Web3.to_checksum_address(token0),
+            Web3.to_checksum_address(token1),
+            int(fee_tier),
+            int(tick_lower),
+            int(tick_upper),
+            int(amount0_desired),
+            int(amount1_desired),
+            int(amount0_min),
+            int(amount1_min),
+            Web3.to_checksum_address(recipient or self.account_address),
+            int(time.time()) + int(deadline_sec),
+        )
+        tx = self.contract.functions.mint(params).build_transaction(self._base_tx())
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
+            tx["gasPrice"] = int(self.web3.eth.gas_price)
+        return self._send_tx(tx)
 
     def decrease_liquidity(self, token_id: int, liquidity_to_remove: int, deadline_sec: int = 600) -> str:
         params = (
