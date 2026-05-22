@@ -33,6 +33,7 @@ from doma_api import (
     OwnedDomain,
     PointsSnapshot,
     Pool,
+    QuestStatus,
     Token,
     decimal_to_raw,
     pick_token_usd_price,
@@ -108,6 +109,7 @@ DOMAIN_DELISTING_CSV = Path("domain_delistings.csv")
 DOMAIN_BRIDGE_CSV = Path("domain_bridges.csv")
 DOMAIN_OFFERS_CSV = Path("domain_offers.csv")
 DOMAIN_ACCEPTED_OFFERS_CSV = Path("domain_accepted_offers.csv")
+DOMAIN_QUESTS_CSV = Path("quests.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.18")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
@@ -1460,6 +1462,103 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             )
         except Exception as exc:
             logger.warning("Points check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
+        if idx < len(wallets) - 1:
+            delay_sec = random.uniform(2, 5)
+            logger.info("Delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+
+def _quest_period_summary(quests: List[QuestStatus], period: str) -> Tuple[int, int, List[str]]:
+    period_quests = [q for q in quests if q.reset_period.upper() == period]
+    completed = sum(1 for q in period_quests if q.completed)
+    missing = [q.description for q in period_quests if not q.completed]
+    return completed, len(period_quests), missing
+
+
+def run_quest_check_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
+    if not wallets:
+        logger.warning("Quest check skipped: no wallets configured")
+        return
+    quests_csv = cfg.points_csv_file.parent / DOMAIN_QUESTS_CSV.name
+    ensure_csv(
+        quests_csv,
+        [
+            "timestamp_utc",
+            "wallet",
+            "line",
+            "reset_period",
+            "quest_type",
+            "description",
+            "points",
+            "completed",
+            "completed_at",
+            "available_at",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+    for idx, wallet in enumerate(wallets):
+        api_key = cfg.file_api_keys[idx].strip() if idx < len(cfg.file_api_keys) else ""
+        if not api_key and cfg.file_api_keys:
+            logger.warning("Quest check skipped for line %s: no API key on same line", idx + 1)
+            continue
+        if not api_key and cfg.doma_api_key.strip():
+            api_key = cfg.doma_api_key.strip()
+
+        proxy = cfg.file_proxies[idx].strip() if idx < len(cfg.file_proxies) else ""
+        if cfg.file_proxies and idx >= len(cfg.file_proxies):
+            logger.warning("Quest check skipped for line %s: no proxy on same line", idx + 1)
+            continue
+
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        quests_api = DomaApiClient(
+            cfg.doma_api_url,
+            api_key=api_key,
+            api_keys=[api_key] if api_key else [],
+            proxies=proxies,
+        )
+        try:
+            quests = quests_api.fetch_quests(wallet, cfg.chain_id)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for quest in sorted(quests, key=lambda q: (q.reset_period, q.priority, q.quest_id)):
+                append_csv(
+                    quests_csv,
+                    [
+                        now_iso,
+                        wallet,
+                        idx + 1,
+                        quest.reset_period,
+                        quest.quest_type,
+                        quest.description,
+                        str(quest.points_to_award),
+                        "yes" if quest.completed else "no",
+                        quest.completed_at,
+                        quest.available_at,
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+
+            daily_done, daily_total, daily_missing = _quest_period_summary(quests, "DAILY")
+            weekly_done, weekly_total, weekly_missing = _quest_period_summary(quests, "WEEKLY")
+            season_done, season_total, season_missing = _quest_period_summary(quests, "SEASON")
+            logger.info(
+                "Quests [%s] [line=%s]: daily=%s/%s weekly=%s/%s season=%s/%s",
+                wallet,
+                idx + 1,
+                daily_done,
+                daily_total,
+                weekly_done,
+                weekly_total,
+                season_done,
+                season_total,
+            )
+            for period, missing in (("daily", daily_missing), ("weekly", weekly_missing), ("season", season_missing)):
+                if missing:
+                    shown = "; ".join(missing[:6])
+                    suffix = f"; +{len(missing) - 6} more" if len(missing) > 6 else ""
+                    logger.info("Quests [%s] %s missing: %s%s", wallet, period, shown, suffix)
+        except Exception as exc:
+            logger.warning("Quest check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
         if idx < len(wallets) - 1:
             delay_sec = random.uniform(2, 5)
             logger.info("Delay before next wallet: %.2f sec", delay_sec)
@@ -7375,7 +7474,7 @@ def run_swap_loop(cfg: BotConfig, logger: logging.Logger, state: BotState) -> No
 def get_menu_choice() -> str:
     print("\nChoose mode:")
     print("1) Bridge")
-    print("2) Check points")
+    print("2) Check points + quests")
     print("3) Close all positions")
     print("4) Swap domain token")
     print("5) Swap ETH <-> USDC.E")
@@ -7521,6 +7620,22 @@ def main() -> None:
         ],
         delimiter=cfg.csv_delimiter,
     )
+    ensure_csv(
+        cfg.points_csv_file.parent / DOMAIN_QUESTS_CSV.name,
+        [
+            "timestamp_utc",
+            "wallet",
+            "line",
+            "reset_period",
+            "quest_type",
+            "description",
+            "points",
+            "completed",
+            "completed_at",
+            "available_at",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
     state = load_state(cfg.state_file)
 
     if cfg.paper_replay_mode:
@@ -7551,6 +7666,7 @@ def main() -> None:
             return
         if choice == "2":
             run_points_once(cfg, logger, state)
+            run_quest_check_once(cfg, logger, state)
             save_state(cfg.state_file, state)
             return
         if choice == "3":

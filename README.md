@@ -96,7 +96,7 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 
 ```text
 1) Bridge
-2) Check points
+2) Check points + quests
 3) Close all positions
 4) Swap domain token
 5) Swap ETH <-> USDC.E
@@ -134,9 +134,23 @@ Relay bridge mode.
 - для native percent bridge оставляется небольшой gas reserve;
 - используются Relay API и RPC fallback.
 
-## 2) Check points
+## 2) Check points + quests
 
 Проверяет points по кошелькам и пишет результат в CSV.
+
+Дополнительно проверяет выполнение Doma quests по периодам:
+
+- `DAILY`
+- `WEEKLY`
+- `SEASON`
+
+Для каждого кошелька в лог пишется summary вида:
+
+```text
+daily=1/2 weekly=2/4 season=3/8
+```
+
+Детализация по каждому заданию пишется в `quests.csv`.
 
 ## 3) Close all positions
 
@@ -407,6 +421,7 @@ doma_node_esm_loader.mjs Node ESM compatibility loader for Doma SDK
 ```text
 trades.csv
 points.csv
+quests.csv
 domain_listings.csv
 domain_offers.csv
 domain_accepted_offers.csv

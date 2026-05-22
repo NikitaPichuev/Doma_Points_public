@@ -387,6 +387,20 @@ class PointsSnapshot:
 
 
 @dataclass
+class QuestStatus:
+    wallet_address: str
+    quest_id: int
+    quest_type: str
+    description: str
+    points_to_award: Decimal
+    reset_period: str
+    priority: int
+    completed: bool
+    completed_at: str
+    available_at: str
+
+
+@dataclass
 class LaunchpadTokenInfo:
     token_id: int
     name: str
@@ -725,6 +739,44 @@ class DomaApiClient:
             total_snapshot_entries=int(item.get("totalEntries") or 0),
             snapshot_date="",
         )
+
+    def fetch_quests(self, wallet_address: str, chain_id: int = 97477) -> List[QuestStatus]:
+        caip_wallet = str(wallet_address or "").strip()
+        if not caip_wallet.startswith("eip155:"):
+            caip_wallet = f"eip155:{chain_id}:{caip_wallet}"
+        query = """
+        query Quests($address: AddressCAIP10) {
+          quests(address: $address) {
+            id
+            type
+            description
+            pointsToAward
+            resetPeriod
+            priority
+            completed
+            completedAt
+            availableAt
+          }
+        }
+        """
+        data = self._post(query, {"address": caip_wallet})
+        out: List[QuestStatus] = []
+        for item in data.get("quests") or []:
+            out.append(
+                QuestStatus(
+                    wallet_address=caip_wallet,
+                    quest_id=int(item.get("id") or 0),
+                    quest_type=str(item.get("type") or ""),
+                    description=str(item.get("description") or ""),
+                    points_to_award=Decimal(str(item.get("pointsToAward") or "0")),
+                    reset_period=str(item.get("resetPeriod") or ""),
+                    priority=int(item.get("priority") or 0),
+                    completed=bool(item.get("completed")),
+                    completed_at=str(item.get("completedAt") or ""),
+                    available_at=str(item.get("availableAt") or ""),
+                )
+            )
+        return out
 
     def fetch_fractional_token_by_name(self, name: str) -> Optional[LaunchpadTokenInfo]:
         query = """
