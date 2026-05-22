@@ -7106,9 +7106,23 @@ def run_volume_farm_once(
                 if not pool:
                     raise RuntimeError("No pool route found for ETH<->USDC.E")
             except Exception as exc:
-                _fail_wallet()
-                logger.warning("[VOLUME] wallet=%s init failed: %s", wallet, exc)
-                continue
+                logger.warning(
+                    "[VOLUME] wallet=%s subgraph init failed, using Doma quote fallback: %s",
+                    wallet,
+                    exc,
+                )
+                try:
+                    doma_api = DomaApiClient(
+                        cfg.doma_api_url,
+                        api_key=cfg.doma_api_key,
+                        api_keys=cfg.doma_api_keys,
+                        proxies=proxies,
+                    )
+                    pool, eth_price = _fallback_eth_usdce_pool_for_ui_route(cfg, doma_api)
+                except Exception as fallback_exc:
+                    _fail_wallet()
+                    logger.warning("[VOLUME] wallet=%s init failed: %s", wallet, fallback_exc)
+                    continue
 
             exec_client = _build_exec_client_with_rpc_fallback(
                 cfg=cfg,
