@@ -338,6 +338,9 @@ Creates Uniswap V3 full-range liquidity positions through the configured Nonfung
 Parameters:
 
 ```text
+Pool selection:
+1) Random from top 10 by TVL
+2) WETH/USDC.E
 Minimum total liquidity USD
 Maximum total liquidity USD
 Minimum delay between wallets sec
@@ -349,6 +352,7 @@ Current logic:
 
 - fetches top 10 pools by TVL from the Doma API, with subgraph fallback;
 - picks one of those pools randomly per wallet;
+- alternatively uses only the highest-TVL WETH/USDC.E pool;
 - chooses total liquidity randomly inside min/max USD;
 - treats min/max as the target UI liquidity range;
 - adds an internal 1.18x mint buffer because full-range mint/UI valuation can consume/show less than the pre-mint USD estimate;

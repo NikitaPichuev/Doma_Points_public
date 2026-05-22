@@ -3475,8 +3475,14 @@ def get_domain_accept_offer_menu_input() -> Optional[Tuple[str, str]]:
     return delay_min_raw, delay_max_raw
 
 
-def get_domain_liquidity_menu_input() -> Optional[Tuple[str, str, str, str]]:
+def get_domain_liquidity_menu_input() -> Optional[Tuple[str, str, str, str, str]]:
     print("\nCreate full-range liquidity positions:")
+    print("Pool selection:")
+    print("1) Random from top 10 by TVL")
+    print("2) WETH/USDC.E")
+    pool_mode_raw = input("Select [1-2, default 1]: ").strip() or "1"
+    if pool_mode_raw not in {"1", "2"}:
+        raise ValueError("Invalid liquidity pool selection")
     min_usd_raw = input("Minimum total liquidity USD [5]: ").strip() or "5"
     max_usd_raw = input("Maximum total liquidity USD [5.5]: ").strip() or "5.5"
     delay_min_raw = input(f"Minimum delay between wallets sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
@@ -3497,7 +3503,7 @@ def get_domain_liquidity_menu_input() -> Optional[Tuple[str, str, str, str]]:
         raise ValueError("Liquidity delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum liquidity delay cannot be lower than minimum delay")
-    return min_usd_raw, max_usd_raw, delay_min_raw, delay_max_raw
+    return pool_mode_raw, min_usd_raw, max_usd_raw, delay_min_raw, delay_max_raw
 
 
 def _random_decimal_between(min_value: Decimal, max_value: Decimal, min_raw: str, max_raw: str) -> Decimal:
@@ -4679,6 +4685,11 @@ def _token_amount_for_usd(token: Token, usd_amount: Decimal, eth_price: Decimal)
     return usd_amount / price
 
 
+def _is_weth_usdce_pool(pool: Pool, quote_token: Token, weth_token: Token) -> bool:
+    addrs = {pool.token0.address.lower(), pool.token1.address.lower()}
+    return quote_token.address.lower() in addrs and weth_token.address.lower() in addrs
+
+
 def _top_up_liquidity_token(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -4774,7 +4785,7 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     if not picked:
         logger.info("[LIQUIDITY] canceled by user.")
         return
-    min_usd_raw, max_usd_raw, delay_min_raw, delay_max_raw = picked
+    pool_mode_raw, min_usd_raw, max_usd_raw, delay_min_raw, delay_max_raw = picked
     min_usd = _parse_decimal_input(min_usd_raw)
     max_usd = _parse_decimal_input(max_usd_raw)
     delay_min = float(_parse_decimal_input(delay_min_raw))
@@ -4825,20 +4836,34 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api_shared, quote_token)
     if eth_price <= 0:
         raise RuntimeError("Failed to resolve ETH price")
-    try:
-        top_pools = doma_api_shared.fetch_top_pools_by_tvl(limit=10, eth_price_usd=eth_price)
-    except Exception as exc:
-        logger.warning("[LIQUIDITY] Doma API pools failed, falling back to subgraph: %s", exc)
-        subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=metadata_proxies)
-        pools = subgraph.fetch_top_pools(limit=10)
-        top_pools = [p for p in pools if p.token0.address and p.token1.address][:10]
+    pool_source_label = "top10-random"
+    if pool_mode_raw == "2":
+        pool_source_label = "WETH/USDC.E"
+        try:
+            candidate_pools = doma_api_shared.fetch_top_pools_by_tvl(limit=100, eth_price_usd=eth_price)
+        except Exception as exc:
+            logger.warning("[LIQUIDITY] Doma API pools failed, falling back to subgraph: %s", exc)
+            subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=metadata_proxies)
+            candidate_pools = subgraph.fetch_top_pools(limit=200)
+        top_pools = [p for p in candidate_pools if _is_weth_usdce_pool(p, quote_token, weth_token)]
+        top_pools.sort(key=lambda p: p.tvl_usd, reverse=True)
+        top_pools = top_pools[:1]
+    else:
+        try:
+            top_pools = doma_api_shared.fetch_top_pools_by_tvl(limit=10, eth_price_usd=eth_price)
+        except Exception as exc:
+            logger.warning("[LIQUIDITY] Doma API pools failed, falling back to subgraph: %s", exc)
+            subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=metadata_proxies)
+            pools = subgraph.fetch_top_pools(limit=10)
+            top_pools = [p for p in pools if p.token0.address and p.token1.address][:10]
     if not top_pools:
-        raise RuntimeError("No top TVL pools available")
+        raise RuntimeError(f"No liquidity pools available for selection: {pool_source_label}")
 
     logger.info(
-        "[LIQUIDITY] mode started | wallets=%s | start_wallet=%s | top_pools=%s | target=%s-%s USD | mint_buffer=%sx | delay=%s-%s sec",
+        "[LIQUIDITY] mode started | wallets=%s | start_wallet=%s | pool_mode=%s | pools=%s | target=%s-%s USD | mint_buffer=%sx | delay=%s-%s sec",
         total_loaded_wallets,
         wallet_start_offset + 1,
+        pool_source_label,
         len(top_pools),
         _format_decimal_plain(min_usd),
         _format_decimal_plain(max_usd),
