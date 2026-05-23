@@ -7665,8 +7665,9 @@ def get_menu_choice() -> str:
     print("13) Place domain offers")
     print("14) Accept received domain offers")
     print("15) Create full-range liquidity")
-    print("16) Exit")
-    return input("Select [1-16]: ").strip()
+    print("16) Weekly ETH/USDC.E volume")
+    print("17) Exit")
+    return input("Select [1-17]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -7712,13 +7713,13 @@ def run_doma_quests_menu_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         if choice == "3":
             validate_config(cfg)
             print("\nWeekly volume quest selected: target=$100 ETH <-> USDC.E")
-            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "100"), weekly_remaining=True)
+            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "100"))
             save_state(cfg.state_file, state)
             return
         if choice == "4":
             validate_config(cfg)
             print("\nWeekly volume quest selected: target=$250 ETH <-> USDC.E")
-            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "250"), weekly_remaining=True)
+            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "250"))
             save_state(cfg.state_file, state)
             return
         if choice == "5":
@@ -7879,7 +7880,7 @@ def main() -> None:
         if choice == "7":
             validate_config(cfg)
             try:
-                run_volume_farm_once(cfg, logger, state, weekly_remaining=True)
+                run_volume_farm_once(cfg, logger, state)
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Volume farm failed: %s", exc)
@@ -7959,6 +7960,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Domain liquidity mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "16":
+            validate_config(cfg)
+            try:
+                run_volume_farm_once(cfg, logger, state, weekly_remaining=True)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Weekly ETH/USDC.E volume failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return
