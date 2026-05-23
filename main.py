@@ -113,6 +113,12 @@ DOMAIN_QUESTS_CSV = Path("quests.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.18")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
+WEEKLY_VOLUME_TOPUP_BUFFER_USD = Decimal("1")
+KNOWN_ETH_USDCE_POOL_ADDRESSES = [
+    "0xd604c96e51DF995bb46FAb0E3FC1b18d985AA8f5",
+    "0xe8E9ca039B1a9467eD32E8B2337f657c8c794754",
+    "0x8db8e9a11c37544e1b274452f932835f4aab6db2",
+]
 DOMAIN_LISTING_DEFAULT_DURATION_DAYS = 90
 DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
@@ -128,6 +134,12 @@ def _color(text: str, code: str) -> str:
 
 def _wallet_progress_label(idx: int, total: int, wallet: str) -> str:
     return f"{idx + 1}/{total} - {wallet}"
+
+
+def _current_week_start_utc() -> datetime:
+    now = datetime.now(timezone.utc)
+    today_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    return today_utc - timedelta(days=now.weekday())
 
 
 def _is_proxy_connectivity_error(exc: Exception) -> bool:
@@ -7067,11 +7079,55 @@ def get_volume_farm_menu_input(state: BotState) -> Optional[Tuple[str, str, str]
     return min_raw, max_raw, target_raw
 
 
+def _eth_usdce_pool_addresses_from_pools(pools: List[Pool]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for pool in pools:
+        symbols = {canonical_symbol(pool.token0.symbol), canonical_symbol(pool.token1.symbol)}
+        if "USDC.E" not in symbols or "WETH" not in symbols:
+            continue
+        addr = str(pool.address or "").strip()
+        if not addr:
+            continue
+        addr_lc = addr.lower()
+        if addr_lc in seen:
+            continue
+        seen.add(addr_lc)
+        out.append(addr)
+    for addr in KNOWN_ETH_USDCE_POOL_ADDRESSES:
+        addr_lc = addr.lower()
+        if addr_lc not in seen:
+            seen.add(addr_lc)
+            out.append(addr)
+    return out
+
+
+def _fetch_weekly_eth_usdce_volume(
+    doma_api: DomaApiClient,
+    wallet: str,
+    pools: List[Pool],
+    since: datetime,
+) -> Decimal:
+    pool_addresses = _eth_usdce_pool_addresses_from_pools(pools)
+    if not pool_addresses:
+        return Decimal("0")
+    return doma_api.fetch_wallet_pool_volume_usd_from_explorer(
+        wallet_address=wallet,
+        pool_address=pool_addresses[0],
+        pool_addresses=pool_addresses,
+        tracked_token_symbol="WETH",
+        quote_token_symbol="USDC.E",
+        max_pages=40,
+        since=since,
+    )
+
+
 def run_volume_farm_once(
     cfg: BotConfig,
     logger: logging.Logger,
     state: BotState,
     preset: Optional[Tuple[str, str, str]] = None,
+    weekly_remaining: bool = False,
 ) -> None:
     success_wallets = 0
     failed_wallets = 0
@@ -7090,6 +7146,7 @@ def run_volume_farm_once(
         return
     min_raw, max_raw, target_raw = picked
     target_volume = _parse_decimal_input(target_raw)
+    weekly_since = _current_week_start_utc() if weekly_remaining else None
 
     wallet_key_records = _build_wallet_key_records(cfg, logger, "VOLUME")
     if not wallet_key_records:
@@ -7100,10 +7157,12 @@ def run_volume_farm_once(
     wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
 
     logger.info(
-        "[VOLUME] mode started | source=AUTO pair=ETH<->USDC.E wallets=%s | start_wallet=%s | target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=ETH",
+        "[VOLUME] mode started | source=AUTO pair=ETH<->USDC.E wallets=%s | start_wallet=%s | target=%s USDC.E | weekly_remaining=%s%s | pattern=auto-100%%->%s-%s%% | final=ETH",
         len(wallet_key_records),
         wallet_start_offset + 1,
         _format_decimal_plain(target_volume),
+        "yes" if weekly_remaining else "no",
+        f" since={weekly_since.isoformat()}" if weekly_since else "",
         min_raw,
         max_raw,
     )
@@ -7121,6 +7180,7 @@ def run_volume_farm_once(
         logger.info("[VOLUME] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
         before_points_snapshot: Optional[PointsSnapshot] = None
         try:
+            pools: List[Pool] = []
             try:
                 subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
                 doma_api = DomaApiClient(
@@ -7172,6 +7232,38 @@ def run_volume_farm_once(
 
             before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "VOLUME")
             accumulated_volume = Decimal("0")
+            wallet_target_volume = target_volume
+            if weekly_since is not None:
+                try:
+                    weekly_done = _fetch_weekly_eth_usdce_volume(doma_api, wallet, pools, weekly_since)
+                except Exception as exc:
+                    logger.warning(
+                        "[VOLUME] wallet=%s weekly ETH/USDC.E volume fetch failed, assuming 0: %s",
+                        wallet,
+                        exc,
+                    )
+                    weekly_done = Decimal("0")
+                weekly_remaining_volume = target_volume - weekly_done
+                if weekly_remaining_volume <= 0:
+                    logger.info(
+                        "[VOLUME] wallet=%s weekly ETH/USDC.E volume already complete | done=%s/%s since=%s | skipping wallet",
+                        wallet,
+                        _format_decimal_plain(weekly_done),
+                        _format_decimal_plain(target_volume),
+                        weekly_since.isoformat(),
+                    )
+                    skipped_wallets += 1
+                    continue
+                wallet_target_volume = weekly_remaining_volume + WEEKLY_VOLUME_TOPUP_BUFFER_USD
+                logger.info(
+                    "[VOLUME] wallet=%s weekly ETH/USDC.E volume | done=%s/%s since=%s | remaining=%s | planned_topup=%s",
+                    wallet,
+                    _format_decimal_plain(weekly_done),
+                    _format_decimal_plain(target_volume),
+                    weekly_since.isoformat(),
+                    _format_decimal_plain(weekly_remaining_volume),
+                    _format_decimal_plain(wallet_target_volume),
+                )
             cycle = 0
             wallet_failed = False
             partial_min = _parse_decimal_input(min_raw)
@@ -7181,14 +7273,14 @@ def run_volume_farm_once(
             if partial_max > 100:
                 raise ValueError("Partial return percent cannot be > 100")
 
-            while accumulated_volume < target_volume:
+            while accumulated_volume < wallet_target_volume:
                 cycle += 1
                 logger.info(
                     "[VOLUME] wallet=%s cycle=%s | progress=%s/%s",
                     wallet,
                     cycle,
                     _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(target_volume),
+                    _format_decimal_plain(wallet_target_volume),
                 )
 
                 _cleanup_weth_balance(
@@ -7286,9 +7378,9 @@ def run_volume_farm_once(
                     wallet,
                     _format_decimal_plain(full_added_volume),
                     _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(target_volume),
+                    _format_decimal_plain(wallet_target_volume),
                 )
-                if accumulated_volume >= target_volume:
+                if accumulated_volume >= wallet_target_volume:
                     break
                 _sleep_between_swaps()
 
@@ -7371,14 +7463,14 @@ def run_volume_farm_once(
                     wallet,
                     _format_decimal_plain(partial_added_volume),
                     _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(target_volume),
+                    _format_decimal_plain(wallet_target_volume),
                 )
-                if accumulated_volume < target_volume:
+                if accumulated_volume < wallet_target_volume:
                     _sleep_between_swaps()
 
             if wallet_failed:
                 _fail_wallet()
-            elif accumulated_volume >= target_volume:
+            elif accumulated_volume >= wallet_target_volume:
                 final_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
                 if final_usdc_balance >= MIN_EXECUTABLE_TRADE_USD:
                     logger.info(
@@ -7426,7 +7518,7 @@ def run_volume_farm_once(
                             wallet,
                             _format_decimal_plain(final_added_volume),
                             _format_decimal_plain(accumulated_volume),
-                            _format_decimal_plain(target_volume),
+                            _format_decimal_plain(wallet_target_volume),
                         )
                 elif final_usdc_balance > 0:
                     logger.info(
@@ -7620,13 +7712,13 @@ def run_doma_quests_menu_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         if choice == "3":
             validate_config(cfg)
             print("\nWeekly volume quest selected: target=$100 ETH <-> USDC.E")
-            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "100"))
+            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "100"), weekly_remaining=True)
             save_state(cfg.state_file, state)
             return
         if choice == "4":
             validate_config(cfg)
             print("\nWeekly volume quest selected: target=$250 ETH <-> USDC.E")
-            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "250"))
+            run_volume_farm_once(cfg, logger, state, preset=("80", "90", "250"), weekly_remaining=True)
             save_state(cfg.state_file, state)
             return
         if choice == "5":
@@ -7787,7 +7879,7 @@ def main() -> None:
         if choice == "7":
             validate_config(cfg)
             try:
-                run_volume_farm_once(cfg, logger, state)
+                run_volume_farm_once(cfg, logger, state, weekly_remaining=True)
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Volume farm failed: %s", exc)
