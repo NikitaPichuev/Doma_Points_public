@@ -6889,18 +6889,26 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
     )
 
 
-def get_pair_swap_menu_input(state: BotState) -> Optional[Tuple[str, str, str]]:
+def get_pair_swap_menu_input(state: BotState) -> Optional[Tuple[str, str, str, str]]:
     _ = state
-    print("\nPair swap ETH <-> USDC.E:")
-    print("1) Source ETH")
-    print("2) Source USDC.E")
-    print("3) Back")
-    src_raw = input("Select [1-3]: ").strip()
-    if src_raw == "3":
+    print("\nPair swap ETH / WETH / USDC.E:")
+    print("1) ETH -> USDC.E")
+    print("2) USDC.E -> ETH")
+    print("3) WETH -> ETH")
+    print("4) WETH -> USDC.E")
+    print("5) Back")
+    route_raw = input("Select [1-5]: ").strip()
+    if route_raw == "5":
         return None
-    if src_raw not in {"1", "2"}:
-        raise ValueError("Invalid source selection")
-    src_symbol = "ETH" if src_raw == "1" else "USDC.E"
+    route_map = {
+        "1": ("ETH", "USDC.E"),
+        "2": ("USDC.E", "ETH"),
+        "3": ("WETH", "ETH"),
+        "4": ("WETH", "USDC.E"),
+    }
+    if route_raw not in route_map:
+        raise ValueError("Invalid route selection")
+    src_symbol, dst_symbol = route_map[route_raw]
 
     print("\nAmount mode:")
     print(f"1) Number ({src_symbol})")
@@ -6913,13 +6921,13 @@ def get_pair_swap_menu_input(state: BotState) -> Optional[Tuple[str, str, str]]:
     if amount_mode == "percent":
         percent_raw = input("Percent: ").strip()
         _ = _parse_decimal_input(percent_raw)
-        return src_symbol, amount_mode, percent_raw
+        return src_symbol, dst_symbol, amount_mode, percent_raw
 
     min_raw = input("Minimum: ").strip()
     max_raw = input("Maximum: ").strip()
     _ = _parse_decimal_input(min_raw)
     _ = _parse_decimal_input(max_raw)
-    return src_symbol, amount_mode, f"{min_raw}|{max_raw}"
+    return src_symbol, dst_symbol, amount_mode, f"{min_raw}|{max_raw}"
 
 
 def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -6937,8 +6945,7 @@ def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) 
     if not picked:
         logger.info("Pair swap canceled by user.")
         return
-    src_symbol, amount_mode, amount_raw = picked
-    dst_symbol = "USDC.E" if src_symbol == "ETH" else "ETH"
+    src_symbol, dst_symbol, amount_mode, amount_raw = picked
 
     wallet_key_records = _build_wallet_key_records(cfg, logger, "PAIR")
     if not wallet_key_records:
@@ -7023,25 +7030,62 @@ def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) 
                 logger.warning("[PAIR] wallet=%s invalid ETH<->USDC.E pool metadata", wallet)
                 continue
 
-            ui_token_in = weth_token if src_symbol == "ETH" else usdc_token
-            ui_token_out = weth_token if dst_symbol == "ETH" else usdc_token
-            ok_swap = _execute_trade_via_doma_ui_route(
-                cfg=cfg,
-                logger=logger,
-                state=state,
-                doma_api=doma_api,
-                exec_client=exec_client,
-                token_in=ui_token_in,
-                token_out=ui_token_out,
-                display_in_symbol=src_symbol,
-                display_out_symbol=dst_symbol,
-                trade_amount_expr=amount_expr,
-                eth_price=eth_price,
-                label=f"PAIR {wallet} {src_symbol}>{dst_symbol}",
-                is_eth_source=src_symbol == "ETH",
-                unwrap_to_native=dst_symbol == "ETH",
-                wait_for_pre_tx=True,
-            )
+            if src_symbol == "WETH" and dst_symbol == "ETH":
+                weth_balance = exec_client.get_erc20_balance(weth_token.address, weth_token.decimals)
+                try:
+                    amount_in_dec, trade_usd = resolve_trade_amount(amount_expr, weth_balance, eth_price)
+                except Exception as exc:
+                    logger.warning("[PAIR] wallet=%s invalid WETH unwrap amount '%s': %s", wallet, amount_expr, exc)
+                    ok_swap = False
+                else:
+                    amount_in_raw = decimal_to_raw(amount_in_dec, weth_token.decimals)
+                    if amount_in_dec > weth_balance or amount_in_raw <= 0:
+                        logger.warning(
+                            "[PAIR] wallet=%s insufficient WETH for unwrap: need=%s have=%s",
+                            wallet,
+                            _format_decimal_plain(amount_in_dec),
+                            _format_decimal_plain(weth_balance),
+                        )
+                        ok_swap = False
+                    elif cfg.paper_mode or cfg.dry_run or not cfg.enable_execution:
+                        logger.info(
+                            "[PAIR %s WETH>ETH] PAPER/DRY mode active. Would unwrap %s WETH (~$%s).",
+                            wallet,
+                            _format_decimal_plain(amount_in_dec),
+                            _format_decimal_plain(trade_usd),
+                        )
+                        ok_swap = True
+                    else:
+                        tx_hash = exec_client.unwrap_weth(weth_token.address, amount_in_raw)
+                        state.last_tx_hash = tx_hash
+                        logger.info(
+                            "[PAIR] wallet=%s WETH->ETH unwrap tx=%s | amount=%s WETH (~$%s)",
+                            wallet,
+                            tx_hash,
+                            _format_decimal_plain(amount_in_dec),
+                            _format_decimal_plain(trade_usd),
+                        )
+                        ok_swap = bool(tx_hash) and _wait_tx_receipt(exec_client, tx_hash, timeout_sec=180)
+            else:
+                ui_token_in = weth_token if src_symbol in {"ETH", "WETH"} else usdc_token
+                ui_token_out = weth_token if dst_symbol == "ETH" else usdc_token
+                ok_swap = _execute_trade_via_doma_ui_route(
+                    cfg=cfg,
+                    logger=logger,
+                    state=state,
+                    doma_api=doma_api,
+                    exec_client=exec_client,
+                    token_in=ui_token_in,
+                    token_out=ui_token_out,
+                    display_in_symbol=src_symbol,
+                    display_out_symbol=dst_symbol,
+                    trade_amount_expr=amount_expr,
+                    eth_price=eth_price,
+                    label=f"PAIR {wallet} {src_symbol}>{dst_symbol}",
+                    is_eth_source=src_symbol == "ETH",
+                    unwrap_to_native=dst_symbol == "ETH",
+                    wait_for_pre_tx=True,
+                )
             if ok_swap:
                 success_wallets += 1
             else:

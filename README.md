@@ -99,7 +99,7 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 2) Check points + quests
 3) Close all positions
 4) Swap domain token
-5) Swap ETH <-> USDC.E
+5) Swap ETH / WETH / USDC.E
 6) Collect all tokens -> ETH / USDC.E
 7) Farm 250+ volume ETH <-> USDC.E
 8) Domain quest volume
@@ -169,16 +169,27 @@ Quests [0x...] [line=1]
 
 Ручной свап выбранного domain token. Поддерживает маршруты через Doma UI quote/router.
 
-## 5) Swap ETH <-> USDC.E
+## 5) Swap ETH / WETH / USDC.E
 
-Парный свап ETH и USDC.E.
+Pair swap mode for ETH, WETH and USDC.E.
 
-Особенности:
+Available routes:
 
-- можно выбрать source ETH или source USDC.E;
-- amount задается числом или процентом;
-- если `graph.doma.xyz` недоступен, бот использует fallback через Doma quote API и адреса из `contracts.json`;
-- ETH source исполняется через native ETH route, без ручного wrap в интерфейсе.
+```text
+1) ETH -> USDC.E
+2) USDC.E -> ETH
+3) WETH -> ETH
+4) WETH -> USDC.E
+5) Back
+```
+
+Current logic:
+
+- amount can be a number or percent;
+- `WETH -> ETH` is executed as direct unwrap through the WETH contract;
+- `WETH -> USDC.E` is executed through Doma UI quote/router;
+- if `graph.doma.xyz` is unavailable, the bot uses Doma quote API fallback and addresses from `contracts.json`;
+- ETH source is executed through native ETH route, without manual wrap in the UI.
 
 ## 6) Collect all tokens -> ETH / USDC.E
 
