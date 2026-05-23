@@ -2485,6 +2485,7 @@ def run_domain_quest_volume_once(
     target_volume = _parse_decimal_input(target_raw)
     quest_target_volume = min(target_volume, DOMAIN_QUEST_COMPLETION_THRESHOLD_USD)
     execution_target_volume = quest_target_volume + max(Decimal("1"), quest_target_volume * Decimal("0.10"))
+    min_single_swap_usd = quest_target_volume
     partial_min = _parse_decimal_input(min_raw)
     partial_max = _parse_decimal_input(max_raw)
     if partial_min <= 0 or partial_max <= 0:
@@ -2541,7 +2542,7 @@ def run_domain_quest_volume_once(
     rides_pool_addresses = [launchpad_info.pool_address]
 
     logger.info(
-        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | lookback=%s days since=%s | target=%s USDC.E | quest_target=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
+        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | lookback=%s days since=%s | target=%s USDC.E | quest_target=%s USDC.E | min_single_swap=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
         domain_name,
         len(wallet_key_records),
         wallet_start_offset + 1,
@@ -2549,6 +2550,7 @@ def run_domain_quest_volume_once(
         volume_since.isoformat(),
         _format_decimal_plain(target_volume),
         _format_decimal_plain(quest_target_volume),
+        _format_decimal_plain(min_single_swap_usd),
         _format_decimal_plain(execution_target_volume),
         min_raw,
         max_raw,
@@ -2762,6 +2764,7 @@ def run_domain_quest_volume_once(
                 )
             cycle = 0
             wallet_failed = False
+            min_single_swap_done = accumulated_volume >= quest_target_volume
 
             while accumulated_volume < execution_target_volume:
                 cycle += 1
@@ -2891,10 +2894,21 @@ def run_domain_quest_volume_once(
                     )
                     wallet_failed = True
                     break
+                if not min_single_swap_done and full_trade_usd < min_single_swap_usd:
+                    logger.warning(
+                        _quest_log("wallet=%s cannot satisfy quest single-swap requirement | need >=%s USDC.E in one swap, available %s via %s"),
+                        wallet,
+                        _format_decimal_plain(min_single_swap_usd),
+                        _format_decimal_plain(full_trade_usd),
+                        full_in_symbol,
+                    )
+                    wallet_failed = True
+                    break
                 if remaining_volume > 0 and remaining_volume < (full_trade_usd * Decimal("2")):
+                    min_full_step_usd = min_single_swap_usd if not min_single_swap_done else MIN_EXECUTABLE_TRADE_USD
                     capped_full_usd = min(
                         full_trade_usd,
-                        max(MIN_EXECUTABLE_TRADE_USD, remaining_volume / Decimal("2")),
+                        max(min_full_step_usd, remaining_volume / Decimal("2")),
                     )
                     if capped_full_usd >= MIN_EXECUTABLE_TRADE_USD:
                         full_trade_usd = capped_full_usd
@@ -2951,6 +2965,23 @@ def run_domain_quest_volume_once(
                 if not ok_full or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
                     wallet_failed = True
                     break
+                if not min_single_swap_done and full_trade_usd < min_single_swap_usd:
+                    logger.warning(
+                        _quest_log("wallet=%s executed swap below quest single-swap requirement | swap=%s/%s USDC.E"),
+                        wallet,
+                        _format_decimal_plain(full_trade_usd),
+                        _format_decimal_plain(min_single_swap_usd),
+                    )
+                    wallet_failed = True
+                    break
+                if not min_single_swap_done and full_trade_usd >= min_single_swap_usd:
+                    min_single_swap_done = True
+                    logger.info(
+                        _quest_log("wallet=%s single-swap requirement met | swap=%s/%s USDC.E"),
+                        wallet,
+                        _format_decimal_plain(full_trade_usd),
+                        _format_decimal_plain(min_single_swap_usd),
+                    )
                 full_after_usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                 full_added_volume = _volume_added_from_usdc_balance_change(
                     full_before_usdc_balance,
