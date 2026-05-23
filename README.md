@@ -110,7 +110,8 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 13) Place domain offers
 14) Accept received domain offers
 15) Create full-range liquidity
-16) Exit
+16) Weekly ETH/USDC.E volume
+17) Exit
 ```
 
 ## 1) Bridge
@@ -365,6 +366,27 @@ Current logic:
 - mints full-range position using fee-tier tick spacing;
 - results are written to `domain_liquidity_positions.csv`.
 
+## 16) Weekly ETH/USDC.E volume
+
+Separate mode for weekly quests `Trade $100 total volume` and `Trade $250 total volume` when only the missing ETH <-> USDC.E volume should be topped up.
+
+Difference from mode `7`:
+
+- mode `7` farms exactly the target volume entered in the menu;
+- mode `16` first calculates already completed weekly ETH/USDC.E volume for the wallet;
+- if the target is already complete, the wallet is skipped;
+- if volume is missing, the bot tops up only the remaining amount plus a small `$1` buffer;
+- weekly volume is calculated from the beginning of the current UTC week using explorer token transfers for ETH/USDC.E pools;
+- final asset is settled back to ETH.
+
+Example log:
+
+```text
+[VOLUME] wallet=0x... weekly ETH/USDC.E volume | done=183/250 since=2026-05-18T00:00:00+00:00 | remaining=67 | planned_topup=68
+```
+
+Limitation: if Doma uses a weekly reset time different from UTC Monday, there can be a small mismatch. The `$1` buffer is added for that reason.
+
 ## Doma Quests
 
 Практическое соответствие режимов:
@@ -377,10 +399,10 @@ Weekly: List any domain on marketplace
 -> пункт 9
 
 Weekly: Trade $100 total volume
--> пункт 7, target volume = 100
+-> mode 7 with target volume = 100, or mode 16 to top up only missing ETH/USDC.E weekly volume
 
 Weekly: Trade $250 total volume
--> пункт 7, target volume = 250
+-> mode 7 with target volume = 250, or mode 16 to top up only missing ETH/USDC.E weekly volume
 
 Season: Bridge a domain from Doma to Base
 -> пункт 12
