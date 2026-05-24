@@ -1563,6 +1563,12 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             logger.info("Delay before next wallet: %.2f sec", delay_sec)
             time.sleep(delay_sec)
 
+    try:
+        cost_since = datetime.now(timezone.utc) - timedelta(days=7)
+        run_doma_cost_report_once(cfg, logger, state, preset=(cost_since, 0))
+    except Exception as exc:
+        logger.warning("Doma cost report failed during points/quests check: %s", exc)
+
 
 def _fetch_wallet_points_snapshot(
     cfg: BotConfig,
@@ -8106,11 +8112,16 @@ def _estimate_wallet_swap_loss_usd(
     return total_loss, eth_usdc_loss, domain_net_loss, swap_volume_usd, swap_tx_count
 
 
-def run_doma_cost_report_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+def run_doma_cost_report_once(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    state: BotState,
+    preset: Optional[Tuple[Optional[datetime], int]] = None,
+) -> None:
     wallets = [w for w in cfg.points_wallets if _is_valid_evm_address(w)]
     if not wallets:
         raise ValueError("No wallets available for Doma cost report")
-    since, start_offset = get_doma_cost_report_menu_input(len(wallets))
+    since, start_offset = preset or get_doma_cost_report_menu_input(len(wallets))
     quote_token = _usdce_token_from_config(cfg)
 
     ensure_csv(
@@ -8336,9 +8347,8 @@ def get_menu_choice() -> str:
     print("15) Create full-range liquidity")
     print("16) Weekly ETH/USDC.E volume")
     print("17) Daily .com top TVL swaps")
-    print("18) Doma cost report")
-    print("19) Exit")
-    return input("Select [1-19]: ").strip()
+    print("18) Exit")
+    return input("Select [1-18]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -8651,16 +8661,6 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Daily .com top TVL swap mode failed: %s", exc)
-                if sys.stdin.isatty():
-                    input("\nPress Enter to return to menu...")
-            return
-        if choice == "18":
-            validate_config(cfg)
-            try:
-                run_doma_cost_report_once(cfg, logger, state)
-                save_state(cfg.state_file, state)
-            except Exception as exc:
-                logger.exception("Doma cost report failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

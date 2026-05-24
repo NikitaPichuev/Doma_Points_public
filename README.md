@@ -112,8 +112,7 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 15) Create full-range liquidity
 16) Weekly ETH/USDC.E volume
 17) Daily .com top TVL swaps
-18) Doma cost report
-19) Exit
+18) Exit
 ```
 
 ## 1) Bridge
@@ -431,16 +430,9 @@ Maximum .com domains per wallet: 5
 
 With a small ETH-only balance, keep max close to min so route fees/slippage do not make the next domain swap fail.
 
-## 18) Doma cost report
+## Cost report inside mode 2
 
-Report mode for estimating how much was spent on Doma network transaction fees and swap losses.
-
-Prompts:
-
-```text
-Lookback days [7, 0 = all available explorer history]:
-Start from wallet number [1-N, default 1]:
-```
+Mode `2) Check points + quests` also runs a Doma cost report for the last 7 days after checking points and quests.
 
 Current logic:
 
