@@ -111,6 +111,7 @@ DOMAIN_OFFERS_CSV = Path("domain_offers.csv")
 DOMAIN_ACCEPTED_OFFERS_CSV = Path("domain_accepted_offers.csv")
 DOMAIN_QUESTS_CSV = Path("quests.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
+DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.18")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
 WEEKLY_VOLUME_TOPUP_BUFFER_USD = Decimal("1")
@@ -3462,6 +3463,39 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
     return max_price_raw, buy_amount_min_raw, buy_amount_max_raw, str(tokens_min), str(tokens_max), str(subdomains_min), str(subdomains_max), delay_min_raw, delay_max_raw
 
 
+def get_com_daily_swap_menu_input() -> Optional[Tuple[str, str, str, str, str, str]]:
+    print("\nDaily quest: swap on top .com domain tokens:")
+    swap_min_raw = input("Minimum swap amount USDC.E [1]: ").strip() or "1"
+    swap_max_raw = input("Maximum swap amount USDC.E [1.2]: ").strip() or "1.2"
+    domains_min_raw = input("Minimum .com domains per wallet [10]: ").strip() or "10"
+    domains_max_raw = input("Maximum .com domains per wallet [10]: ").strip() or "10"
+    delay_min_raw = input(f"Minimum delay between domain swaps sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between domain swaps sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    swap_min = _parse_decimal_input(swap_min_raw)
+    swap_max = _parse_decimal_input(swap_max_raw)
+    domains_min = int(_parse_decimal_input(domains_min_raw).to_integral_value(rounding=ROUND_FLOOR))
+    domains_max = int(_parse_decimal_input(domains_max_raw).to_integral_value(rounding=ROUND_CEILING))
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if swap_min <= 0 or swap_max <= 0:
+        raise ValueError("Swap amounts must be > 0")
+    if swap_max < swap_min:
+        raise ValueError("Maximum swap amount cannot be lower than minimum")
+    if domains_min <= 0 or domains_max <= 0:
+        raise ValueError(".com domain counts must be > 0")
+    if domains_max < domains_min:
+        raise ValueError("Maximum .com domain count cannot be lower than minimum")
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Swap delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum swap delay cannot be lower than minimum delay")
+    return swap_min_raw, swap_max_raw, str(domains_min), str(domains_max), delay_min_raw, delay_max_raw
+
+
 def get_domain_offer_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str]]:
     print("\nPlace domain offers in USDC.E:")
     buffer_raw = input("Minimum offer amount USDC.E [0.23]: ").strip() or "0.23"
@@ -5214,6 +5248,31 @@ def _eligible_cheap_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token
     return eligible
 
 
+def _top_tvl_com_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token, limit: int) -> List[LaunchpadTokenInfo]:
+    quote_address = quote_token.address.lower()
+    eligible: List[LaunchpadTokenInfo] = []
+    seen_names: set[str] = set()
+    seen_addresses: set[str] = set()
+    for token in catalog:
+        name = str(token.name or token.symbol or "").strip().lower()
+        address = (token.address or "").strip().lower()
+        if not name.endswith(".com") or not address:
+            continue
+        if name in seen_names or address in seen_addresses:
+            continue
+        if (token.quote_token_address or "").strip().lower() != quote_address:
+            continue
+        if not token.pool_address:
+            continue
+        if token.price_usd <= 0:
+            continue
+        seen_names.add(name)
+        seen_addresses.add(address)
+        eligible.append(token)
+    eligible.sort(key=lambda item: item.tvl_usd, reverse=True)
+    return eligible[:limit]
+
+
 def _top_up_usdce_from_eth_for_cheap_buy(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -5596,6 +5655,265 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         for entry in insufficient_balance_wallets:
             print(f"  {entry}")
     _print_mode_summary("CHEAP_BUY", total=len(wallet_key_records), success=success_wallets, failed=failed_wallets, skipped=skipped_wallets)
+
+
+def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    picked = get_com_daily_swap_menu_input()
+    if not picked:
+        logger.info("[COM_DAILY] mode canceled by user.")
+        return
+    swap_min_raw, swap_max_raw, domains_min_raw, domains_max_raw, delay_min_raw, delay_max_raw = picked
+    swap_min_usdc = _parse_decimal_input(swap_min_raw)
+    swap_max_usdc = _parse_decimal_input(swap_max_raw)
+    domains_min = int(_parse_decimal_input(domains_min_raw).to_integral_value(rounding=ROUND_FLOOR))
+    domains_max = int(_parse_decimal_input(domains_max_raw).to_integral_value(rounding=ROUND_CEILING))
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "COM_DAILY")
+    if not wallet_key_records:
+        raise RuntimeError("No wallet/private-key pairs available for .com daily swaps")
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
+    quote_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
+
+    metadata_proxies: Optional[Dict[str, str]] = None
+    for metadata_line_idx, _, _ in wallet_key_records:
+        candidate_proxies, skip_metadata_proxy = _proxy_for_line(cfg, metadata_line_idx, None, "COM_DAILY_METADATA")
+        if not skip_metadata_proxy:
+            metadata_proxies = candidate_proxies
+            break
+    shared_doma_api = DomaApiClient(
+        cfg.doma_api_url,
+        api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+        proxies=metadata_proxies,
+    )
+    catalog = shared_doma_api.fetch_fractional_tokens(take=250, max_pages=10)
+    top_com_tokens = _top_tvl_com_tokens(catalog, quote_token, domains_max)
+    if len(top_com_tokens) < domains_min:
+        raise RuntimeError(f"Not enough eligible .com tokens by TVL: found {len(top_com_tokens)}, need at least {domains_min}")
+
+    logger.info(
+        "[COM_DAILY] mode started | wallets=%s | start_wallet=%s | swap=%s-%s USDC.E | domains=%s-%s | selected_top_by_tvl=%s | delay=%s-%s sec",
+        total_loaded_wallets,
+        wallet_start_offset + 1,
+        _format_decimal_plain(swap_min_usdc),
+        _format_decimal_plain(swap_max_usdc),
+        domains_min,
+        domains_max,
+        ", ".join(f"{token.name}(${_format_decimal_plain(token.tvl_usd)})" for token in top_com_tokens),
+        _format_decimal_plain(delay_min),
+        _format_decimal_plain(delay_max),
+    )
+
+    swap_csv = cfg.trades_csv_file.parent / DOMAIN_COM_DAILY_CSV.name
+    ensure_csv(
+        swap_csv,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "domain",
+            "token_address",
+            "pool_address",
+            "tvl_usd",
+            "swap_usdc",
+            "tx_hash",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    success_wallets = failed_wallets = skipped_wallets = 0
+    total_success_swaps = total_failed_swaps = 0
+    failed_wallet_addresses: List[str] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "COM_DAILY")
+        wallet_number = wallet_start_offset + idx
+        logger.info("[COM_DAILY] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        if skip_wallet:
+            skipped_wallets += 1
+            continue
+
+        domains_count = random.randint(domains_min, domains_max)
+        selected_tokens = top_com_tokens[:domains_count]
+        wallet_success = wallet_failed = 0
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_key=cfg.doma_api_key,
+                api_keys=cfg.doma_api_keys,
+                proxies=proxies,
+            )
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg=cfg,
+                logger=logger,
+                wallet=wallet,
+                private_key=private_key,
+                proxies=proxies,
+                log_prefix="[COM_DAILY]",
+            )
+            eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+            required_usdc = swap_max_usdc * Decimal(domains_count)
+            current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+            if current_usdc < required_usdc:
+                if eth_price <= 0:
+                    topup_reason = "eth_price_unknown"
+                else:
+                    reserve_eth = Decimal("0.05") / eth_price
+                    native_eth = exec_client.get_native_balance()
+                    spendable_eth = native_eth - reserve_eth
+                    missing_usdc = required_usdc - current_usdc
+                    bootstrap_eth = min(max(missing_usdc, MIN_EXECUTABLE_TRADE_USD) / eth_price, spendable_eth)
+                    bootstrap_usd = bootstrap_eth * eth_price
+                    if bootstrap_eth <= 0 or bootstrap_usd < MIN_EXECUTABLE_TRADE_USD:
+                        topup_reason = f"eth_bootstrap_below_min:{_format_decimal_plain(bootstrap_usd)}"
+                    else:
+                        logger.info(
+                            "[COM_DAILY] wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
+                            wallet,
+                            _format_decimal_plain(bootstrap_eth),
+                            _format_decimal_plain(missing_usdc),
+                        )
+                        topup_ok = _execute_trade_via_doma_ui_route(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            doma_api=doma_api,
+                            exec_client=exec_client,
+                            token_in=weth_token,
+                            token_out=quote_token,
+                            display_in_symbol="ETH",
+                            display_out_symbol="USDC.E",
+                            trade_amount_expr=_format_decimal_plain(bootstrap_eth),
+                            eth_price=eth_price,
+                            label=f"COM_DAILY {wallet} ETH>USDC.E BOOTSTRAP",
+                            is_eth_source=True,
+                            unwrap_to_native=False,
+                            wait_for_pre_tx=True,
+                        )
+                        if topup_ok and state.last_tx_hash:
+                            topup_ok = _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                        topup_reason = "" if topup_ok else "eth_to_usdc_bootstrap_failed"
+                current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                if current_usdc < swap_min_usdc:
+                    skipped_wallets += 1
+                    logger.warning(
+                        "[COM_DAILY] wallet=%s skipped | insufficient USDC.E after bootstrap (%s), reason=%s",
+                        wallet,
+                        _format_decimal_plain(current_usdc),
+                        topup_reason,
+                    )
+                    continue
+
+            for token_idx, info in enumerate(selected_tokens, start=1):
+                domain_token = _token_from_launchpad_price(info, eth_price)
+                swap_usdc = _random_decimal_between(swap_min_usdc, swap_max_usdc, swap_min_raw, swap_max_raw)
+                current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                if current_usdc < swap_usdc:
+                    reason = f"USDC.E balance below selected swap amount ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_usdc)})"
+                    logger.warning("[COM_DAILY] wallet=%s domain=%s skipped | %s", wallet, info.name, reason)
+                    wallet_failed += 1
+                    total_failed_swaps += 1
+                    append_csv(
+                        swap_csv,
+                        [
+                            datetime.now(timezone.utc).isoformat(),
+                            "failed",
+                            wallet,
+                            info.name,
+                            info.address,
+                            info.pool_address or "",
+                            _format_decimal_plain(info.tvl_usd),
+                            _format_decimal_plain(swap_usdc),
+                            "",
+                            reason,
+                        ],
+                        delimiter=cfg.csv_delimiter,
+                    )
+                    break
+                logger.info(
+                    "[COM_DAILY] wallet=%s domain %s/%s %s | tvl=$%s | swap=%s USDC.E",
+                    wallet,
+                    token_idx,
+                    len(selected_tokens),
+                    info.name,
+                    _format_decimal_plain(info.tvl_usd),
+                    _format_decimal_plain(swap_usdc),
+                )
+                ok = _execute_trade_via_doma_ui_route(
+                    cfg=cfg,
+                    logger=logger,
+                    state=state,
+                    doma_api=doma_api,
+                    exec_client=exec_client,
+                    token_in=quote_token,
+                    token_out=domain_token,
+                    display_in_symbol="USDC.E",
+                    display_out_symbol=domain_token.symbol,
+                    trade_amount_expr=f"${_format_decimal_plain(swap_usdc)}",
+                    eth_price=eth_price,
+                    label=f"COM_DAILY {wallet} USDC.E>{domain_token.symbol}",
+                    wait_for_pre_tx=True,
+                )
+                tx_hash = state.last_tx_hash if ok else ""
+                if ok and tx_hash:
+                    ok = _wait_tx_receipt(exec_client, tx_hash, timeout_sec=180)
+                if ok:
+                    wallet_success += 1
+                    total_success_swaps += 1
+                    logger.info("[COM_DAILY] wallet=%s domain=%s swap complete tx=%s", wallet, info.name, tx_hash)
+                else:
+                    wallet_failed += 1
+                    total_failed_swaps += 1
+                    logger.warning("[COM_DAILY] wallet=%s domain=%s swap failed", wallet, info.name)
+                append_csv(
+                    swap_csv,
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        "ok" if ok else "failed",
+                        wallet,
+                        info.name,
+                        info.address,
+                        info.pool_address or "",
+                        _format_decimal_plain(info.tvl_usd),
+                        _format_decimal_plain(swap_usdc),
+                        tx_hash,
+                        "" if ok else "swap failed",
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+                if token_idx < len(selected_tokens):
+                    delay_sec = random.uniform(float(delay_min), float(delay_max))
+                    logger.info("[COM_DAILY] delay before next .com domain: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+            if wallet_success >= domains_count and wallet_failed == 0:
+                success_wallets += 1
+            elif wallet_success > 0:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+            else:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[COM_DAILY] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records):
+            delay_sec = random.uniform(float(delay_min), float(delay_max))
+            logger.info("[COM_DAILY] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    logger.info("[COM_DAILY] swaps total | success=%s failed=%s", total_success_swaps, total_failed_swaps)
+    _print_mode_summary(
+        "COM_DAILY",
+        total=len(wallet_key_records),
+        success=success_wallets,
+        failed=failed_wallets,
+        skipped=skipped_wallets,
+        failed_wallets=failed_wallet_addresses,
+    )
 
 
 def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -7698,7 +8016,7 @@ def get_menu_choice() -> str:
     print("2) Check points + quests")
     print("3) Close all positions")
     print("4) Swap domain token")
-    print("5) Swap ETH <-> USDC.E")
+    print("5) Swap ETH / WETH / USDC.E")
     print("6) Collect all tokens -> ETH / USDC.E")
     print("7) Farm 250+ volume ETH <-> USDC.E")
     print("8) Domain quest volume")
@@ -7710,8 +8028,9 @@ def get_menu_choice() -> str:
     print("14) Accept received domain offers")
     print("15) Create full-range liquidity")
     print("16) Weekly ETH/USDC.E volume")
-    print("17) Exit")
-    return input("Select [1-17]: ").strip()
+    print("17) Daily .com top TVL swaps")
+    print("18) Exit")
+    return input("Select [1-18]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -8014,6 +8333,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Weekly ETH/USDC.E volume failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "17":
+            validate_config(cfg)
+            try:
+                run_com_daily_swap_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Daily .com top TVL swap mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

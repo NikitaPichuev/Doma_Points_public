@@ -111,7 +111,8 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 14) Accept received domain offers
 15) Create full-range liquidity
 16) Weekly ETH/USDC.E volume
-17) Exit
+17) Daily .com top TVL swaps
+18) Exit
 ```
 
 ## 1) Bridge
@@ -398,16 +399,47 @@ Example log:
 
 Limitation: if Doma uses a weekly reset time different from UTC Monday, there can be a small mismatch. The `$1` buffer is added for that reason.
 
+## 17) Daily .com top TVL swaps
+
+Separate mode for the daily quest `Swap at least $1 on at least 5 .com domains`.
+
+Current logic:
+
+- fetches fractional domain tokens from the Doma API;
+- filters only unique `.com` domain tokens with USDC.E quote token and an active pool;
+- sorts them by TVL descending;
+- uses the top `.com` domains by TVL for each wallet;
+- default domain count is `10-10`, but the menu still allows min/max count;
+- each selected domain gets one `USDC.E -> domain token` swap;
+- swap amount is selected randomly inside the configured min/max USDC.E range;
+- if USDC.E is not enough, the bot can bootstrap USDC.E from ETH;
+- results are written to `domain_com_daily_swaps.csv`.
+
+Parameters:
+
+```text
+Minimum swap amount USDC.E
+Maximum swap amount USDC.E
+Minimum .com domains per wallet
+Maximum .com domains per wallet
+Minimum delay between domain swaps sec
+Maximum delay between domain swaps sec
+Start from wallet number
+```
+
 ## Doma Quests
 
-Практическое соответствие режимов:
+Practical mode mapping:
 
 ```text
 Daily: Make a $5+ swap on any domain token
--> пункт 8, target volume = 5
+-> mode 8, target volume = 5
+
+Daily: Swap at least $1 on at least 5 .com domains
+-> mode 17, default domain count = 10 top .com domains by TVL
 
 Weekly: List any domain on marketplace
--> пункт 9
+-> mode 9
 
 Weekly: Trade $100 total volume
 -> mode 7 with target volume = 100, or mode 16 to top up only missing ETH/USDC.E weekly volume
@@ -416,10 +448,10 @@ Weekly: Trade $250 total volume
 -> mode 7 with target volume = 250, or mode 16 to top up only missing ETH/USDC.E weekly volume
 
 Season: Bridge a domain from Doma to Base
--> пункт 12
+-> mode 12
 
 Season: Stake subdomains
--> пункт 11
+-> mode 11
 ```
 
 ## Основные настройки `.env`
