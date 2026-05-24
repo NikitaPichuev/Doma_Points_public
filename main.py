@@ -5869,27 +5869,65 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 swap_usdc = _random_decimal_between(swap_min_usdc, swap_max_usdc, swap_min_raw, swap_max_raw)
                 current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                 if current_usdc < swap_usdc:
-                    reason = f"USDC.E balance below selected swap amount ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_usdc)})"
-                    logger.warning("[COM_DAILY] wallet=%s domain=%s skipped | %s", wallet, info.name, reason)
-                    wallet_failed += 1
-                    total_failed_swaps += 1
-                    append_csv(
-                        swap_csv,
-                        [
-                            datetime.now(timezone.utc).isoformat(),
-                            "failed",
-                            wallet,
-                            info.name,
-                            info.address,
-                            info.pool_address or "",
-                            _format_decimal_plain(info.tvl_usd),
-                            _format_decimal_plain(swap_usdc),
-                            "",
-                            reason,
-                        ],
-                        delimiter=cfg.csv_delimiter,
-                    )
-                    break
+                    if current_usdc >= swap_min_usdc:
+                        adjusted_swap_usdc = current_usdc.quantize(
+                            Decimal("0.000001"),
+                            rounding=ROUND_FLOOR,
+                        )
+                        if adjusted_swap_usdc >= swap_min_usdc:
+                            logger.info(
+                                "[COM_DAILY] wallet=%s domain=%s swap amount adjusted to available USDC.E | selected=%s available=%s adjusted=%s",
+                                wallet,
+                                info.name,
+                                _format_decimal_plain(swap_usdc),
+                                _format_decimal_plain(current_usdc),
+                                _format_decimal_plain(adjusted_swap_usdc),
+                            )
+                            swap_usdc = adjusted_swap_usdc
+                        else:
+                            reason = f"USDC.E balance below minimum swap amount after rounding ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_min_usdc)})"
+                            logger.warning("[COM_DAILY] wallet=%s domain=%s skipped | %s", wallet, info.name, reason)
+                            wallet_failed += 1
+                            total_failed_swaps += 1
+                            append_csv(
+                                swap_csv,
+                                [
+                                    datetime.now(timezone.utc).isoformat(),
+                                    "failed",
+                                    wallet,
+                                    info.name,
+                                    info.address,
+                                    info.pool_address or "",
+                                    _format_decimal_plain(info.tvl_usd),
+                                    _format_decimal_plain(swap_usdc),
+                                    "",
+                                    reason,
+                                ],
+                                delimiter=cfg.csv_delimiter,
+                            )
+                            break
+                    else:
+                        reason = f"USDC.E balance below minimum swap amount ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_min_usdc)})"
+                        logger.warning("[COM_DAILY] wallet=%s domain=%s skipped | %s", wallet, info.name, reason)
+                        wallet_failed += 1
+                        total_failed_swaps += 1
+                        append_csv(
+                            swap_csv,
+                            [
+                                datetime.now(timezone.utc).isoformat(),
+                                "failed",
+                                wallet,
+                                info.name,
+                                info.address,
+                                info.pool_address or "",
+                                _format_decimal_plain(info.tvl_usd),
+                                _format_decimal_plain(swap_usdc),
+                                "",
+                                reason,
+                            ],
+                            delimiter=cfg.csv_delimiter,
+                        )
+                        break
                 logger.info(
                     "[COM_DAILY] wallet=%s domain %s/%s %s | tvl=$%s | round_trip_swap=%s USDC.E",
                     wallet,

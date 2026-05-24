@@ -413,6 +413,7 @@ Current logic:
 - default domain count is `10-10`, but the menu still allows min/max count;
 - each selected domain gets a round trip: `USDC.E -> domain token -> USDC.E`;
 - swap amount is selected randomly inside the configured min/max USDC.E range;
+- if the selected amount is slightly above the current USDC.E balance after prior round-trip loss, the bot lowers it to the available balance as long as it is still >= the configured minimum;
 - if USDC.E is not enough for one max-sized swap, the bot can bootstrap USDC.E from ETH;
 - ETH-only wallets are supported: the bot first swaps enough ETH to USDC.E, then reuses that USDC.E through round trips;
 - the bot only needs enough USDC.E for one max-sized swap, not for all selected domains at once;
