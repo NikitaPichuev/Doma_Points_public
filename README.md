@@ -410,10 +410,11 @@ Current logic:
 - sorts them by TVL descending;
 - uses the top `.com` domains by TVL for each wallet;
 - default domain count is `10-10`, but the menu still allows min/max count;
-- each selected domain gets one `USDC.E -> domain token` swap;
+- each selected domain gets a round trip: `USDC.E -> domain token -> USDC.E`;
 - swap amount is selected randomly inside the configured min/max USDC.E range;
-- if USDC.E is not enough, the bot can bootstrap USDC.E from ETH;
-- results are written to `domain_com_daily_swaps.csv`.
+- if USDC.E is not enough for one max-sized swap, the bot can bootstrap USDC.E from ETH;
+- results are written to `domain_com_daily_swaps.csv`;
+- because swaps are round-trip, the same small USDC.E balance can be reused across multiple .com domains.
 
 Parameters:
 

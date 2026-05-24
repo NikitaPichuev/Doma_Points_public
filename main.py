@@ -5755,7 +5755,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 log_prefix="[COM_DAILY]",
             )
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
-            required_usdc = swap_max_usdc * Decimal(domains_count)
+            required_usdc = swap_max_usdc
             current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
             if current_usdc < required_usdc:
                 if eth_price <= 0:
@@ -5834,7 +5834,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     )
                     break
                 logger.info(
-                    "[COM_DAILY] wallet=%s domain %s/%s %s | tvl=$%s | swap=%s USDC.E",
+                    "[COM_DAILY] wallet=%s domain %s/%s %s | tvl=$%s | round_trip_swap=%s USDC.E",
                     wallet,
                     token_idx,
                     len(selected_tokens),
@@ -5842,7 +5842,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     _format_decimal_plain(info.tvl_usd),
                     _format_decimal_plain(swap_usdc),
                 )
-                ok = _execute_trade_via_doma_ui_route(
+                before_domain_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
+                ok_forward = _execute_trade_via_doma_ui_route(
                     cfg=cfg,
                     logger=logger,
                     state=state,
@@ -5857,17 +5858,60 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     label=f"COM_DAILY {wallet} USDC.E>{domain_token.symbol}",
                     wait_for_pre_tx=True,
                 )
-                tx_hash = state.last_tx_hash if ok else ""
-                if ok and tx_hash:
-                    ok = _wait_tx_receipt(exec_client, tx_hash, timeout_sec=180)
+                forward_tx_hash = state.last_tx_hash if ok_forward else ""
+                if ok_forward and forward_tx_hash:
+                    ok_forward = _wait_tx_receipt(exec_client, forward_tx_hash, timeout_sec=180)
+                reverse_tx_hash = ""
+                ok_reverse = False
+                reason = ""
+                if ok_forward:
+                    after_domain_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
+                    received_domain = after_domain_balance - before_domain_balance
+                    if received_domain <= 0:
+                        reason = "no domain token received for reverse swap"
+                        logger.warning("[COM_DAILY] wallet=%s domain=%s reverse skipped | %s", wallet, info.name, reason)
+                    else:
+                        if token_idx < len(selected_tokens):
+                            delay_sec = random.uniform(float(delay_min), float(delay_max))
+                            logger.info("[COM_DAILY] delay before reverse swap: %.2f sec", delay_sec)
+                            time.sleep(delay_sec)
+                        ok_reverse = _execute_trade_via_doma_ui_route(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            doma_api=doma_api,
+                            exec_client=exec_client,
+                            token_in=domain_token,
+                            token_out=quote_token,
+                            display_in_symbol=domain_token.symbol,
+                            display_out_symbol="USDC.E",
+                            trade_amount_expr=_format_decimal_plain(received_domain),
+                            eth_price=eth_price,
+                            label=f"COM_DAILY {wallet} {domain_token.symbol}>USDC.E",
+                            wait_for_pre_tx=True,
+                        )
+                        reverse_tx_hash = state.last_tx_hash if ok_reverse else ""
+                        if ok_reverse and reverse_tx_hash:
+                            ok_reverse = _wait_tx_receipt(exec_client, reverse_tx_hash, timeout_sec=180)
+                        if not ok_reverse:
+                            reason = "reverse swap failed"
+                else:
+                    reason = "forward swap failed"
+                ok = ok_forward and ok_reverse
                 if ok:
                     wallet_success += 1
                     total_success_swaps += 1
-                    logger.info("[COM_DAILY] wallet=%s domain=%s swap complete tx=%s", wallet, info.name, tx_hash)
+                    logger.info(
+                        "[COM_DAILY] wallet=%s domain=%s round trip complete | forward=%s reverse=%s",
+                        wallet,
+                        info.name,
+                        forward_tx_hash,
+                        reverse_tx_hash,
+                    )
                 else:
                     wallet_failed += 1
                     total_failed_swaps += 1
-                    logger.warning("[COM_DAILY] wallet=%s domain=%s swap failed", wallet, info.name)
+                    logger.warning("[COM_DAILY] wallet=%s domain=%s round trip failed | %s", wallet, info.name, reason)
                 append_csv(
                     swap_csv,
                     [
@@ -5879,8 +5923,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         info.pool_address or "",
                         _format_decimal_plain(info.tvl_usd),
                         _format_decimal_plain(swap_usdc),
-                        tx_hash,
-                        "" if ok else "swap failed",
+                        "|".join([tx for tx in [forward_tx_hash, reverse_tx_hash] if tx]),
+                        "" if ok else reason,
                     ],
                     delimiter=cfg.csv_delimiter,
                 )
