@@ -7517,13 +7517,29 @@ def _fetch_weekly_eth_usdce_volume(
     pool_addresses = _eth_usdce_pool_addresses_from_pools(pools)
     if not pool_addresses:
         return Decimal("0")
-    return doma_api.fetch_wallet_pool_volume_usd_from_explorer(
+    return doma_api.fetch_wallet_pool_volume_usd(
         wallet_address=wallet,
         pool_address=pool_addresses[0],
         pool_addresses=pool_addresses,
         tracked_token_symbol="WETH",
         quote_token_symbol="USDC.E",
         max_pages=40,
+        since=since,
+    )
+
+
+def _fetch_weekly_total_volume(
+    doma_api: DomaApiClient,
+    wallet: str,
+    pools: List[Pool],
+    since: datetime,
+) -> Decimal:
+    pool_addresses = _eth_usdce_pool_addresses_from_pools(pools)
+    return doma_api.fetch_wallet_total_swap_volume_usd_from_explorer(
+        wallet_address=wallet,
+        quote_token_symbol="USDC.E",
+        pool_addresses=pool_addresses,
+        max_pages=80,
         since=since,
     )
 
@@ -7641,10 +7657,10 @@ def run_volume_farm_once(
             wallet_target_volume = target_volume
             if weekly_since is not None:
                 try:
-                    weekly_done = _fetch_weekly_eth_usdce_volume(doma_api, wallet, pools, weekly_since)
+                    weekly_done = _fetch_weekly_total_volume(doma_api, wallet, pools, weekly_since)
                 except Exception as exc:
                     logger.warning(
-                        "[VOLUME] wallet=%s weekly ETH/USDC.E volume fetch failed, assuming 0: %s",
+                        "[VOLUME] wallet=%s weekly total volume fetch failed, assuming 0: %s",
                         wallet,
                         exc,
                     )
@@ -7652,7 +7668,7 @@ def run_volume_farm_once(
                 weekly_remaining_volume = target_volume - weekly_done
                 if weekly_remaining_volume <= 0:
                     logger.info(
-                        "[VOLUME] wallet=%s weekly ETH/USDC.E volume already complete | done=%s/%s since=%s | skipping wallet",
+                        "[VOLUME] wallet=%s weekly total volume already complete | done=%s/%s since=%s | skipping wallet",
                         wallet,
                         _format_decimal_plain(weekly_done),
                         _format_decimal_plain(target_volume),
@@ -7662,7 +7678,7 @@ def run_volume_farm_once(
                     continue
                 wallet_target_volume = weekly_remaining_volume + WEEKLY_VOLUME_TOPUP_BUFFER_USD
                 logger.info(
-                    "[VOLUME] wallet=%s weekly ETH/USDC.E volume | done=%s/%s since=%s | remaining=%s | planned_topup=%s",
+                    "[VOLUME] wallet=%s weekly total volume | done=%s/%s since=%s | remaining=%s | planned_topup=%s | topup_pair=ETH<->USDC.E",
                     wallet,
                     _format_decimal_plain(weekly_done),
                     _format_decimal_plain(target_volume),

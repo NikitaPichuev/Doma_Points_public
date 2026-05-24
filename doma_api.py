@@ -1535,9 +1535,14 @@ class DomaApiClient:
                 str((item.get("token") or {}).get("symbol") or "").strip().upper()
                 for item in items
             }
-            if tracked_symbol and tracked_symbol not in symbols:
-                continue
             if quote_symbol not in symbols:
+                continue
+            tx_touches_pool = any(
+                str(((item.get("from") or {}).get("hash")) or "").strip().lower() in pool_set
+                or str(((item.get("to") or {}).get("hash")) or "").strip().lower() in pool_set
+                for item in items
+            )
+            if not tx_touches_pool:
                 continue
             has_pool_touch = False
             quote_amount = Decimal("0")
@@ -1555,9 +1560,87 @@ class DomaApiClient:
                 )
                 if wallet_involved and counterparty_is_pool:
                     has_pool_touch = True
-                if wallet_involved and symbol == quote_symbol and counterparty_is_pool:
+                if wallet_involved and symbol == quote_symbol:
                     quote_amount += Decimal(value_raw) / (Decimal(10) ** decimals)
-            if has_pool_touch and quote_amount > 0:
+            if (has_pool_touch or tx_touches_pool) and quote_amount > 0:
+                total_volume_usd += quote_amount
+        return total_volume_usd
+
+    def fetch_wallet_total_swap_volume_usd_from_explorer(
+        self,
+        wallet_address: str,
+        quote_token_symbol: str = "USDC.E",
+        pool_addresses: Optional[List[str]] = None,
+        max_pages: int = 80,
+        since: Optional[datetime] = None,
+    ) -> Decimal:
+        wallet_lc = str(wallet_address).strip().lower()
+        quote_symbol = str(quote_token_symbol or "USDC.E").strip().upper()
+        pool_set = {
+            str(addr).strip().lower()
+            for addr in (pool_addresses or [])
+            if str(addr).strip()
+        }
+        since_utc = since.astimezone(timezone.utc) if since is not None else None
+
+        tx_groups: Dict[str, List[dict]] = {}
+        next_params: Optional[dict] = None
+        reached_older_items = False
+
+        for _page in range(max_pages):
+            data = self._explorer_get(
+                f"addresses/{wallet_address}/token-transfers",
+                params=next_params,
+            )
+            items = data.get("items", [])
+            if not items:
+                break
+            for item in items:
+                item_date_raw = str(item.get("timestamp") or "").strip()
+                if since_utc is not None and item_date_raw:
+                    item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
+                    if item_date < since_utc:
+                        reached_older_items = True
+                        continue
+                tx_hash = str(item.get("transaction_hash") or "").strip().lower()
+                if not tx_hash:
+                    continue
+                tx_groups.setdefault(tx_hash, []).append(item)
+            if reached_older_items:
+                break
+            next_params = data.get("next_page_params")
+            if not next_params:
+                break
+
+        total_volume_usd = Decimal("0")
+        for items in tx_groups.values():
+            quote_amount = Decimal("0")
+            has_quote_wallet_transfer = False
+            has_other_wallet_transfer = False
+            has_pool_like_quote_transfer = False
+
+            for item in items:
+                from_hash = str(((item.get("from") or {}).get("hash")) or "").strip().lower()
+                to_hash = str(((item.get("to") or {}).get("hash")) or "").strip().lower()
+                token_meta = item.get("token") or {}
+                symbol = str(token_meta.get("symbol") or "").strip().upper()
+                decimals = int(token_meta.get("decimals") or (item.get("total") or {}).get("decimals") or 18)
+                value_raw = int(str((item.get("total") or {}).get("value") or "0"))
+                wallet_involved = from_hash == wallet_lc or to_hash == wallet_lc
+                if not wallet_involved:
+                    continue
+                if symbol == quote_symbol:
+                    has_quote_wallet_transfer = True
+                    quote_amount += Decimal(value_raw) / (Decimal(10) ** decimals)
+                    # Direct ETH/WETH <-> USDC.E swaps can appear as a single USDC.E wallet transfer.
+                    if from_hash in pool_set and to_hash == wallet_lc:
+                        has_pool_like_quote_transfer = True
+                    if from_hash == wallet_lc and to_hash in pool_set:
+                        has_pool_like_quote_transfer = True
+                else:
+                    has_other_wallet_transfer = True
+
+            if has_quote_wallet_transfer and quote_amount > 0 and (has_other_wallet_transfer or has_pool_like_quote_transfer):
                 total_volume_usd += quote_amount
         return total_volume_usd
 

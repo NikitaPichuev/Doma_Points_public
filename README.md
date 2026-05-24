@@ -380,21 +380,22 @@ Current logic:
 
 ## 16) Weekly ETH/USDC.E volume
 
-Separate mode for weekly quests `Trade $100 total volume` and `Trade $250 total volume` when only the missing ETH <-> USDC.E volume should be topped up.
+Separate mode for weekly quests `Trade $100 total volume` and `Trade $250 total volume` when the missing weekly volume should be topped up through ETH <-> USDC.E.
 
 Difference from mode `7`:
 
 - mode `7` farms exactly the target volume entered in the menu;
-- mode `16` first calculates already completed weekly ETH/USDC.E volume for the wallet;
+- mode `16` first calculates already completed weekly total swap volume for the wallet;
 - if the target is already complete, the wallet is skipped;
 - if volume is missing, the bot tops up only the remaining amount plus a small `$1` buffer;
-- weekly volume is calculated from the beginning of the current UTC week using explorer token transfers for ETH/USDC.E pools;
+- weekly total volume is calculated from the beginning of the current UTC week using explorer token transfers;
+- the missing amount is farmed with ETH <-> USDC.E swaps;
 - final asset is settled back to ETH.
 
 Example log:
 
 ```text
-[VOLUME] wallet=0x... weekly ETH/USDC.E volume | done=183/250 since=2026-05-18T00:00:00+00:00 | remaining=67 | planned_topup=68
+[VOLUME] wallet=0x... weekly total volume | done=183/250 since=2026-05-18T00:00:00+00:00 | remaining=67 | planned_topup=68 | topup_pair=ETH<->USDC.E
 ```
 
 Limitation: if Doma uses a weekly reset time different from UTC Monday, there can be a small mismatch. The `$1` buffer is added for that reason.
