@@ -201,6 +201,13 @@ Current logic:
 
 Может свапать WETH/domain tokens через доступные маршруты и выполнять финальный settle.
 
+Current sweep routing:
+
+- domain tokens are sold through Doma UI quote/router first, using token metadata from the Doma API catalog;
+- WETH -> USDC.E also uses Doma UI quote/router;
+- `graph.doma.xyz` is no longer required for sweep startup; Doma pools are loaded only as a direct-pool fallback;
+- if Doma pools are unavailable, sweep can still continue through Doma UI routes.
+
 ## 7) Farm 250+ volume ETH <-> USDC.E
 
 Фармит объем по паре ETH <-> USDC.E.

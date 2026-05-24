@@ -7150,35 +7150,21 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
         api_keys=cfg.doma_api_keys,
         proxies=None,
     )
-    shared_subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=None)
-    pools = shared_subgraph.fetch_top_pools(limit=1000)
-    eth_price = shared_subgraph.fetch_eth_price_usd()
+    usdc_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
+    eth_price = _fetch_eth_price_via_doma_quote(cfg, shared_doma_api, usdc_token)
     if eth_price <= 0:
         raise RuntimeError("Failed to resolve ETH/USD")
     token_catalog = shared_doma_api.fetch_fractional_tokens(take=100, max_pages=10)
     if not token_catalog:
         raise RuntimeError("Doma fractional token catalog is empty")
-
-    def _find_token_by_symbol(sym: str) -> Optional[Token]:
-        target = canonical_symbol(sym)
-        for pool in pools:
-            if pool.token0.symbol == target:
-                return pool.token0
-            if pool.token1.symbol == target:
-                return pool.token1
-        return None
-
-    usdc_token = _find_token_by_symbol("USDC.E")
-    if not usdc_token:
-        raise RuntimeError("USDC.E token metadata not found")
-    weth_token = _find_token_by_symbol("WETH")
-    if not weth_token:
-        raise RuntimeError("WETH token metadata not found")
-    pool_weth_usdc = _find_best_pool_for_symbols(cfg, pools, "WETH", "USDC.E", ignore_limits=True)
-    if not pool_weth_usdc:
-        raise RuntimeError("No route WETH<->USDC.E")
+    try:
+        pools = shared_doma_api.fetch_top_pools_by_tvl(limit=100, eth_price_usd=eth_price)
+    except Exception as exc:
+        logger.warning("[SWEEP] Doma API pools failed, direct pool fallback disabled: %s", exc)
+        pools = []
     logger.info(
-        "[SWEEP] shared metadata loaded | pools=%s | tokens=%s | eth_price=%s",
+        "[SWEEP] shared metadata loaded | pools=%s | tokens=%s | eth_price=%s | route_source=doma_ui",
         len(pools),
         len(token_catalog),
         _format_decimal_plain(eth_price),
@@ -7263,7 +7249,26 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                 _format_decimal_plain(balance_dec),
             )
             ok = False
-            if info.pool_address:
+            token_meta = _token_from_launchpad_price(info, eth_price)
+            if info.address and info.price_usd > 0:
+                ok = _execute_trade_via_doma_ui_route(
+                    cfg=cfg,
+                    logger=logger,
+                    state=state,
+                    doma_api=shared_doma_api,
+                    exec_client=exec_client,
+                    token_in=token_meta,
+                    token_out=usdc_token,
+                    display_in_symbol=token_symbol,
+                    display_out_symbol="USDC.E",
+                    trade_amount_expr="100%",
+                    eth_price=eth_price,
+                    label=f"SWEEP {wallet} {token_symbol}>USDC.E",
+                    is_eth_source=False,
+                    unwrap_to_native=False,
+                    wait_for_pre_tx=True,
+                )
+            if not ok and info.pool_address:
                 pool = _find_pool_by_address(pools, info.pool_address)
                 if pool is None:
                     pool = _find_best_pool_for_symbols(cfg, pools, token_symbol, "USDC.E", ignore_limits=True)
@@ -7285,7 +7290,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     )
                 else:
                     logger.warning("[SWEEP] wallet=%s token=%s no pool route to USDC.E", wallet, token_symbol)
-            elif info.launchpad_address and info.quote_token_address == usdc_token.address:
+            if not ok and info.launchpad_address and info.quote_token_address == usdc_token.address:
                 ok = _execute_launchpad_sell(
                     cfg=cfg,
                     logger=logger,
@@ -7298,7 +7303,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     label=f"SWEEP {wallet} {token_symbol}>USDC.E",
                     wait_for_pre_tx=True,
                 )
-            else:
+            if not ok and not info.pool_address and not info.launchpad_address:
                 logger.warning(
                     "[SWEEP] wallet=%s token=%s unsupported route to USDC.E (pool=%s launchpad=%s quote=%s)",
                     wallet,
@@ -7331,19 +7336,21 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     wait_for_receipt=True,
                 )
             else:
-                ok = _execute_trade_for_pair(
+                ok = _execute_trade_via_doma_ui_route(
                     cfg=cfg,
                     logger=logger,
                     state=state,
+                    doma_api=shared_doma_api,
                     exec_client=exec_client,
-                    pool=pool_weth_usdc,
-                    symbol_in="WETH",
-                    symbol_out="USDC.E",
+                    token_in=weth_token,
+                    token_out=usdc_token,
+                    display_in_symbol="WETH",
+                    display_out_symbol="USDC.E",
                     trade_amount_expr="100%",
                     eth_price=eth_price,
                     label=f"SWEEP {wallet} WETH>USDC.E",
-                    bypass_risk_checks=True,
-                    allow_no_quoter_execution=True,
+                    is_eth_source=False,
+                    unwrap_to_native=False,
                     wait_for_pre_tx=True,
                 )
             if ok:
