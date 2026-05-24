@@ -112,7 +112,8 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 15) Create full-range liquidity
 16) Weekly ETH/USDC.E volume
 17) Daily .com top TVL swaps
-18) Exit
+18) Doma cost report
+19) Exit
 ```
 
 ## 1) Bridge
@@ -429,6 +430,30 @@ Maximum .com domains per wallet: 5
 ```
 
 With a small ETH-only balance, keep max close to min so route fees/slippage do not make the next domain swap fail.
+
+## 18) Doma cost report
+
+Report mode for estimating how much was spent on Doma network transaction fees and swap losses.
+
+Prompts:
+
+```text
+Lookback days [7, 0 = all available explorer history]:
+Start from wallet number [1-N, default 1]:
+```
+
+Current logic:
+
+- reads wallet transactions, token transfers, and internal transactions from Doma explorer;
+- gas cost is exact: explorer `actual fee` summed for outgoing wallet transactions;
+- gas USD is calculated using the current ETH/USDC.E Doma quote;
+- swap loss/slippage is an estimate from wallet transfers:
+  - ETH -> USDC.E: input ETH is valued with current ETH/USDC.E quote and compared with received USDC.E;
+  - USDC.E -> ETH: sent USDC.E is compared with received ETH valued by current ETH/USDC.E quote;
+  - domain round trips: net USDC.E sent minus received is counted as realized loss;
+- results are written to `doma_cost_report.csv`.
+
+Important limitation: explorer does not provide historical route quotes for every swap. Gas is exact, but swap loss/slippage is marked as `estimated` and can differ if ETH price changed during the selected period or if non-USDC.E tokens are still held.
 
 Parameters:
 

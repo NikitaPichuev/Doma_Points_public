@@ -1644,6 +1644,108 @@ class DomaApiClient:
                 total_volume_usd += quote_amount
         return total_volume_usd
 
+    def fetch_wallet_transactions_from_explorer(
+        self,
+        wallet_address: str,
+        max_pages: int = 80,
+        since: Optional[datetime] = None,
+    ) -> List[dict]:
+        since_utc = since.astimezone(timezone.utc) if since is not None else None
+        out: List[dict] = []
+        next_params: Optional[dict] = None
+
+        for _page in range(max_pages):
+            data = self._explorer_get(
+                f"addresses/{wallet_address}/transactions",
+                params=next_params,
+            )
+            items = data.get("items", [])
+            if not items:
+                break
+            reached_older_items = False
+            for item in items:
+                item_date_raw = str(item.get("timestamp") or "").strip()
+                if since_utc is not None and item_date_raw:
+                    item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
+                    if item_date < since_utc:
+                        reached_older_items = True
+                        continue
+                out.append(item)
+            if reached_older_items:
+                break
+            next_params = data.get("next_page_params")
+            if not next_params:
+                break
+        return out
+
+    def fetch_wallet_token_transfers_from_explorer(
+        self,
+        wallet_address: str,
+        max_pages: int = 80,
+        since: Optional[datetime] = None,
+    ) -> List[dict]:
+        since_utc = since.astimezone(timezone.utc) if since is not None else None
+        out: List[dict] = []
+        next_params: Optional[dict] = None
+
+        for _page in range(max_pages):
+            data = self._explorer_get(
+                f"addresses/{wallet_address}/token-transfers",
+                params=next_params,
+            )
+            items = data.get("items", [])
+            if not items:
+                break
+            reached_older_items = False
+            for item in items:
+                item_date_raw = str(item.get("timestamp") or "").strip()
+                if since_utc is not None and item_date_raw:
+                    item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
+                    if item_date < since_utc:
+                        reached_older_items = True
+                        continue
+                out.append(item)
+            if reached_older_items:
+                break
+            next_params = data.get("next_page_params")
+            if not next_params:
+                break
+        return out
+
+    def fetch_wallet_internal_transactions_from_explorer(
+        self,
+        wallet_address: str,
+        max_pages: int = 80,
+        since: Optional[datetime] = None,
+    ) -> List[dict]:
+        since_utc = since.astimezone(timezone.utc) if since is not None else None
+        out: List[dict] = []
+        next_params: Optional[dict] = None
+
+        for _page in range(max_pages):
+            data = self._explorer_get(
+                f"addresses/{wallet_address}/internal-transactions",
+                params=next_params,
+            )
+            items = data.get("items", [])
+            if not items:
+                break
+            reached_older_items = False
+            for item in items:
+                item_date_raw = str(item.get("timestamp") or "").strip()
+                if since_utc is not None and item_date_raw:
+                    item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
+                    if item_date < since_utc:
+                        reached_older_items = True
+                        continue
+                out.append(item)
+            if reached_older_items:
+                break
+            next_params = data.get("next_page_params")
+            if not next_params:
+                break
+        return out
+
     def fetch_fractional_tokens(self, take: int = 250, max_pages: int = 10) -> List[LaunchpadTokenInfo]:
         query = """
         query FractionalTokens(

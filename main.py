@@ -112,6 +112,7 @@ DOMAIN_ACCEPTED_OFFERS_CSV = Path("domain_accepted_offers.csv")
 DOMAIN_QUESTS_CSV = Path("quests.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
+DOMA_COST_REPORT_CSV = Path("doma_cost_report.csv")
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.18")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
 WEEKLY_VOLUME_TOPUP_BUFFER_USD = Decimal("1")
@@ -7994,6 +7995,252 @@ def run_volume_farm_once(
     )
 
 
+def get_doma_cost_report_menu_input(wallet_count: int) -> Optional[Tuple[Optional[datetime], int]]:
+    print("\nDoma cost report:")
+    lookback_raw = input("Lookback days [7, 0 = all available explorer history]: ").strip() or "7"
+    lookback_days = int(_parse_decimal_input(lookback_raw))
+    if lookback_days < 0:
+        raise ValueError("Lookback days cannot be negative")
+    since = None if lookback_days == 0 else datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    start_raw = input(f"Start from wallet number [1-{wallet_count}, default 1]: ").strip() or "1"
+    start_number = int(start_raw)
+    if start_number < 1 or start_number > wallet_count:
+        raise ValueError("Invalid start wallet number")
+    return since, start_number - 1
+
+
+def _safe_decimal_from_raw(value: object, decimals: int) -> Decimal:
+    try:
+        return Decimal(int(str(value or "0"))) / (Decimal(10) ** decimals)
+    except Exception:
+        return Decimal("0")
+
+
+def _cost_report_group_transfers(items: List[dict]) -> Dict[str, List[dict]]:
+    grouped: Dict[str, List[dict]] = {}
+    for item in items:
+        tx_hash = str(item.get("transaction_hash") or "").strip().lower()
+        if tx_hash:
+            grouped.setdefault(tx_hash, []).append(item)
+    return grouped
+
+
+def _estimate_wallet_swap_loss_usd(
+    wallet: str,
+    txs: List[dict],
+    token_transfers_by_tx: Dict[str, List[dict]],
+    internal_by_tx: Dict[str, List[dict]],
+    eth_price: Decimal,
+) -> Tuple[Decimal, Decimal, Decimal, Decimal, int]:
+    wallet_lc = wallet.lower()
+    eth_usdc_loss = Decimal("0")
+    domain_usdc_sent = Decimal("0")
+    domain_usdc_received = Decimal("0")
+    swap_volume_usd = Decimal("0")
+    swap_tx_count = 0
+
+    for tx in txs:
+        if str(tx.get("status") or "").lower() not in {"ok", "success"}:
+            continue
+        tx_hash = str(tx.get("hash") or "").strip().lower()
+        if not tx_hash:
+            continue
+        transfers = token_transfers_by_tx.get(tx_hash, [])
+        internals = internal_by_tx.get(tx_hash, [])
+
+        usdc_sent = Decimal("0")
+        usdc_received = Decimal("0")
+        other_wallet_token_transfer = False
+        for item in transfers:
+            from_hash = str(((item.get("from") or {}).get("hash")) or "").strip().lower()
+            to_hash = str(((item.get("to") or {}).get("hash")) or "").strip().lower()
+            if from_hash != wallet_lc and to_hash != wallet_lc:
+                continue
+            token_meta = item.get("token") or {}
+            symbol = canonical_symbol(str(token_meta.get("symbol") or ""))
+            decimals = int(token_meta.get("decimals") or (item.get("total") or {}).get("decimals") or 18)
+            amount = _safe_decimal_from_raw((item.get("total") or {}).get("value"), decimals)
+            if symbol == "USDC.E":
+                if from_hash == wallet_lc:
+                    usdc_sent += amount
+                if to_hash == wallet_lc:
+                    usdc_received += amount
+            else:
+                other_wallet_token_transfer = True
+
+        native_sent = _safe_decimal_from_raw(tx.get("value"), 18)
+        native_received = Decimal("0")
+        for item in internals:
+            if not bool(item.get("success", True)):
+                continue
+            to_hash = str(((item.get("to") or {}).get("hash")) or "").strip().lower()
+            if to_hash == wallet_lc:
+                native_received += _safe_decimal_from_raw(item.get("value"), 18)
+
+        direct_eth_usdc = False
+        if native_sent > 0 and usdc_received > 0:
+            eth_usdc_loss += (native_sent * eth_price) - usdc_received
+            swap_volume_usd += max(native_sent * eth_price, usdc_received)
+            direct_eth_usdc = True
+        if usdc_sent > 0 and native_received > 0:
+            eth_usdc_loss += usdc_sent - (native_received * eth_price)
+            swap_volume_usd += max(usdc_sent, native_received * eth_price)
+            direct_eth_usdc = True
+
+        if other_wallet_token_transfer and not direct_eth_usdc:
+            domain_usdc_sent += usdc_sent
+            domain_usdc_received += usdc_received
+            swap_volume_usd += max(usdc_sent, usdc_received)
+        elif not direct_eth_usdc and (usdc_sent > 0 or usdc_received > 0):
+            swap_volume_usd += max(usdc_sent, usdc_received)
+
+        if direct_eth_usdc or other_wallet_token_transfer:
+            swap_tx_count += 1
+
+    domain_net_loss = domain_usdc_sent - domain_usdc_received
+    if eth_usdc_loss < 0:
+        eth_usdc_loss = Decimal("0")
+    if domain_net_loss < 0:
+        domain_net_loss = Decimal("0")
+    total_loss = eth_usdc_loss + domain_net_loss
+    return total_loss, eth_usdc_loss, domain_net_loss, swap_volume_usd, swap_tx_count
+
+
+def run_doma_cost_report_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    wallets = [w for w in cfg.points_wallets if _is_valid_evm_address(w)]
+    if not wallets:
+        raise ValueError("No wallets available for Doma cost report")
+    since, start_offset = get_doma_cost_report_menu_input(len(wallets))
+    quote_token = _usdce_token_from_config(cfg)
+
+    ensure_csv(
+        cfg.points_csv_file.parent / DOMA_COST_REPORT_CSV.name,
+        [
+            "timestamp_utc",
+            "wallet",
+            "line",
+            "since",
+            "tx_count",
+            "gas_tx_count",
+            "swap_tx_count",
+            "gas_eth",
+            "gas_usd",
+            "swap_volume_usd_est",
+            "swap_loss_usd_est",
+            "eth_usdc_loss_usd_est",
+            "domain_roundtrip_loss_usd_est",
+            "total_cost_usd_est",
+            "note",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    total_gas_eth = Decimal("0")
+    total_gas_usd = Decimal("0")
+    total_swap_loss = Decimal("0")
+    total_cost = Decimal("0")
+
+    logger.info(
+        "[COST] mode started | wallets=%s | start_wallet=%s | since=%s | slippage=estimated",
+        len(wallets),
+        start_offset + 1,
+        since.isoformat() if since else "all",
+    )
+
+    for idx, wallet in list(enumerate(wallets))[start_offset:]:
+        proxies, skip_wallet = _proxy_for_line(cfg, idx, logger, "COST")
+        if skip_wallet:
+            continue
+        logger.info("[COST] wallet %s", _wallet_progress_label(idx, len(wallets), wallet))
+        try:
+            api = DomaApiClient(
+                cfg.doma_api_url,
+                api_key=cfg.doma_api_key,
+                api_keys=cfg.doma_api_keys,
+                proxies=proxies,
+            )
+            eth_price = _fetch_eth_price_via_doma_quote(cfg, api, quote_token)
+            txs = api.fetch_wallet_transactions_from_explorer(wallet, max_pages=100, since=since)
+            token_transfers = api.fetch_wallet_token_transfers_from_explorer(wallet, max_pages=100, since=since)
+            internals = api.fetch_wallet_internal_transactions_from_explorer(wallet, max_pages=100, since=since)
+        except Exception as exc:
+            logger.warning("[COST] wallet=%s fetch failed: %s", wallet, exc)
+            continue
+
+        wallet_lc = wallet.lower()
+        gas_tx_count = 0
+        gas_eth = Decimal("0")
+        for tx in txs:
+            from_hash = str(((tx.get("from") or {}).get("hash")) or "").strip().lower()
+            if from_hash != wallet_lc:
+                continue
+            fee_obj = tx.get("fee") or {}
+            fee_raw = fee_obj.get("value") if isinstance(fee_obj, dict) else tx.get("fee")
+            fee_eth = _safe_decimal_from_raw(fee_raw, 18)
+            if fee_eth <= 0:
+                continue
+            gas_tx_count += 1
+            gas_eth += fee_eth
+
+        gas_usd = gas_eth * eth_price
+        token_transfers_by_tx = _cost_report_group_transfers(token_transfers)
+        internal_by_tx = _cost_report_group_transfers(internals)
+        swap_loss, eth_usdc_loss, domain_loss, swap_volume, swap_tx_count = _estimate_wallet_swap_loss_usd(
+            wallet,
+            txs,
+            token_transfers_by_tx,
+            internal_by_tx,
+            eth_price,
+        )
+        wallet_total_cost = gas_usd + swap_loss
+
+        total_gas_eth += gas_eth
+        total_gas_usd += gas_usd
+        total_swap_loss += swap_loss
+        total_cost += wallet_total_cost
+
+        logger.info(
+            "[COST] wallet=%s tx=%s gas=%s ETH (~$%s) | swap_loss_est=$%s | total_est=$%s | swap_volume_est=$%s",
+            wallet,
+            len(txs),
+            _format_decimal_plain(gas_eth),
+            _format_decimal_plain(gas_usd),
+            _format_decimal_plain(swap_loss),
+            _format_decimal_plain(wallet_total_cost),
+            _format_decimal_plain(swap_volume),
+        )
+        append_csv_row(
+            cfg.points_csv_file.parent / DOMA_COST_REPORT_CSV.name,
+            [
+                datetime.now(timezone.utc).isoformat(),
+                wallet,
+                str(idx + 1),
+                since.isoformat() if since else "",
+                str(len(txs)),
+                str(gas_tx_count),
+                str(swap_tx_count),
+                str(gas_eth),
+                str(gas_usd),
+                str(swap_volume),
+                str(swap_loss),
+                str(eth_usdc_loss),
+                str(domain_loss),
+                str(wallet_total_cost),
+                "gas exact from explorer actual fee; swap loss estimated from wallet transfers and current ETH/USD",
+            ],
+            delimiter=cfg.csv_delimiter,
+        )
+
+    logger.info(
+        "[COST] итог | gas=%s ETH (~$%s) | swap_loss_est=$%s | total_cost_est=$%s | since=%s",
+        _format_decimal_plain(total_gas_eth),
+        _format_decimal_plain(total_gas_usd),
+        _format_decimal_plain(total_swap_loss),
+        _format_decimal_plain(total_cost),
+        since.isoformat() if since else "all",
+    )
+
+
 def get_bridge_tasks_from_menu(state: BotState) -> Optional[List[str]]:
     print("\nBridge routes (Relay):")
     print("1) Base -> Doma | ETH -> ETH")
@@ -8089,8 +8336,9 @@ def get_menu_choice() -> str:
     print("15) Create full-range liquidity")
     print("16) Weekly ETH/USDC.E volume")
     print("17) Daily .com top TVL swaps")
-    print("18) Exit")
-    return input("Select [1-18]: ").strip()
+    print("18) Doma cost report")
+    print("19) Exit")
+    return input("Select [1-19]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -8403,6 +8651,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Daily .com top TVL swap mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "18":
+            validate_config(cfg)
+            try:
+                run_doma_cost_report_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Doma cost report failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return
