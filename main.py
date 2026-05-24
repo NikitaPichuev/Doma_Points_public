@@ -1565,7 +1565,16 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
 
     try:
         cost_since = datetime.now(timezone.utc) - timedelta(days=7)
-        run_doma_cost_report_once(cfg, logger, state, preset=(cost_since, 0))
+        run_doma_cost_report_once(cfg, logger, state, preset=(cost_since, 0), report_label="last_7d")
+        for period_label, period_since, period_until in _derive_current_season_ranges(cfg, logger, wallets):
+            run_doma_cost_report_once(
+                cfg,
+                logger,
+                state,
+                preset=(period_since, 0),
+                report_label=period_label,
+                until=period_until,
+            )
     except Exception as exc:
         logger.warning("Doma cost report failed during points/quests check: %s", exc)
 
@@ -1622,6 +1631,47 @@ def _log_wallet_points_delta(
         _fmt(after_volume),
         _fmt(delta_volume),
     )
+
+
+def _derive_current_season_ranges(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallets: List[str],
+) -> List[Tuple[str, Optional[datetime], Optional[datetime]]]:
+    for idx, wallet in enumerate(wallets):
+        ctx = _wallet_api_context(cfg, idx, logger, "Season range")
+        if ctx is None:
+            continue
+        api_key, proxies = ctx
+        api = DomaApiClient(
+            cfg.doma_api_url,
+            api_key=api_key,
+            api_keys=[api_key] if api_key else [],
+            proxies=proxies,
+        )
+        snapshot = api.fetch_points(wallet, cfg.leaderboard_rank_by)
+        meta = snapshot.snapshot_date if snapshot else ""
+        week_match = re.search(r"week=(\d+)", meta)
+        season_match = re.search(r"season=(\d+)", meta)
+        if not week_match or not season_match:
+            continue
+        week_number = int(week_match.group(1))
+        season_number = int(season_match.group(1))
+        if season_number != 1 or week_number < 1:
+            logger.warning("Season range: expected current season=1, got meta=%s; season cost split skipped", meta)
+            return []
+        season_1_start = _current_week_start_utc() - timedelta(weeks=week_number - 1)
+        logger.info(
+            "Season range derived from leaderboard meta=%s | season_1_start=%s",
+            meta,
+            season_1_start.isoformat(),
+        )
+        return [
+            ("season_0", None, season_1_start),
+            ("season_1", season_1_start, None),
+        ]
+    logger.warning("Season range: unable to derive season/week from leaderboard; season cost split skipped")
+    return []
 
 
 def run_bridge_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -8117,6 +8167,8 @@ def run_doma_cost_report_once(
     logger: logging.Logger,
     state: BotState,
     preset: Optional[Tuple[Optional[datetime], int]] = None,
+    report_label: str = "custom",
+    until: Optional[datetime] = None,
 ) -> None:
     wallets = [w for w in cfg.points_wallets if _is_valid_evm_address(w)]
     if not wallets:
@@ -8152,10 +8204,12 @@ def run_doma_cost_report_once(
     total_cost = Decimal("0")
 
     logger.info(
-        "[COST] mode started | wallets=%s | start_wallet=%s | since=%s | slippage=estimated",
+        "[COST] mode started | period=%s | wallets=%s | start_wallet=%s | since=%s | until=%s | slippage=estimated",
+        report_label,
         len(wallets),
         start_offset + 1,
         since.isoformat() if since else "all",
+        until.isoformat() if until else "now",
     )
 
     for idx, wallet in list(enumerate(wallets))[start_offset:]:
@@ -8171,9 +8225,9 @@ def run_doma_cost_report_once(
                 proxies=proxies,
             )
             eth_price = _fetch_eth_price_via_doma_quote(cfg, api, quote_token)
-            txs = api.fetch_wallet_transactions_from_explorer(wallet, max_pages=100, since=since)
-            token_transfers = api.fetch_wallet_token_transfers_from_explorer(wallet, max_pages=100, since=since)
-            internals = api.fetch_wallet_internal_transactions_from_explorer(wallet, max_pages=100, since=since)
+            txs = api.fetch_wallet_transactions_from_explorer(wallet, max_pages=100, since=since, until=until)
+            token_transfers = api.fetch_wallet_token_transfers_from_explorer(wallet, max_pages=100, since=since, until=until)
+            internals = api.fetch_wallet_internal_transactions_from_explorer(wallet, max_pages=100, since=since, until=until)
         except Exception as exc:
             logger.warning("[COST] wallet=%s fetch failed: %s", wallet, exc)
             continue
@@ -8211,7 +8265,8 @@ def run_doma_cost_report_once(
         total_cost += wallet_total_cost
 
         logger.info(
-            "[COST] wallet=%s tx=%s gas=%s ETH (~$%s) | swap_loss_est=$%s | total_est=$%s | swap_volume_est=$%s",
+            "[COST] period=%s wallet=%s tx=%s gas=%s ETH (~$%s) | swap_loss_est=$%s | total_est=$%s | swap_volume_est=$%s",
+            report_label,
             wallet,
             len(txs),
             _format_decimal_plain(gas_eth),
@@ -8226,7 +8281,7 @@ def run_doma_cost_report_once(
                 datetime.now(timezone.utc).isoformat(),
                 wallet,
                 str(idx + 1),
-                since.isoformat() if since else "",
+                f"{report_label}:{since.isoformat() if since else 'all'}..{until.isoformat() if until else 'now'}",
                 str(len(txs)),
                 str(gas_tx_count),
                 str(swap_tx_count),
@@ -8243,12 +8298,14 @@ def run_doma_cost_report_once(
         )
 
     logger.info(
-        "[COST] итог | gas=%s ETH (~$%s) | swap_loss_est=$%s | total_cost_est=$%s | since=%s",
+        "[COST] итог | period=%s | gas=%s ETH (~$%s) | swap_loss_est=$%s | total_cost_est=$%s | since=%s | until=%s",
+        report_label,
         _format_decimal_plain(total_gas_eth),
         _format_decimal_plain(total_gas_usd),
         _format_decimal_plain(total_swap_loss),
         _format_decimal_plain(total_cost),
         since.isoformat() if since else "all",
+        until.isoformat() if until else "now",
     )
 
 

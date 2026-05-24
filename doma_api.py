@@ -1649,8 +1649,10 @@ class DomaApiClient:
         wallet_address: str,
         max_pages: int = 80,
         since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
     ) -> List[dict]:
         since_utc = since.astimezone(timezone.utc) if since is not None else None
+        until_utc = until.astimezone(timezone.utc) if until is not None else None
         out: List[dict] = []
         next_params: Optional[dict] = None
 
@@ -1665,10 +1667,12 @@ class DomaApiClient:
             reached_older_items = False
             for item in items:
                 item_date_raw = str(item.get("timestamp") or "").strip()
-                if since_utc is not None and item_date_raw:
+                if (since_utc is not None or until_utc is not None) and item_date_raw:
                     item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
-                    if item_date < since_utc:
+                    if since_utc is not None and item_date < since_utc:
                         reached_older_items = True
+                        continue
+                    if until_utc is not None and item_date >= until_utc:
                         continue
                 out.append(item)
             if reached_older_items:
@@ -1683,8 +1687,10 @@ class DomaApiClient:
         wallet_address: str,
         max_pages: int = 80,
         since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
     ) -> List[dict]:
         since_utc = since.astimezone(timezone.utc) if since is not None else None
+        until_utc = until.astimezone(timezone.utc) if until is not None else None
         out: List[dict] = []
         next_params: Optional[dict] = None
 
@@ -1699,10 +1705,12 @@ class DomaApiClient:
             reached_older_items = False
             for item in items:
                 item_date_raw = str(item.get("timestamp") or "").strip()
-                if since_utc is not None and item_date_raw:
+                if (since_utc is not None or until_utc is not None) and item_date_raw:
                     item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
-                    if item_date < since_utc:
+                    if since_utc is not None and item_date < since_utc:
                         reached_older_items = True
+                        continue
+                    if until_utc is not None and item_date >= until_utc:
                         continue
                 out.append(item)
             if reached_older_items:
@@ -1717,8 +1725,10 @@ class DomaApiClient:
         wallet_address: str,
         max_pages: int = 80,
         since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
     ) -> List[dict]:
         since_utc = since.astimezone(timezone.utc) if since is not None else None
+        until_utc = until.astimezone(timezone.utc) if until is not None else None
         out: List[dict] = []
         next_params: Optional[dict] = None
 
@@ -1733,10 +1743,12 @@ class DomaApiClient:
             reached_older_items = False
             for item in items:
                 item_date_raw = str(item.get("timestamp") or "").strip()
-                if since_utc is not None and item_date_raw:
+                if (since_utc is not None or until_utc is not None) and item_date_raw:
                     item_date = datetime.fromisoformat(item_date_raw.replace("Z", "+00:00"))
-                    if item_date < since_utc:
+                    if since_utc is not None and item_date < since_utc:
                         reached_older_items = True
+                        continue
+                    if until_utc is not None and item_date >= until_utc:
                         continue
                 out.append(item)
             if reached_older_items:

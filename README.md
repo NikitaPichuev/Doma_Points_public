@@ -432,7 +432,13 @@ With a small ETH-only balance, keep max close to min so route fees/slippage do n
 
 ## Cost report inside mode 2
 
-Mode `2) Check points + quests` also runs a Doma cost report for the last 7 days after checking points and quests.
+Mode `2) Check points + quests` also runs Doma cost reports after checking points and quests:
+
+- `last_7d`: last 7 days;
+- `season_0`: all explorer history before the current season 1 start;
+- `season_1`: from the current season 1 start until now.
+
+Season 1 start is derived from Doma leaderboard metadata (`seasonNumber` + `weekNumber`), not hardcoded. If the leaderboard does not return `season=1` and a valid week number, the season split is skipped and the log says why.
 
 Current logic:
 
