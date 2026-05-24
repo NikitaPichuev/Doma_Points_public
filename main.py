@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 import json
@@ -5485,7 +5485,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             continue
         try:
             doma_api = DomaApiClient(cfg.doma_api_url, api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys], proxies=proxies)
-            catalog = doma_api.fetch_fractional_tokens(take=250, max_pages=10)
+            catalog = doma_api.fetch_fractional_tokens(take=100, max_pages=10)
             tokens_per_wallet = random.randint(tokens_min_per_wallet, tokens_max_per_wallet)
             exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
@@ -5688,7 +5688,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
         api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
         proxies=metadata_proxies,
     )
-    catalog = shared_doma_api.fetch_fractional_tokens(take=250, max_pages=10)
+    catalog = shared_doma_api.fetch_fractional_tokens(take=100, max_pages=10)
     top_com_tokens = _top_tvl_com_tokens(catalog, quote_token, domains_max)
     if len(top_com_tokens) < domains_min:
         raise RuntimeError(f"Not enough eligible .com tokens by TVL: found {len(top_com_tokens)}, need at least {domains_min}")
@@ -6913,7 +6913,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
     eth_price = shared_subgraph.fetch_eth_price_usd()
     if eth_price <= 0:
         raise RuntimeError("Failed to resolve ETH/USD")
-    token_catalog = shared_doma_api.fetch_fractional_tokens(take=250, max_pages=10)
+    token_catalog = shared_doma_api.fetch_fractional_tokens(take=100, max_pages=10)
     if not token_catalog:
         raise RuntimeError("Doma fractional token catalog is empty")
 
@@ -8352,4 +8352,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
