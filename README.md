@@ -413,8 +413,21 @@ Current logic:
 - each selected domain gets a round trip: `USDC.E -> domain token -> USDC.E`;
 - swap amount is selected randomly inside the configured min/max USDC.E range;
 - if USDC.E is not enough for one max-sized swap, the bot can bootstrap USDC.E from ETH;
+- ETH-only wallets are supported: the bot first swaps enough ETH to USDC.E, then reuses that USDC.E through round trips;
+- the bot only needs enough USDC.E for one max-sized swap, not for all selected domains at once;
 - results are written to `domain_com_daily_swaps.csv`;
 - because swaps are round-trip, the same small USDC.E balance can be reused across multiple .com domains.
+
+Small-balance recommendation:
+
+```text
+Minimum swap amount USDC.E: 1
+Maximum swap amount USDC.E: 1.05
+Minimum .com domains per wallet: 5
+Maximum .com domains per wallet: 5
+```
+
+With a small ETH-only balance, keep max close to min so route fees/slippage do not make the next domain swap fail.
 
 Parameters:
 
