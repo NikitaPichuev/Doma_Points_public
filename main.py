@@ -5330,6 +5330,53 @@ def _top_tvl_com_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token, l
     return eligible[:limit]
 
 
+def _read_today_com_daily_success_domains(csv_path: Path, wallet: str, delimiter: str) -> set[str]:
+    if not csv_path.exists():
+        return set()
+    today = datetime.now(timezone.utc).date()
+    wallet_lc = wallet.lower()
+    out: set[str] = set()
+
+    def _read_with(delim: str) -> List[dict]:
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8") as f:
+                return list(csv.DictReader(f, delimiter=delim))
+        except Exception:
+            return []
+
+    rows = _read_with(delimiter)
+    if rows and "wallet" not in rows[0]:
+        rows = _read_with("," if delimiter != "," else ";")
+    for row in rows:
+        if str(row.get("status") or "").strip().lower() != "ok":
+            continue
+        if str(row.get("wallet") or "").strip().lower() != wallet_lc:
+            continue
+        domain = str(row.get("domain") or "").strip().lower()
+        if not domain.endswith(".com"):
+            continue
+        ts_raw = str(row.get("timestamp_utc") or "").strip()
+        if ts_raw:
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                if ts.astimezone(timezone.utc).date() != today:
+                    continue
+            except Exception:
+                continue
+        out.add(domain)
+    return out
+
+
+def _is_com_daily_quest_completed(api: DomaApiClient, wallet: str, chain_id: int) -> Optional[bool]:
+    quests = api.fetch_quests(wallet, chain_id)
+    for quest in quests:
+        description = quest.description.lower()
+        reset_period = quest.reset_period.upper()
+        if reset_period == "DAILY" and ".com" in description and "swap" in description:
+            return bool(quest.completed)
+    return None
+
+
 def _top_up_usdce_from_eth_for_cheap_buy(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -5746,7 +5793,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
         proxies=metadata_proxies,
     )
     catalog = shared_doma_api.fetch_fractional_tokens(take=100, max_pages=10)
-    top_com_tokens = _top_tvl_com_tokens(catalog, quote_token, domains_max)
+    top_com_tokens = _top_tvl_com_tokens(catalog, quote_token, max(10, domains_max + 5))
     if len(top_com_tokens) < domains_min:
         raise RuntimeError(f"Not enough eligible .com tokens by TVL: found {len(top_com_tokens)}, need at least {domains_min}")
 
@@ -5793,8 +5840,6 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             skipped_wallets += 1
             continue
 
-        domains_count = random.randint(domains_min, domains_max)
-        selected_tokens = top_com_tokens[:domains_count]
         wallet_success = wallet_failed = 0
         try:
             doma_api = DomaApiClient(
@@ -5812,6 +5857,64 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 log_prefix="[COM_DAILY]",
             )
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+
+            quest_completed: Optional[bool] = None
+            try:
+                quest_completed = _is_com_daily_quest_completed(doma_api, wallet, cfg.chain_id)
+            except Exception as exc:
+                logger.warning("[COM_DAILY] wallet=%s quest status fetch failed, using local CSV checker: %s", wallet, exc)
+            if quest_completed is True:
+                skipped_wallets += 1
+                logger.info("[COM_DAILY] wallet=%s daily .com quest already completed by Doma API | skipping", wallet)
+                continue
+
+            already_domains = _read_today_com_daily_success_domains(swap_csv, wallet, cfg.csv_delimiter)
+            target_domains = random.randint(domains_min, domains_max)
+            missing_domains = target_domains - len(already_domains)
+            if missing_domains <= 0:
+                # If Doma API still says incomplete, do one extra distinct .com swap to help indexing.
+                missing_domains = 1 if quest_completed is False else 0
+            if missing_domains <= 0:
+                skipped_wallets += 1
+                logger.info(
+                    "[COM_DAILY] wallet=%s local checker shows complete | done=%s/%s | skipping",
+                    wallet,
+                    len(already_domains),
+                    target_domains,
+                )
+                continue
+
+            selected_tokens = [
+                token
+                for token in top_com_tokens
+                if str(token.name or token.symbol or "").strip().lower() not in already_domains
+            ][:missing_domains]
+            if len(selected_tokens) < missing_domains:
+                selected_tokens = selected_tokens + [
+                    token
+                    for token in top_com_tokens
+                    if token not in selected_tokens
+                ][: missing_domains - len(selected_tokens)]
+            if not selected_tokens:
+                skipped_wallets += 1
+                logger.warning(
+                    "[COM_DAILY] wallet=%s no .com tokens left to complete quest | local_done=%s target=%s",
+                    wallet,
+                    len(already_domains),
+                    target_domains,
+                )
+                continue
+            required_new_domains = len(selected_tokens)
+            logger.info(
+                "[COM_DAILY] wallet=%s checker | doma_completed=%s | local_done_today=%s/%s | will_do=%s | already=%s",
+                wallet,
+                quest_completed,
+                len(already_domains),
+                target_domains,
+                required_new_domains,
+                ", ".join(sorted(already_domains)) or "none",
+            )
+
             required_usdc = swap_max_usdc
             current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
             if current_usdc < required_usdc:
@@ -6027,7 +6130,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     delay_sec = random.uniform(float(delay_min), float(delay_max))
                     logger.info("[COM_DAILY] delay before next .com domain: %.2f sec", delay_sec)
                     time.sleep(delay_sec)
-            if wallet_success >= domains_count and wallet_failed == 0:
+            if wallet_success >= required_new_domains and wallet_failed == 0:
                 success_wallets += 1
             elif wallet_success > 0:
                 failed_wallets += 1

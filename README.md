@@ -411,6 +411,10 @@ Current logic:
 - sorts them by TVL descending;
 - uses the top `.com` domains by TVL for each wallet;
 - default domain count is `10-10`, but the menu still allows min/max count;
+- before swapping, checks Doma daily quest status for the wallet;
+- if Doma API says the `.com` daily quest is already completed, the wallet is skipped;
+- if not completed, reads today's successful `domain_com_daily_swaps.csv` rows and swaps only missing `.com` domains;
+- if local CSV already shows enough domains but Doma API still says incomplete, the bot performs one extra distinct `.com` round trip to help the quest indexer catch up;
 - each selected domain gets a round trip: `USDC.E -> domain token -> USDC.E`;
 - swap amount is selected randomly inside the configured min/max USDC.E range;
 - if the selected amount is slightly above the current USDC.E balance after prior round-trip loss, the bot lowers it to the available balance as long as it is still >= the configured minimum;
