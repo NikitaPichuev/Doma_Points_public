@@ -450,7 +450,9 @@ def _apply_wallet_start_selection(records: List[Tuple[int, str, str]]) -> Tuple[
     total_wallets = len(records)
     start_number = _prompt_start_wallet_number(total_wallets)
     start_offset = start_number - 1
-    return records[start_offset:], start_offset, total_wallets
+    selected = list(records[start_offset:])
+    random.shuffle(selected)
+    return selected, start_offset, total_wallets
 
 
 def _proxy_for_line(
@@ -1540,7 +1542,9 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     if not wallets:
         logger.warning("Points check skipped: no wallets configured")
         return
-    for idx, wallet in enumerate(wallets):
+    wallet_records = list(enumerate(wallets))
+    random.shuffle(wallet_records)
+    for order_idx, (idx, wallet) in enumerate(wallet_records):
         ctx = _wallet_api_context(cfg, idx, logger, "Points/quests check")
         if ctx is None:
             continue
@@ -1559,7 +1563,7 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             _write_quest_statuses(cfg, logger, wallet, idx + 1, api)
         except Exception as exc:
             logger.warning("Quest check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
-        if idx < len(wallets) - 1:
+        if order_idx < len(wallet_records) - 1:
             delay_sec = random.uniform(2, 5)
             logger.info("Delay before next wallet: %.2f sec", delay_sec)
             time.sleep(delay_sec)
@@ -8537,7 +8541,9 @@ def run_doma_cost_report_once(
         until.isoformat() if until else "now",
     )
 
-    for idx, wallet in list(enumerate(wallets))[start_offset:]:
+    wallet_records = list(enumerate(wallets))[start_offset:]
+    random.shuffle(wallet_records)
+    for idx, wallet in wallet_records:
         proxies, skip_wallet = _proxy_for_line(cfg, idx, logger, "COST")
         if skip_wallet:
             continue
