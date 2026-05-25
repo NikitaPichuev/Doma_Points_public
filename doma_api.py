@@ -4,7 +4,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -848,7 +848,91 @@ class DomaApiClient:
                     available_at=str(item.get("availableAt") or ""),
                 )
             )
+        self._apply_quest_activity_fallback(caip_wallet, out)
         return out
+
+    @staticmethod
+    def _parse_api_datetime(value: str) -> Optional[datetime]:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_quest_text(value: str) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    def _fetch_leaderboard_quest_activities(self, caip_wallet: str, take: int = 100) -> List[dict]:
+        query = """
+        query LeaderboardQuestActivities($walletAddress: AddressCAIP10!, $take: Int) {
+          leaderboardActivities(walletAddress: $walletAddress, take: $take) {
+            items {
+              points
+              allocationType
+              allocatedAt
+              activityData {
+                __typename
+                ... on QuestActivityData {
+                  questId
+                  questType
+                  questDescription
+                }
+              }
+            }
+          }
+        }
+        """
+        try:
+            data = self._post(query, {"walletAddress": caip_wallet, "take": int(take)})
+        except Exception:
+            return []
+        return [
+            item for item in ((data.get("leaderboardActivities") or {}).get("items") or [])
+            if str(item.get("allocationType") or "").upper() == "QUEST"
+        ]
+
+    def _quest_activity_matches_current_period(self, quest: QuestStatus, allocated_at: datetime) -> bool:
+        now = datetime.now(timezone.utc)
+        period = quest.reset_period.upper()
+        if period == "DAILY":
+            return allocated_at.date() == now.date()
+        if period == "WEEKLY":
+            today_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+            week_start = today_utc - timedelta(days=now.weekday())
+            return allocated_at >= week_start
+        return True
+
+    def _apply_quest_activity_fallback(self, caip_wallet: str, quests: List[QuestStatus]) -> None:
+        if not quests:
+            return
+        activities = self._fetch_leaderboard_quest_activities(caip_wallet)
+        if not activities:
+            return
+        by_id: Dict[str, str] = {}
+        by_desc: Dict[str, str] = {}
+        for item in activities:
+            allocated_at_raw = str(item.get("allocatedAt") or "")
+            data = item.get("activityData") or {}
+            if str(data.get("__typename") or "") != "QuestActivityData":
+                continue
+            quest_id = str(data.get("questId") or "").strip()
+            quest_desc = self._normalize_quest_text(str(data.get("questDescription") or ""))
+            if quest_id:
+                by_id.setdefault(quest_id, allocated_at_raw)
+            if quest_desc:
+                by_desc.setdefault(quest_desc, allocated_at_raw)
+
+        for quest in quests:
+            if quest.completed:
+                continue
+            allocated_at_raw = by_id.get(str(quest.quest_id)) or by_desc.get(self._normalize_quest_text(quest.description))
+            allocated_at = self._parse_api_datetime(allocated_at_raw or "")
+            if not allocated_at:
+                continue
+            if not self._quest_activity_matches_current_period(quest, allocated_at):
+                continue
+            quest.completed = True
+            quest.completed_at = allocated_at_raw
 
     def fetch_fractional_token_by_name(self, name: str) -> Optional[LaunchpadTokenInfo]:
         query = """
