@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from datetime import datetime, timezone
@@ -2498,7 +2499,9 @@ class EvmExecutionClient:
 
         subdomain_id: Optional[int] = None
         try:
-            events = fractionalization.events.SubdomainStaked().process_receipt(receipt)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*MismatchedABI.*")
+                events = fractionalization.events.SubdomainStaked().process_receipt(receipt)
             if events:
                 subdomain_id = int(events[0]["args"]["subdomainId"])
         except Exception:
