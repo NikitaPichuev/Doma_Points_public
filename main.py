@@ -5502,19 +5502,19 @@ def _top_up_usdce_from_eth_for_cheap_buy(
         return False, "no_spendable_eth", native_eth, reserve_eth
 
     missing_usdc = required_usdc - current_usdc
-    target_usdc = max(missing_usdc, MIN_EXECUTABLE_TRADE_USD)
+    target_usdc = missing_usdc * Decimal("1.05")
     bootstrap_eth = target_usdc / eth_price
     max_bootstrap_eth = spendable_eth
     if bootstrap_eth > max_bootstrap_eth:
         bootstrap_eth = max_bootstrap_eth
     bootstrap_usd = bootstrap_eth * eth_price
-    if bootstrap_eth <= 0 or bootstrap_usd < MIN_EXECUTABLE_TRADE_USD:
+    if bootstrap_eth <= 0:
         logger.warning(
-            "[CHEAP_BUY] wallet=%s skipped | ETH->USDC.E bootstrap below minimum executable amount (%s USD)",
+            "[CHEAP_BUY] wallet=%s skipped | ETH->USDC.E bootstrap has no spendable amount (%s USD)",
             wallet,
             _format_decimal_plain(bootstrap_usd),
         )
-        return False, "eth_bootstrap_below_min", bootstrap_usd, MIN_EXECUTABLE_TRADE_USD
+        return False, "eth_bootstrap_no_spendable_amount", bootstrap_usd, missing_usdc
 
     logger.info(
         "[CHEAP_BUY] wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
@@ -5620,12 +5620,13 @@ def _top_up_usdce_from_eth_for_offer(
     return refreshed_usdc >= required_usdc
 
 
-def _has_spendable_eth_for_cheap_buy(exec_client: EvmExecutionClient, eth_price: Decimal) -> bool:
+def _has_spendable_eth_for_cheap_buy(exec_client: EvmExecutionClient, eth_price: Decimal, required_usdc: Decimal = Decimal("0")) -> bool:
     if eth_price <= 0:
         return False
     reserve_eth = Decimal("0.05") / eth_price
     spendable_eth = exec_client.get_native_balance() - reserve_eth
-    return spendable_eth > 0 and (spendable_eth * eth_price) >= MIN_EXECUTABLE_TRADE_USD
+    required_usd = max(required_usdc, Decimal("0.000001"))
+    return spendable_eth > 0 and (spendable_eth * eth_price) >= required_usd
 
 
 def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -5751,7 +5752,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     )
                 else:
                     skipped_wallets += 1
-                    if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price):
+                    if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price, buy_amount_min_usdc):
                         _remember_insufficient(wallet_number, wallet)
                         logger.warning("[CHEAP_BUY] wallet=%s skipped | insufficient USDC.E and spendable ETH", wallet)
                     else:
@@ -5764,7 +5765,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
             if usdc_balance < buy_amount_min_usdc:
                 skipped_wallets += 1
-                if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price):
+                if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price, buy_amount_min_usdc):
                     _remember_insufficient(wallet_number, wallet)
                     logger.warning("[CHEAP_BUY] wallet=%s skipped | insufficient USDC.E and spendable ETH", wallet)
                 else:
@@ -5780,7 +5781,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 if current_usdc_balance < buy_amount_usdc:
                     wallet_failed += 1
                     buy_failed_count += 1
-                    if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price):
+                    if not _has_spendable_eth_for_cheap_buy(exec_client, eth_price, buy_amount_usdc):
                         _remember_insufficient(wallet_number, wallet)
                     logger.warning("[CHEAP_BUY] wallet=%s token=%s skipped | USDC.E balance below selected buy amount (%s < %s)", wallet, domain_token.symbol, _format_decimal_plain(current_usdc_balance), _format_decimal_plain(buy_amount_usdc))
                     break
