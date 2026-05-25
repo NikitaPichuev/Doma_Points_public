@@ -4117,7 +4117,7 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             "No wallet/private-key pairs available for domain listing "
             "(fill wallets.txt + keys.txt line-by-line or set valid PRIVATE_KEY in .env)"
         )
-    wallet_key_records, wallet_start_offset, _ = _apply_wallet_start_selection(wallet_key_records)
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
 
     listing_csv = cfg.trades_csv_file.parent / DOMAIN_LISTING_CSV.name
     ensure_csv(
@@ -4152,18 +4152,41 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     failed_wallets = 0
     skipped_wallets = 0
     failed_wallet_addresses: List[str] = []
+    skipped_wallet_details: List[str] = []
 
-    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
-        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "LIST")
-        proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
-        if skip_wallet:
-            skipped_wallets += 1
-            continue
-        logger.info(
-            "[LIST] wallet %s",
-            _wallet_progress_label(idx + wallet_start_offset, len(wallet_key_records) + wallet_start_offset, wallet),
+    def _print_list_summary() -> None:
+        _print_mode_summary(
+            "LIST",
+            len(wallet_key_records),
+            success_wallets,
+            failed_wallets,
+            skipped_wallets,
+            failed_wallet_addresses,
         )
+        if skipped_wallet_details:
+            print(_color("[LIST] skipped wallets:", ANSI_YELLOW))
+            logger.info("[LIST] skipped wallets:")
+            for detail in skipped_wallet_details:
+                line = f"[LIST] skipped | {detail}"
+                print(_color(line, ANSI_YELLOW))
+                logger.info(line)
+
+    interrupted = False
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
+        wallet_number = wallet_start_offset + idx + 1
         try:
+            proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "LIST")
+            proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+            if skip_wallet:
+                skipped_wallets += 1
+                skipped_wallet_details.append(
+                    f"wallet {wallet_number}/{total_loaded_wallets} | wallet={wallet} | reason=no proxy on matching line"
+                )
+                continue
+            logger.info(
+                "[LIST] wallet %s",
+                _wallet_progress_label(idx + wallet_start_offset, total_loaded_wallets, wallet),
+            )
             doma_api = DomaApiClient(
                 cfg.doma_api_url,
                 api_key=cfg.doma_api_key,
@@ -4175,6 +4198,9 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             unlisted_domains = _eligible_unlisted_domains(all_domains, listed_domains, cfg.chain_id)
             if not unlisted_domains:
                 skipped_wallets += 1
+                skipped_wallet_details.append(
+                    f"wallet {wallet_number}/{total_loaded_wallets} | wallet={wallet} | reason=no unlisted domains | owned={len(all_domains)} listed={len(listed_domains)}"
+                )
                 logger.info(
                     "[LIST] wallet=%s no unlisted domains | owned=%s listed=%s",
                     wallet,
@@ -4249,19 +4275,23 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             failed_wallets += 1
             failed_wallet_addresses.append(wallet)
             logger.warning("[LIST] wallet=%s failed: %s", wallet, exc)
+        except KeyboardInterrupt:
+            interrupted = True
+            logger.warning("[LIST] interrupted by user at wallet %s/%s | wallet=%s", wallet_number, total_loaded_wallets, wallet)
+            break
         if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
             delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
             logger.info("[LIST] delay before next wallet: %.2f sec", delay_sec)
-            time.sleep(delay_sec)
+            try:
+                time.sleep(delay_sec)
+            except KeyboardInterrupt:
+                interrupted = True
+                logger.warning("[LIST] interrupted by user during delay after wallet %s/%s | wallet=%s", wallet_number, total_loaded_wallets, wallet)
+                break
 
-    _print_mode_summary(
-        "LIST",
-        len(wallet_key_records),
-        success_wallets,
-        failed_wallets,
-        skipped_wallets,
-        failed_wallet_addresses,
-    )
+    if interrupted:
+        print(_color("[LIST] stopped by user; partial summary:", ANSI_YELLOW))
+    _print_list_summary()
 
 
 def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -5233,7 +5263,9 @@ def _pick_available_subdomain_label(exec_client: EvmExecutionClient, token_addre
 
 def _claim_subdomains_for_domain_token(
     logger: logging.Logger,
+    doma_api: DomaApiClient,
     exec_client: EvmExecutionClient,
+    chain_id: int,
     wallet: str,
     domain_token: Token,
     domain_name: str,
@@ -5268,7 +5300,20 @@ def _claim_subdomains_for_domain_token(
             domain_token.symbol,
         )
         try:
-            approve_hash, stake_hash, subdomain_id, dns_hash = exec_client.claim_subdomain_and_set_dns(domain_token.address, label, wallet)
+            voucher_contract, staking_voucher, staking_signature = doma_api.sign_fractional_staking_subdomain_voucher(
+                domain_token.address,
+                label,
+                wallet,
+                chain_id=chain_id,
+            )
+            approve_hash, stake_hash, subdomain_id, dns_hash = exec_client.claim_subdomain_and_set_dns(
+                domain_token.address,
+                label,
+                wallet,
+                voucher_contract_address=voucher_contract,
+                staking_voucher=staking_voucher,
+                staking_signature=staking_signature,
+            )
             if approve_hash:
                 logger.info("[CHEAP_BUY] wallet=%s subdomain approve tx sent: %s", wallet, approve_hash)
             logger.info("[CHEAP_BUY] wallet=%s subdomain stake tx sent: %s | subdomain_id=%s", wallet, stake_hash, subdomain_id if subdomain_id is not None else "unknown")
@@ -5567,6 +5612,21 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         _format_decimal_plain(delay_max),
     )
 
+    metadata_proxies: Optional[Dict[str, str]] = None
+    for metadata_line_idx, _, _ in wallet_key_records:
+        candidate_proxies, skip_metadata_proxy = _proxy_for_line(cfg, metadata_line_idx, None, "CHEAP_BUY_METADATA")
+        if not skip_metadata_proxy:
+            metadata_proxies = candidate_proxies
+            break
+    logger.info("[CHEAP_BUY] loading token catalog once | max_pages=10")
+    shared_doma_api = DomaApiClient(
+        cfg.doma_api_url,
+        api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+        proxies=metadata_proxies,
+    )
+    catalog = shared_doma_api.fetch_fractional_tokens(take=100, max_pages=10)
+    logger.info("[CHEAP_BUY] token catalog loaded | tokens=%s", len(catalog))
+
     success_wallets = failed_wallets = skipped_wallets = 0
     buy_success_count = buy_failed_count = 0
     subdomain_success_count = subdomain_failed_count = 0
@@ -5588,61 +5648,16 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             logger.warning("[CHEAP_BUY] wallet=%s skipped: proxy is required for cheap token buy", wallet)
             continue
         try:
+            logger.info("[CHEAP_BUY] wallet=%s loading wallet context", wallet)
             doma_api = DomaApiClient(cfg.doma_api_url, api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys], proxies=proxies)
-            catalog = doma_api.fetch_fractional_tokens(take=100, max_pages=10)
             tokens_per_wallet = random.randint(tokens_min_per_wallet, tokens_max_per_wallet)
             exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
+            logger.info("[CHEAP_BUY] wallet=%s RPC ready", wallet)
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+            logger.info("[CHEAP_BUY] wallet=%s ETH price ready | skipping full existing-token scan", wallet)
             wallet_success = wallet_failed = 0
             existing_token_addresses: set[str] = set()
             existing_subdomains_claimed = 0
-            for info in catalog:
-                if existing_subdomains_claimed >= tokens_per_wallet:
-                    break
-                token_address = (info.address or "").strip().lower()
-                if not token_address or token_address in existing_token_addresses:
-                    continue
-                domain_token = _token_from_launchpad_price(info, eth_price)
-                try:
-                    held_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
-                    if held_balance <= 0:
-                        continue
-                    prices_raw = exec_client.get_subdomain_staking_prices(domain_token.address)
-                    label_length = max(32, len(prices_raw) if prices_raw else 32)
-                    label_price_index = 0 if len(prices_raw) == 1 else min(label_length - 1, len(prices_raw) - 1)
-                    required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
-                    if required_amount <= 0 or held_balance < required_amount:
-                        continue
-                    max_claims = int((held_balance / required_amount).to_integral_value(rounding=ROUND_FLOOR))
-                    logger.info(
-                        "[CHEAP_BUY] wallet=%s existing token found | %s balance=%s | required=%s | claim_from_balance=yes",
-                        wallet,
-                        domain_token.symbol,
-                        _format_decimal_plain(held_balance),
-                        _format_decimal_plain(required_amount),
-                    )
-                    claimed_ok, claimed_failed = _claim_subdomains_for_domain_token(
-                        logger=logger,
-                        exec_client=exec_client,
-                        wallet=wallet,
-                        domain_token=domain_token,
-                        domain_name=info.name,
-                        subdomains_min_per_token=subdomains_min_per_token,
-                        subdomains_max_per_token=subdomains_max_per_token,
-                        delay_min=delay_min,
-                        delay_max=delay_max,
-                        max_claims=max_claims,
-                    )
-                    subdomain_success_count += claimed_ok
-                    subdomain_failed_count += claimed_failed
-                    existing_token_addresses.add(token_address)
-                    if claimed_ok > 0:
-                        wallet_success += 1
-                        existing_subdomains_claimed += claimed_ok
-                    elif claimed_failed > 0:
-                        wallet_failed += 1
-                except Exception as exc:
-                    logger.warning("[CHEAP_BUY] wallet=%s token=%s existing balance check failed: %s", wallet, domain_token.symbol, exc)
 
             tokens_to_buy = max(0, tokens_per_wallet - existing_subdomains_claimed)
             selected_tokens = [
@@ -5721,10 +5736,11 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 ok = _execute_trade_via_doma_ui_route(cfg=cfg, logger=logger, state=state, doma_api=doma_api, exec_client=exec_client, token_in=quote_token, token_out=domain_token, display_in_symbol="USDC.E", display_out_symbol=domain_token.symbol, trade_amount_expr=f"${_format_decimal_plain(buy_amount_usdc)}", eth_price=eth_price, label=f"CHEAP_BUY {wallet} USDC.E>{domain_token.symbol}", wait_for_pre_tx=True)
                 if ok:
                     buy_success_count += 1
-                    wallet_success += 1
                     claimed_ok, claimed_failed = _claim_subdomains_for_domain_token(
                         logger=logger,
+                        doma_api=doma_api,
                         exec_client=exec_client,
+                        chain_id=cfg.chain_id,
                         wallet=wallet,
                         domain_token=domain_token,
                         domain_name=info.name,
@@ -5735,6 +5751,12 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     )
                     subdomain_success_count += claimed_ok
                     subdomain_failed_count += claimed_failed
+                    if claimed_ok > 0:
+                        wallet_success += 1
+                        logger.info("[CHEAP_BUY] wallet=%s daily subdomain staking quest satisfied | staked=%s", wallet, claimed_ok)
+                        break
+                    if claimed_failed > 0:
+                        wallet_failed += 1
                 else:
                     buy_failed_count += 1
                     wallet_failed += 1
@@ -5835,7 +5857,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "COM_DAILY")
         wallet_number = wallet_start_offset + idx
-        logger.info("[COM_DAILY] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        wallet_log_prefix = f"[COM_DAILY wallet {wallet_number}/{total_loaded_wallets}]"
+        logger.info("%s wallet=%s", wallet_log_prefix, wallet)
         if skip_wallet:
             skipped_wallets += 1
             continue
@@ -5854,7 +5877,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 wallet=wallet,
                 private_key=private_key,
                 proxies=proxies,
-                log_prefix="[COM_DAILY]",
+                log_prefix=wallet_log_prefix,
             )
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
 
@@ -5862,10 +5885,10 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             try:
                 quest_completed = _is_com_daily_quest_completed(doma_api, wallet, cfg.chain_id)
             except Exception as exc:
-                logger.warning("[COM_DAILY] wallet=%s quest status fetch failed, using local CSV checker: %s", wallet, exc)
+                logger.warning("%s wallet=%s quest status fetch failed, using local CSV checker: %s", wallet_log_prefix, wallet, exc)
             if quest_completed is True:
                 skipped_wallets += 1
-                logger.info("[COM_DAILY] wallet=%s daily .com quest already completed by Doma API | skipping", wallet)
+                logger.info("%s wallet=%s daily .com quest already completed by Doma API | skipping", wallet_log_prefix, wallet)
                 continue
 
             already_domains = _read_today_com_daily_success_domains(swap_csv, wallet, cfg.csv_delimiter)
@@ -5877,7 +5900,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             if missing_domains <= 0:
                 skipped_wallets += 1
                 logger.info(
-                    "[COM_DAILY] wallet=%s local checker shows complete | done=%s/%s | skipping",
+                    "%s wallet=%s local checker shows complete | done=%s/%s | skipping",
+                    wallet_log_prefix,
                     wallet,
                     len(already_domains),
                     target_domains,
@@ -5898,7 +5922,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             if not selected_tokens:
                 skipped_wallets += 1
                 logger.warning(
-                    "[COM_DAILY] wallet=%s no .com tokens left to complete quest | local_done=%s target=%s",
+                    "%s wallet=%s no .com tokens left to complete quest | local_done=%s target=%s",
+                    wallet_log_prefix,
                     wallet,
                     len(already_domains),
                     target_domains,
@@ -5906,7 +5931,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 continue
             required_new_domains = len(selected_tokens)
             logger.info(
-                "[COM_DAILY] wallet=%s checker | doma_completed=%s | local_done_today=%s/%s | will_do=%s | already=%s",
+                "%s wallet=%s checker | doma_completed=%s | local_done_today=%s/%s | will_do=%s | already=%s",
+                wallet_log_prefix,
                 wallet,
                 quest_completed,
                 len(already_domains),
@@ -5931,7 +5957,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         topup_reason = f"eth_bootstrap_below_min:{_format_decimal_plain(bootstrap_usd)}"
                     else:
                         logger.info(
-                            "[COM_DAILY] wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
+                            "%s wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
+                            wallet_log_prefix,
                             wallet,
                             _format_decimal_plain(bootstrap_eth),
                             _format_decimal_plain(missing_usdc),
@@ -5948,7 +5975,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                             display_out_symbol="USDC.E",
                             trade_amount_expr=_format_decimal_plain(bootstrap_eth),
                             eth_price=eth_price,
-                            label=f"COM_DAILY {wallet} ETH>USDC.E BOOTSTRAP",
+                            label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} ETH>USDC.E BOOTSTRAP",
                             is_eth_source=True,
                             unwrap_to_native=False,
                             wait_for_pre_tx=True,
@@ -5960,7 +5987,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 if current_usdc < swap_min_usdc:
                     skipped_wallets += 1
                     logger.warning(
-                        "[COM_DAILY] wallet=%s skipped | insufficient USDC.E after bootstrap (%s), reason=%s",
+                        "%s wallet=%s skipped | insufficient USDC.E after bootstrap (%s), reason=%s",
+                        wallet_log_prefix,
                         wallet,
                         _format_decimal_plain(current_usdc),
                         topup_reason,
@@ -5979,7 +6007,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         )
                         if adjusted_swap_usdc >= swap_min_usdc:
                             logger.info(
-                                "[COM_DAILY] wallet=%s domain=%s swap amount adjusted to available USDC.E | selected=%s available=%s adjusted=%s",
+                                "%s wallet=%s domain=%s swap amount adjusted to available USDC.E | selected=%s available=%s adjusted=%s",
+                                wallet_log_prefix,
                                 wallet,
                                 info.name,
                                 _format_decimal_plain(swap_usdc),
@@ -5989,7 +6018,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                             swap_usdc = adjusted_swap_usdc
                         else:
                             reason = f"USDC.E balance below minimum swap amount after rounding ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_min_usdc)})"
-                            logger.warning("[COM_DAILY] wallet=%s domain=%s skipped | %s", wallet, info.name, reason)
+                            logger.warning("%s wallet=%s domain=%s skipped | %s", wallet_log_prefix, wallet, info.name, reason)
                             wallet_failed += 1
                             total_failed_swaps += 1
                             append_csv(
@@ -6011,7 +6040,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                             break
                     else:
                         reason = f"USDC.E balance below minimum swap amount ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_min_usdc)})"
-                        logger.warning("[COM_DAILY] wallet=%s domain=%s skipped | %s", wallet, info.name, reason)
+                        logger.warning("%s wallet=%s domain=%s skipped | %s", wallet_log_prefix, wallet, info.name, reason)
                         wallet_failed += 1
                         total_failed_swaps += 1
                         append_csv(
@@ -6032,7 +6061,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         )
                         break
                 logger.info(
-                    "[COM_DAILY] wallet=%s domain %s/%s %s | tvl=$%s | round_trip_swap=%s USDC.E",
+                    "%s wallet=%s domain %s/%s %s | tvl=$%s | round_trip_swap=%s USDC.E",
+                    wallet_log_prefix,
                     wallet,
                     token_idx,
                     len(selected_tokens),
@@ -6053,7 +6083,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     display_out_symbol=domain_token.symbol,
                     trade_amount_expr=f"${_format_decimal_plain(swap_usdc)}",
                     eth_price=eth_price,
-                    label=f"COM_DAILY {wallet} USDC.E>{domain_token.symbol}",
+                    label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} USDC.E>{domain_token.symbol}",
                     wait_for_pre_tx=True,
                 )
                 forward_tx_hash = state.last_tx_hash if ok_forward else ""
@@ -6067,11 +6097,11 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     received_domain = after_domain_balance - before_domain_balance
                     if received_domain <= 0:
                         reason = "no domain token received for reverse swap"
-                        logger.warning("[COM_DAILY] wallet=%s domain=%s reverse skipped | %s", wallet, info.name, reason)
+                        logger.warning("%s wallet=%s domain=%s reverse skipped | %s", wallet_log_prefix, wallet, info.name, reason)
                     else:
                         if token_idx < len(selected_tokens):
                             delay_sec = random.uniform(float(delay_min), float(delay_max))
-                            logger.info("[COM_DAILY] delay before reverse swap: %.2f sec", delay_sec)
+                            logger.info("%s delay before reverse swap: %.2f sec", wallet_log_prefix, delay_sec)
                             time.sleep(delay_sec)
                         ok_reverse = _execute_trade_via_doma_ui_route(
                             cfg=cfg,
@@ -6085,7 +6115,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                             display_out_symbol="USDC.E",
                             trade_amount_expr=_format_decimal_plain(received_domain),
                             eth_price=eth_price,
-                            label=f"COM_DAILY {wallet} {domain_token.symbol}>USDC.E",
+                            label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} {domain_token.symbol}>USDC.E",
                             wait_for_pre_tx=True,
                         )
                         reverse_tx_hash = state.last_tx_hash if ok_reverse else ""
@@ -6100,7 +6130,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     wallet_success += 1
                     total_success_swaps += 1
                     logger.info(
-                        "[COM_DAILY] wallet=%s domain=%s round trip complete | forward=%s reverse=%s",
+                        "%s wallet=%s domain=%s round trip complete | forward=%s reverse=%s",
+                        wallet_log_prefix,
                         wallet,
                         info.name,
                         forward_tx_hash,
@@ -6109,7 +6140,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 else:
                     wallet_failed += 1
                     total_failed_swaps += 1
-                    logger.warning("[COM_DAILY] wallet=%s domain=%s round trip failed | %s", wallet, info.name, reason)
+                    logger.warning("%s wallet=%s domain=%s round trip failed | %s", wallet_log_prefix, wallet, info.name, reason)
                 append_csv(
                     swap_csv,
                     [
@@ -6128,7 +6159,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 )
                 if token_idx < len(selected_tokens):
                     delay_sec = random.uniform(float(delay_min), float(delay_max))
-                    logger.info("[COM_DAILY] delay before next .com domain: %.2f sec", delay_sec)
+                    logger.info("%s delay before next .com domain: %.2f sec", wallet_log_prefix, delay_sec)
                     time.sleep(delay_sec)
             if wallet_success >= required_new_domains and wallet_failed == 0:
                 success_wallets += 1
@@ -6141,10 +6172,10 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
         except Exception as exc:
             failed_wallets += 1
             failed_wallet_addresses.append(wallet)
-            logger.warning("[COM_DAILY] wallet=%s failed: %s", wallet, exc)
+            logger.warning("%s wallet=%s failed: %s", wallet_log_prefix, wallet, exc)
         if idx < len(wallet_key_records):
             delay_sec = random.uniform(float(delay_min), float(delay_max))
-            logger.info("[COM_DAILY] delay before next wallet: %.2f sec", delay_sec)
+            logger.info("%s delay before next wallet: %.2f sec", wallet_log_prefix, delay_sec)
             time.sleep(delay_sec)
 
     logger.info("[COM_DAILY] swaps total | success=%s failed=%s", total_success_swaps, total_failed_swaps)

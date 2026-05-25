@@ -186,8 +186,18 @@ DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI = [
     },
     {
         "inputs": [
-            {"internalType": "address", "name": "fractionalToken", "type": "address"},
-            {"internalType": "string", "name": "label", "type": "string"},
+            {
+                "components": [
+                    {"internalType": "address", "name": "fractionalToken", "type": "address"},
+                    {"internalType": "string", "name": "label", "type": "string"},
+                    {"internalType": "address", "name": "owner", "type": "address"},
+                    {"internalType": "uint256", "name": "expiration", "type": "uint256"},
+                ],
+                "internalType": "struct FractionalStakingSubdomainVoucher",
+                "name": "voucher",
+                "type": "tuple",
+            },
+            {"internalType": "bytes", "name": "signature", "type": "bytes"},
             {"internalType": "string[]", "name": "records", "type": "string[]"},
         ],
         "name": "stakeForSubdomain",
@@ -658,6 +668,47 @@ class DomaApiClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    def sign_fractional_staking_subdomain_voucher(
+        self,
+        fractional_token_address: str,
+        label: str,
+        owner_address: str,
+        chain_id: int = 97477,
+    ) -> Tuple[str, Tuple[str, str, str, int], str]:
+        query = """
+        mutation SignFractionalStakingSubdomainVoucher($input: FractionalStakingSubdomainVoucherInput!) {
+          signFractionalStakingSubdomainVoucher(input: $input) {
+            contractAddress
+            signature
+            voucher {
+              fractionalToken
+              label
+              owner
+              expiration
+            }
+          }
+        }
+        """
+        variables = {
+            "input": {
+                "fractionalToken": f"eip155:{int(chain_id)}:{Web3.to_checksum_address(fractional_token_address)}",
+                "label": label.lower().strip(),
+                "owner": Web3.to_checksum_address(owner_address),
+            }
+        }
+        data = self._post(query, variables).get("signFractionalStakingSubdomainVoucher") or {}
+        voucher = data.get("voucher") or {}
+        return (
+            Web3.to_checksum_address(str(data.get("contractAddress") or DOMA_FRACTIONALIZATION_ADDRESS)),
+            (
+                Web3.to_checksum_address(str(voucher.get("fractionalToken") or fractional_token_address)),
+                str(voucher.get("label") or label).lower().strip(),
+                Web3.to_checksum_address(str(voucher.get("owner") or owner_address)),
+                int(voucher.get("expiration") or 0),
+            ),
+            str(data.get("signature") or ""),
+        )
 
     def fetch_points(self, wallet_address: str, rank_by: str = "POINTS") -> Optional[PointsSnapshot]:
         caip_wallet = f"eip155:97477:{wallet_address}"
@@ -2295,13 +2346,16 @@ class EvmExecutionClient:
         fractional_token_address: str,
         label: str,
         dns_wallet_address: str,
+        voucher_contract_address: Optional[str] = None,
+        staking_voucher: Optional[Tuple[str, str, str, int]] = None,
+        staking_signature: Optional[str] = None,
     ) -> Tuple[Optional[str], str, Optional[int], Optional[str]]:
         fractional_token = Web3.to_checksum_address(fractional_token_address)
         label = label.lower().strip()
         if not label:
             raise RuntimeError("Subdomain label is empty")
         fractionalization = self.web3.eth.contract(
-            address=Web3.to_checksum_address(DOMA_FRACTIONALIZATION_ADDRESS),
+            address=Web3.to_checksum_address(voucher_contract_address or DOMA_FRACTIONALIZATION_ADDRESS),
             abi=DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI,
         )
         prices = [int(value) for value in fractionalization.functions.getSubdomainStakingPrices(fractional_token).call()]
@@ -2316,23 +2370,36 @@ class EvmExecutionClient:
         if bool(fractionalization.functions.isSubdomainTaken(fractional_token, label).call()):
             raise RuntimeError(f"Subdomain label already taken: {label}")
 
-        approve_hash = self.ensure_allowance(
-            fractional_token,
-            staking_amount_raw,
-            spender_address=DOMA_FRACTIONALIZATION_ADDRESS,
-            approve_max=False,
-        )
-        if approve_hash:
-            self.web3.eth.wait_for_transaction_receipt(approve_hash, timeout=180, poll_latency=2)
+        try:
+            approve_hash = self.ensure_allowance(
+                fractional_token,
+                staking_amount_raw,
+                spender_address=DOMA_FRACTIONALIZATION_ADDRESS,
+                approve_max=False,
+            )
+            if approve_hash:
+                self.web3.eth.wait_for_transaction_receipt(approve_hash, timeout=180, poll_latency=2)
+        except Exception as exc:
+            raise RuntimeError(f"subdomain approve failed: {exc}") from exc
 
-        stake_tx = fractionalization.functions.stakeForSubdomain(
-            fractional_token,
-            label,
-            [],
-        ).build_transaction(self._base_tx())
-        stake_tx["gas"] = int(self.web3.eth.estimate_gas(stake_tx) * 1.2)
-        stake_hash = self._send_tx(stake_tx)
-        receipt = self.web3.eth.wait_for_transaction_receipt(stake_hash, timeout=180, poll_latency=2)
+        try:
+            if staking_voucher is None or not staking_signature:
+                raise RuntimeError("Subdomain staking voucher/signature is missing")
+            record = f'"ENS1 dnsname.ens.eth {Web3.to_checksum_address(dns_wallet_address)}"'
+            stake_tx = fractionalization.functions.stakeForSubdomain(
+                staking_voucher,
+                staking_signature,
+                [record],
+            ).build_transaction(self._base_tx())
+            stake_tx["gas"] = int(self.web3.eth.estimate_gas(stake_tx) * 1.2)
+            stake_hash = self._send_tx(stake_tx)
+        except Exception as exc:
+            raise RuntimeError(f"subdomain stake estimate/send failed: {exc}") from exc
+
+        try:
+            receipt = self.web3.eth.wait_for_transaction_receipt(stake_hash, timeout=180, poll_latency=2)
+        except Exception as exc:
+            raise RuntimeError(f"subdomain stake receipt failed | tx={stake_hash}: {exc}") from exc
 
         subdomain_id: Optional[int] = None
         try:
@@ -2342,25 +2409,7 @@ class EvmExecutionClient:
         except Exception:
             subdomain_id = None
 
-        dns_hash: Optional[str] = None
-        if subdomain_id is not None:
-            proxy_record = self.web3.eth.contract(
-                address=Web3.to_checksum_address(PROXY_DOMA_RECORD_ADDRESS),
-                abi=PROXY_DOMA_RECORD_ABI,
-            )
-            record = f'"ENS1 dnsname.ens.eth {Web3.to_checksum_address(dns_wallet_address)}"'
-            dns_tx = proxy_record.functions.setDNSRRSet(
-                int(subdomain_id),
-                "",
-                "TXT",
-                3600,
-                [record],
-            ).build_transaction(self._base_tx())
-            dns_tx["gas"] = int(self.web3.eth.estimate_gas(dns_tx) * 1.2)
-            dns_hash = self._send_tx(dns_tx)
-            self.web3.eth.wait_for_transaction_receipt(dns_hash, timeout=180, poll_latency=2)
-
-        return approve_hash, stake_hash, subdomain_id, dns_hash
+        return approve_hash, stake_hash, subdomain_id, None
 
     def execute_domain_bridge(
         self,
