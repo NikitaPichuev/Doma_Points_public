@@ -205,6 +205,13 @@ DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI = [
         "stateMutability": "nonpayable",
         "type": "function",
     },
+    {
+        "inputs": [{"internalType": "uint256", "name": "subdomainId", "type": "uint256"}],
+        "name": "unstakeSubdomain",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
 ]
 
 WETH_ABI = [
@@ -439,6 +446,19 @@ class OwnedDomain:
     owner_address: str
     token_type: str
     orderbook_disabled: bool
+
+
+@dataclass
+class StakedSubdomain:
+    name: str
+    token_id: str
+    token_address: str
+    network_id: str
+    owner_address: str
+    fractional_token_address: str
+    staked_amount_raw: str
+    stake_tx_hash: str
+    listed: bool
 
 
 @dataclass
@@ -984,6 +1004,81 @@ class DomaApiClient:
                         owner_address=str(token.get("ownerAddress") or "").strip().lower(),
                         token_type=str(token.get("type") or ""),
                         orderbook_disabled=bool(token.get("orderbookDisabled") or False),
+                    )
+                )
+            if not page.get("hasNextPage"):
+                break
+            skip += len(items) if items else page_take
+        return out
+
+    def fetch_wallet_staked_subdomains(
+        self,
+        wallet_address: str,
+        chain_id: int = 97477,
+        take: int = 100,
+        max_pages: int = 20,
+    ) -> List[StakedSubdomain]:
+        caip_wallet = f"eip155:{chain_id}:{wallet_address.lower()}"
+        query = """
+        query WalletSubdomains(
+          $owner: AddressCAIP10!
+          $skip: Int
+          $take: Int
+        ) {
+          subdomains(
+            owner: $owner
+            skip: $skip
+            take: $take
+          ) {
+            items {
+              tokenId
+              name
+              networkId
+              ownerAddress
+              tokenAddress
+              deletedAt
+              listings {
+                id
+                externalId
+              }
+              fractionalizationInfo {
+                fractionalTokenAddress
+                stakedAmount
+                stakeTxHash
+              }
+            }
+            hasNextPage
+          }
+        }
+        """
+        out: List[StakedSubdomain] = []
+        skip = 0
+        page_take = max(1, min(int(take), 500))
+        for _ in range(max_pages):
+            data = self._post(query, {"owner": caip_wallet, "skip": skip, "take": page_take})
+            page = data.get("subdomains") or {}
+            items = page.get("items") or []
+            for item in items:
+                info = item.get("fractionalizationInfo") or {}
+                if item.get("deletedAt"):
+                    continue
+                token_id = str(item.get("tokenId") or "").strip()
+                name = str(item.get("name") or "").strip().lower()
+                token_address = str(item.get("tokenAddress") or "").strip().lower()
+                fractional_token_address = str(info.get("fractionalTokenAddress") or "").strip().lower()
+                if not token_id or not name or not fractional_token_address:
+                    continue
+                out.append(
+                    StakedSubdomain(
+                        name=name,
+                        token_id=token_id,
+                        token_address=token_address,
+                        network_id=str(item.get("networkId") or f"eip155:{chain_id}").strip(),
+                        owner_address=str(item.get("ownerAddress") or "").strip().lower(),
+                        fractional_token_address=fractional_token_address,
+                        staked_amount_raw=str(info.get("stakedAmount") or "0"),
+                        stake_tx_hash=str(info.get("stakeTxHash") or ""),
+                        listed=bool(item.get("listings") or []),
                     )
                 )
             if not page.get("hasNextPage"):
@@ -2410,6 +2505,31 @@ class EvmExecutionClient:
             subdomain_id = None
 
         return approve_hash, stake_hash, subdomain_id, None
+
+    def unstake_subdomain(self, subdomain_id: str | int) -> str:
+        try:
+            token_id = int(str(subdomain_id).strip())
+        except Exception as exc:
+            raise RuntimeError(f"invalid subdomain id: {subdomain_id}") from exc
+        if token_id <= 0:
+            raise RuntimeError(f"invalid subdomain id: {subdomain_id}")
+        fractionalization = self.web3.eth.contract(
+            address=Web3.to_checksum_address(DOMA_FRACTIONALIZATION_ADDRESS),
+            abi=DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI,
+        )
+        try:
+            tx = fractionalization.functions.unstakeSubdomain(token_id).build_transaction(self._base_tx())
+            tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+            tx_hash = self._send_tx(tx)
+        except Exception as exc:
+            raise RuntimeError(f"subdomain unstake estimate/send failed: {exc}") from exc
+        try:
+            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=180, poll_latency=2)
+        except Exception as exc:
+            raise RuntimeError(f"subdomain unstake receipt failed | tx={tx_hash}: {exc}") from exc
+        if int(getattr(receipt, "status", 0)) != 1:
+            raise RuntimeError(f"subdomain unstake reverted | tx={tx_hash}")
+        return tx_hash
 
     def execute_domain_bridge(
         self,

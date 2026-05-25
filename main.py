@@ -34,6 +34,7 @@ from doma_api import (
     PointsSnapshot,
     Pool,
     QuestStatus,
+    StakedSubdomain,
     Token,
     decimal_to_raw,
     pick_token_usd_price,
@@ -3520,6 +3521,29 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
     return max_price_raw, buy_amount_min_raw, buy_amount_max_raw, str(tokens_min), str(tokens_max), str(subdomains_min), str(subdomains_max), delay_min_raw, delay_max_raw
 
 
+def get_close_subdomains_menu_input() -> Optional[Tuple[str, str, str]]:
+    print("\nClose/unstake staked subdomains:")
+    max_raw = input("Maximum subdomains to close per wallet [all]: ").strip()
+    delay_min_raw = input(f"Minimum delay between subdomains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between subdomains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    max_to_close = 0
+    if max_raw:
+        max_to_close = int(_parse_decimal_input(max_raw).to_integral_value(rounding=ROUND_FLOOR))
+        if max_to_close <= 0:
+            raise ValueError("Maximum subdomains to close must be > 0 or empty")
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Subdomain close delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum close delay cannot be lower than minimum delay")
+    return str(max_to_close), delay_min_raw, delay_max_raw
+
+
 def get_com_daily_swap_menu_input() -> Optional[Tuple[str, str, str, str, str, str]]:
     print("\nDaily quest: swap on top .com domain tokens:")
     swap_min_raw = input("Minimum swap amount USDC.E [1]: ").strip() or "1"
@@ -5781,6 +5805,128 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         for entry in insufficient_balance_wallets:
             print(f"  {entry}")
     _print_mode_summary("CHEAP_BUY", total=len(wallet_key_records), success=success_wallets, failed=failed_wallets, skipped=skipped_wallets)
+
+
+def _closeable_subdomains(items: List[StakedSubdomain]) -> Tuple[List[StakedSubdomain], List[Tuple[str, str]]]:
+    closeable: List[StakedSubdomain] = []
+    skipped: List[Tuple[str, str]] = []
+    seen_ids: set[str] = set()
+    for item in items:
+        token_id = str(item.token_id or "").strip()
+        if not token_id or token_id in seen_ids:
+            continue
+        seen_ids.add(token_id)
+        if item.listed:
+            skipped.append((item.name, "listed on marketplace"))
+            continue
+        if not item.fractional_token_address:
+            skipped.append((item.name, "missing fractional token"))
+            continue
+        closeable.append(item)
+    return closeable, skipped
+
+
+def run_close_subdomains_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    picked = get_close_subdomains_menu_input()
+    if not picked:
+        logger.info("[SUBDOMAIN_CLOSE] mode canceled by user.")
+        return
+    max_to_close_raw, delay_min_raw, delay_max_raw = picked
+    max_to_close = int(max_to_close_raw)
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "SUBDOMAIN_CLOSE")
+    if not wallet_key_records:
+        raise RuntimeError("No wallet/private-key pairs available for subdomain close")
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
+    logger.info(
+        "[SUBDOMAIN_CLOSE] mode started | wallets=%s | start_wallet=%s | max_per_wallet=%s | delay=%s-%s sec",
+        total_loaded_wallets,
+        wallet_start_offset + 1,
+        "all" if max_to_close <= 0 else max_to_close,
+        _format_decimal_plain(delay_min),
+        _format_decimal_plain(delay_max),
+    )
+
+    success_wallets = failed_wallets = skipped_wallets = 0
+    closed_total = failed_total = 0
+    skipped_details: List[Tuple[int, str, str]] = []
+    failed_wallet_addresses: List[str] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
+        wallet_number = wallet_start_offset + idx
+        logger.info("[SUBDOMAIN_CLOSE] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "SUBDOMAIN_CLOSE")
+        if skip_wallet or not proxies:
+            skipped_wallets += 1
+            reason = "no proxy"
+            skipped_details.append((wallet_number, wallet, reason))
+            logger.warning("[SUBDOMAIN_CLOSE] wallet=%s skipped | %s", wallet, reason)
+            continue
+        try:
+            doma_api = DomaApiClient(cfg.doma_api_url, api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys], proxies=proxies)
+            subdomains = doma_api.fetch_wallet_staked_subdomains(wallet, chain_id=cfg.chain_id, take=100, max_pages=20)
+            closeable, per_item_skipped = _closeable_subdomains(subdomains)
+            if max_to_close > 0:
+                closeable = closeable[:max_to_close]
+            if not closeable:
+                skipped_wallets += 1
+                reason = "no closeable staked subdomains"
+                if per_item_skipped:
+                    reason += " | " + "; ".join(f"{name}: {why}" for name, why in per_item_skipped[:3])
+                skipped_details.append((wallet_number, wallet, reason))
+                logger.info("[SUBDOMAIN_CLOSE] wallet=%s skipped | %s | found=%s", wallet, reason, len(subdomains))
+                continue
+
+            exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[SUBDOMAIN_CLOSE]")
+            wallet_closed = wallet_failed = 0
+            logger.info("[SUBDOMAIN_CLOSE] wallet=%s closeable=%s/%s", wallet, len(closeable), len(subdomains))
+            for sub_idx, subdomain in enumerate(closeable, start=1):
+                logger.info(
+                    "[SUBDOMAIN_CLOSE] wallet=%s subdomain %s/%s close | %s | tokenId=%s",
+                    wallet,
+                    sub_idx,
+                    len(closeable),
+                    subdomain.name,
+                    subdomain.token_id,
+                )
+                try:
+                    tx_hash = exec_client.unstake_subdomain(subdomain.token_id)
+                    wallet_closed += 1
+                    closed_total += 1
+                    logger.info("[SUBDOMAIN_CLOSE] wallet=%s subdomain=%s closed | tx=%s", wallet, subdomain.name, tx_hash)
+                except Exception as exc:
+                    wallet_failed += 1
+                    failed_total += 1
+                    logger.warning("[SUBDOMAIN_CLOSE] wallet=%s subdomain=%s close failed: %s", wallet, subdomain.name, exc)
+                if sub_idx < len(closeable):
+                    delay_sec = random.uniform(float(delay_min), float(delay_max))
+                    logger.info("[SUBDOMAIN_CLOSE] delay before next subdomain: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+
+            if wallet_closed > 0:
+                success_wallets += 1
+            elif wallet_failed > 0:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[SUBDOMAIN_CLOSE] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records):
+            delay_sec = random.uniform(float(delay_min), float(delay_max))
+            logger.info("[SUBDOMAIN_CLOSE] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    logger.info("[SUBDOMAIN_CLOSE] subdomains total | closed=%s failed=%s", closed_total, failed_total)
+    if skipped_details:
+        print("\n[SUBDOMAIN_CLOSE] skipped wallets:")
+        for wallet_number, wallet, reason in skipped_details:
+            line = f"  #{wallet_number} {wallet} | {reason}"
+            logger.warning("[SUBDOMAIN_CLOSE] skipped | #%s %s | %s", wallet_number, wallet, reason)
+            print(line)
+    _print_mode_summary("SUBDOMAIN_CLOSE", total=len(wallet_key_records), success=success_wallets, failed=failed_wallets, skipped=skipped_wallets, failed_wallets=failed_wallet_addresses)
 
 
 def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -8583,8 +8729,9 @@ def get_menu_choice() -> str:
     print("15) Create full-range liquidity")
     print("16) Weekly ETH/USDC.E volume")
     print("17) Daily .com top TVL swaps")
-    print("18) Exit")
-    return input("Select [1-18]: ").strip()
+    print("18) Close/unstake subdomains")
+    print("19) Exit")
+    return input("Select [1-19]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -8897,6 +9044,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Daily .com top TVL swap mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "18":
+            validate_config(cfg)
+            try:
+                run_close_subdomains_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Subdomain close mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return
