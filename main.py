@@ -446,13 +446,33 @@ def _prompt_start_wallet_number(total_wallets: int) -> int:
         print(f"Enter a number from 1 to {total_wallets}.")
 
 
+def _prompt_wallet_order(default_random: bool = True) -> str:
+    default = "1" if default_random else "2"
+    while True:
+        print("Wallet order:")
+        print("1) Random")
+        print("2) In order")
+        raw = input(f"Select [1-2, default {default}]: ").strip() or default
+        if raw == "1":
+            return "random"
+        if raw == "2":
+            return "ordered"
+        print("Enter 1 or 2.")
+
+
+def _apply_wallet_order(records: List[Tuple[int, str, str]], order: str) -> List[Tuple[int, str, str]]:
+    selected = list(records)
+    if order == "random":
+        random.shuffle(selected)
+    return selected
+
+
 def _apply_wallet_start_selection(records: List[Tuple[int, str, str]]) -> Tuple[List[Tuple[int, str, str]], int, int]:
     total_wallets = len(records)
     start_number = _prompt_start_wallet_number(total_wallets)
+    order = _prompt_wallet_order(default_random=True)
     start_offset = start_number - 1
-    selected = list(records[start_offset:])
-    random.shuffle(selected)
-    return selected, start_offset, total_wallets
+    return _apply_wallet_order(records[start_offset:], order), start_offset, total_wallets
 
 
 def _proxy_for_line(
@@ -1543,7 +1563,9 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
         logger.warning("Points check skipped: no wallets configured")
         return
     wallet_records = list(enumerate(wallets))
-    random.shuffle(wallet_records)
+    points_wallet_order = _prompt_wallet_order(default_random=True)
+    if points_wallet_order == "random":
+        random.shuffle(wallet_records)
     for order_idx, (idx, wallet) in enumerate(wallet_records):
         ctx = _wallet_api_context(cfg, idx, logger, "Points/quests check")
         if ctx is None:
@@ -1570,7 +1592,7 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
 
     try:
         cost_since = datetime.now(timezone.utc) - timedelta(days=7)
-        run_doma_cost_report_once(cfg, logger, state, preset=(cost_since, 0), report_label="last_7d")
+        run_doma_cost_report_once(cfg, logger, state, preset=(cost_since, 0), report_label="last_7d", wallet_order=points_wallet_order)
         for period_label, period_since, period_until in _derive_current_season_ranges(cfg, logger, wallets):
             run_doma_cost_report_once(
                 cfg,
@@ -1579,6 +1601,7 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
                 preset=(period_since, 0),
                 report_label=period_label,
                 until=period_until,
+                wallet_order=points_wallet_order,
             )
     except Exception as exc:
         logger.warning("Doma cost report failed during points/quests check: %s", exc)
@@ -8498,6 +8521,7 @@ def run_doma_cost_report_once(
     preset: Optional[Tuple[Optional[datetime], int]] = None,
     report_label: str = "custom",
     until: Optional[datetime] = None,
+    wallet_order: str = "random",
 ) -> None:
     wallets = [w for w in cfg.points_wallets if _is_valid_evm_address(w)]
     if not wallets:
@@ -8542,7 +8566,10 @@ def run_doma_cost_report_once(
     )
 
     wallet_records = list(enumerate(wallets))[start_offset:]
-    random.shuffle(wallet_records)
+    if preset is None:
+        wallet_order = _prompt_wallet_order(default_random=True)
+    if wallet_order == "random":
+        random.shuffle(wallet_records)
     for idx, wallet in wallet_records:
         proxies, skip_wallet = _proxy_for_line(cfg, idx, logger, "COST")
         if skip_wallet:
