@@ -1562,7 +1562,9 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     if not wallets:
         logger.warning("Points check skipped: no wallets configured")
         return
-    wallet_records = list(enumerate(wallets))
+    start_number = _prompt_start_wallet_number(len(wallets))
+    start_offset = start_number - 1
+    wallet_records = list(enumerate(wallets))[start_offset:]
     points_wallet_order = _prompt_wallet_order(default_random=True)
     if points_wallet_order == "random":
         random.shuffle(wallet_records)
@@ -1592,13 +1594,13 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
 
     try:
         cost_since = datetime.now(timezone.utc) - timedelta(days=7)
-        run_doma_cost_report_once(cfg, logger, state, preset=(cost_since, 0), report_label="last_7d", wallet_order=points_wallet_order)
+        run_doma_cost_report_once(cfg, logger, state, preset=(cost_since, start_offset), report_label="last_7d", wallet_order=points_wallet_order)
         for period_label, period_since, period_until in _derive_current_season_ranges(cfg, logger, wallets):
             run_doma_cost_report_once(
                 cfg,
                 logger,
                 state,
-                preset=(period_since, 0),
+                preset=(period_since, start_offset),
                 report_label=period_label,
                 until=period_until,
                 wallet_order=points_wallet_order,
