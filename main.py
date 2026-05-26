@@ -5346,13 +5346,97 @@ def _pick_affordable_subdomain_label(
     return None, Decimal("0")
 
 
-def _claim_subdomains_for_domain_token(
+def _top_up_domain_token_for_subdomain(
+    cfg: BotConfig,
     logger: logging.Logger,
+    state: BotState,
+    doma_api: DomaApiClient,
+    exec_client: EvmExecutionClient,
+    wallet: str,
+    domain_token: Token,
+    quote_token: Token,
+    weth_token: Token,
+    eth_price: Decimal,
+    required_amount: Decimal,
+) -> bool:
+    current_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
+    if current_balance >= required_amount:
+        return True
+    token_price = pick_token_usd_price(domain_token, eth_price)
+    if token_price <= 0:
+        logger.warning("[CHEAP_BUY] wallet=%s token=%s cannot top up: unknown token price", wallet, domain_token.symbol)
+        return False
+
+    missing_tokens = required_amount - current_balance
+    buy_usd = (missing_tokens * token_price * Decimal("1.10")).quantize(Decimal("0.000001"))
+    if buy_usd < Decimal("0.01"):
+        buy_usd = Decimal("0.01")
+
+    usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+    if usdc_balance < buy_usd:
+        topup_ok, topup_reason, _, _ = _top_up_usdce_from_eth_for_cheap_buy(
+            cfg,
+            logger,
+            state,
+            doma_api,
+            exec_client,
+            quote_token,
+            weth_token,
+            wallet,
+            eth_price,
+            buy_usd,
+        )
+        if not topup_ok:
+            logger.warning(
+                "[CHEAP_BUY] wallet=%s token=%s cannot top up for subdomain | need=%s USDC.E | reason=%s",
+                wallet,
+                domain_token.symbol,
+                _format_decimal_plain(buy_usd),
+                topup_reason,
+            )
+            return False
+
+    logger.info(
+        "[CHEAP_BUY] wallet=%s token=%s topup before subdomain | balance=%s required=%s buy=%s USDC.E",
+        wallet,
+        domain_token.symbol,
+        _format_decimal_plain(current_balance),
+        _format_decimal_plain(required_amount),
+        _format_decimal_plain(buy_usd),
+    )
+    ok = _execute_trade_via_doma_ui_route(
+        cfg=cfg,
+        logger=logger,
+        state=state,
+        doma_api=doma_api,
+        exec_client=exec_client,
+        token_in=quote_token,
+        token_out=domain_token,
+        display_in_symbol="USDC.E",
+        display_out_symbol=domain_token.symbol,
+        trade_amount_expr=f"${_format_decimal_plain(buy_usd)}",
+        eth_price=eth_price,
+        label=f"CHEAP_BUY {wallet} USDC.E>{domain_token.symbol} SUBDOMAIN-TOPUP",
+        wait_for_pre_tx=True,
+    )
+    if not ok:
+        return False
+    refreshed_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
+    return refreshed_balance >= required_amount
+
+
+def _claim_subdomains_for_domain_token(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    state: BotState,
     doma_api: DomaApiClient,
     exec_client: EvmExecutionClient,
     chain_id: int,
     wallet: str,
     domain_token: Token,
+    quote_token: Token,
+    weth_token: Token,
+    eth_price: Decimal,
     domain_name: str,
     subdomains_min_per_token: int,
     subdomains_max_per_token: int,
@@ -5371,23 +5455,33 @@ def _claim_subdomains_for_domain_token(
     failed_count = 0
     for sub_idx in range(1, subdomains_to_claim + 1):
         token_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
-        label, required_amount = _pick_affordable_subdomain_label(
-            exec_client,
-            domain_token.address,
-            prices_raw,
-            domain_token.decimals,
-            token_balance,
-            min_length=20,
-            max_length=40,
-        )
-        if not label:
-            logger.warning(
-                "[CHEAP_BUY] wallet=%s token=%s stop subdomain claims | token balance=%s cannot afford any 20-40 char subdomain",
+        label_length = random.randint(20, 40)
+        label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
+        required_amount = _subdomain_staking_amount_for_length(prices_raw, domain_token.decimals, len(label))
+        if token_balance < required_amount:
+            if not _top_up_domain_token_for_subdomain(
+                cfg,
+                logger,
+                state,
+                doma_api,
+                exec_client,
                 wallet,
-                domain_token.symbol,
-                _format_decimal_plain(token_balance),
-            )
-            break
+                domain_token,
+                quote_token,
+                weth_token,
+                eth_price,
+                required_amount,
+            ):
+                failed_count += 1
+                logger.warning(
+                    "[CHEAP_BUY] wallet=%s token=%s subdomain skipped | topup failed | balance=%s required=%s",
+                    wallet,
+                    domain_token.symbol,
+                    _format_decimal_plain(token_balance),
+                    _format_decimal_plain(required_amount),
+                )
+                continue
+            token_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
         logger.info(
             "[CHEAP_BUY] wallet=%s subdomain %s/%s claim | %s.%s | required=%s %s | balance=%s",
             wallet,
@@ -5838,12 +5932,17 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 if ok:
                     buy_success_count += 1
                     claimed_ok, claimed_failed = _claim_subdomains_for_domain_token(
+                        cfg=cfg,
                         logger=logger,
+                        state=state,
                         doma_api=doma_api,
                         exec_client=exec_client,
                         chain_id=cfg.chain_id,
                         wallet=wallet,
                         domain_token=domain_token,
+                        quote_token=quote_token,
+                        weth_token=weth_token,
+                        eth_price=eth_price,
                         domain_name=info.name,
                         subdomains_min_per_token=subdomains_min_per_token,
                         subdomains_max_per_token=subdomains_max_per_token,
