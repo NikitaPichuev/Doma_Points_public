@@ -5338,7 +5338,7 @@ def _claim_subdomains_for_domain_token(
     success_count = 0
     failed_count = 0
     for sub_idx in range(1, subdomains_to_claim + 1):
-        label_length = random.randint(32, 40)
+        label_length = random.randint(20, 40)
         label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
         label_price_index = 0 if len(prices_raw) == 1 else min(len(label) - 1, len(prices_raw) - 1)
         required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
