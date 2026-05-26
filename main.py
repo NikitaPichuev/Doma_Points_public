@@ -5314,6 +5314,38 @@ def _pick_available_subdomain_label(exec_client: EvmExecutionClient, token_addre
     raise RuntimeError("Unable to find available subdomain label")
 
 
+def _subdomain_staking_amount_for_length(prices_raw: List[int], token_decimals: int, label_length: int) -> Decimal:
+    if not prices_raw:
+        return Decimal("0")
+    label_price_index = 0 if len(prices_raw) == 1 else min(max(0, label_length - 1), len(prices_raw) - 1)
+    return raw_to_decimal(int(prices_raw[label_price_index]), token_decimals)
+
+
+def _pick_affordable_subdomain_label(
+    exec_client: EvmExecutionClient,
+    token_address: str,
+    prices_raw: List[int],
+    token_decimals: int,
+    token_balance: Decimal,
+    min_length: int = 20,
+    max_length: int = 40,
+) -> Tuple[Optional[str], Decimal]:
+    affordable_lengths = [
+        length
+        for length in range(min_length, max_length + 1)
+        if _subdomain_staking_amount_for_length(prices_raw, token_decimals, length) <= token_balance
+    ]
+    random.shuffle(affordable_lengths)
+    for length in affordable_lengths:
+        try:
+            label = _pick_available_subdomain_label(exec_client, token_address, length)
+            required_amount = _subdomain_staking_amount_for_length(prices_raw, token_decimals, len(label))
+            return label, required_amount
+        except Exception:
+            continue
+    return None, Decimal("0")
+
+
 def _claim_subdomains_for_domain_token(
     logger: logging.Logger,
     doma_api: DomaApiClient,
@@ -5338,12 +5370,26 @@ def _claim_subdomains_for_domain_token(
     success_count = 0
     failed_count = 0
     for sub_idx in range(1, subdomains_to_claim + 1):
-        label_length = random.randint(20, 40)
-        label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
-        label_price_index = 0 if len(prices_raw) == 1 else min(len(label) - 1, len(prices_raw) - 1)
-        required_amount = raw_to_decimal(int(prices_raw[label_price_index]) if prices_raw else 0, domain_token.decimals)
+        token_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
+        label, required_amount = _pick_affordable_subdomain_label(
+            exec_client,
+            domain_token.address,
+            prices_raw,
+            domain_token.decimals,
+            token_balance,
+            min_length=20,
+            max_length=40,
+        )
+        if not label:
+            logger.warning(
+                "[CHEAP_BUY] wallet=%s token=%s stop subdomain claims | token balance=%s cannot afford any 20-40 char subdomain",
+                wallet,
+                domain_token.symbol,
+                _format_decimal_plain(token_balance),
+            )
+            break
         logger.info(
-            "[CHEAP_BUY] wallet=%s subdomain %s/%s claim | %s.%s | required=%s %s",
+            "[CHEAP_BUY] wallet=%s subdomain %s/%s claim | %s.%s | required=%s %s | balance=%s",
             wallet,
             sub_idx,
             subdomains_to_claim,
@@ -5351,6 +5397,7 @@ def _claim_subdomains_for_domain_token(
             domain_name,
             _format_decimal_plain(required_amount),
             domain_token.symbol,
+            _format_decimal_plain(token_balance),
         )
         try:
             voucher_contract, staking_voucher, staking_signature = doma_api.sign_fractional_staking_subdomain_voucher(
