@@ -3472,9 +3472,18 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, s
     )
 
 
-def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str]]:
+def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str, str]]:
     print("\nCancel active domain listings:")
     cancellation_type = "off-chain"
+    print("Domain network:")
+    print("1) Doma")
+    print("2) Base")
+    print("3) Any available")
+    network_mode_raw = input("Select [1-3, default 3]: ").strip()
+    if not network_mode_raw:
+        network_mode_raw = "3"
+    if network_mode_raw not in {"1", "2", "3"}:
+        raise ValueError("Invalid domain network mode")
     delay_min_raw = input(f"Minimum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
     delay_max_raw = input(f"Maximum delay between domains sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
     if not delay_min_raw:
@@ -3487,7 +3496,7 @@ def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str]]:
         raise ValueError("Domain delisting delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum domain delisting delay cannot be lower than minimum delay")
-    return cancellation_type, delay_min_raw, delay_max_raw
+    return cancellation_type, network_mode_raw, delay_min_raw, delay_max_raw
 
 
 def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str, str]]:
@@ -3833,8 +3842,16 @@ def _listing_network_label(cfg: BotConfig, network_mode_raw: str) -> str:
     return "any supported"
 
 
-def _listing_chain_context(cfg: BotConfig, domain: OwnedDomain) -> Tuple[int, str, List[str]]:
-    chain_id = _chain_id_from_network_id(domain.network_id, cfg.chain_id)
+def _listing_network_chain_ids(cfg: BotConfig, network_mode_raw: str) -> List[int]:
+    if network_mode_raw == "1":
+        return [cfg.chain_id]
+    if network_mode_raw == "2":
+        return [BASE_CHAIN_ID]
+    return sorted(_supported_listing_chain_ids(cfg))
+
+
+def _listing_chain_context_from_network(cfg: BotConfig, network_id: str) -> Tuple[int, str, List[str]]:
+    chain_id = _chain_id_from_network_id(network_id, cfg.chain_id)
     if chain_id == BASE_CHAIN_ID:
         rpc_urls = _base_rpc_candidates()
     else:
@@ -3842,6 +3859,27 @@ def _listing_chain_context(cfg: BotConfig, domain: OwnedDomain) -> Tuple[int, st
     if not rpc_urls:
         raise ValueError(f"No RPC URL configured for chain_id={chain_id}")
     return chain_id, rpc_urls[0], rpc_urls
+
+
+def _listing_chain_context(cfg: BotConfig, domain: OwnedDomain) -> Tuple[int, str, List[str]]:
+    return _listing_chain_context_from_network(cfg, domain.network_id)
+
+
+def _fetch_wallet_domain_listings_for_network_mode(
+    doma_api: DomaApiClient,
+    wallet: str,
+    cfg: BotConfig,
+    network_mode_raw: str,
+) -> List[DomainListing]:
+    out: List[DomainListing] = []
+    seen: set[str] = set()
+    for chain_id in _listing_network_chain_ids(cfg, network_mode_raw):
+        for listing in doma_api.fetch_wallet_domain_listings(wallet, chain_id=chain_id):
+            if listing.order_id in seen:
+                continue
+            seen.add(listing.order_id)
+            out.append(listing)
+    return out
 
 
 def _run_domain_listing_helper(
@@ -3965,9 +4003,10 @@ def _run_domain_cancel_listing_helper(
     loader_path = _domain_listing_loader_path()
     if not loader_path.exists():
         raise FileNotFoundError(f"Node ESM loader not found: {loader_path}")
+    chain_id, rpc_url, _ = _listing_chain_context_from_network(cfg, listing.network_id)
     payload = {
-        "chainId": cfg.chain_id,
-        "rpcUrl": cfg.rpc_url,
+        "chainId": chain_id,
+        "rpcUrl": rpc_url,
         "privateKey": private_key,
         "orderId": listing.order_id,
         "cancellationType": cancellation_type,
@@ -4520,7 +4559,7 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     if not picked:
         logger.info("[DELIST] canceled by user.")
         return
-    cancellation_type, delay_min_raw, delay_max_raw = picked
+    cancellation_type, network_mode_raw, delay_min_raw, delay_max_raw = picked
     delisting_delay_min = float(_parse_decimal_input(delay_min_raw))
     delisting_delay_max = float(_parse_decimal_input(delay_max_raw))
 
@@ -4549,9 +4588,10 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     )
 
     logger.info(
-        "[DELIST] mode started | wallets=%s | start_wallet=%s | cancellation=%s | delay=%s-%s sec",
+        "[DELIST] mode started | wallets=%s | start_wallet=%s | network=%s | cancellation=%s | delay=%s-%s sec",
         len(wallet_key_records),
         wallet_start_offset + 1,
+        _listing_network_label(cfg, network_mode_raw),
         cancellation_type,
         delay_min_raw,
         delay_max_raw,
@@ -4580,25 +4620,32 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 api_keys=cfg.doma_api_keys,
                 proxies=proxies,
             )
-            listings = doma_api.fetch_wallet_domain_listings(wallet, chain_id=cfg.chain_id)
+            listings = _fetch_wallet_domain_listings_for_network_mode(doma_api, wallet, cfg, network_mode_raw)
             if not listings:
-                logger.info("[DELIST] wallet=%s no active listings | proxy=%s", wallet, "yes" if proxies else "no")
+                logger.info(
+                    "[DELIST] wallet=%s no active listings | network=%s | proxy=%s",
+                    wallet,
+                    _listing_network_label(cfg, network_mode_raw),
+                    "yes" if proxies else "no",
+                )
                 continue
             logger.info(
-                "[DELIST] wallet=%s active listings=%s | proxy=%s",
+                "[DELIST] wallet=%s active listings=%s | network=%s | proxy=%s",
                 wallet,
                 len(listings),
+                _listing_network_label(cfg, network_mode_raw),
                 "yes" if proxies else "no",
             )
             wallet_success = 0
             wallet_failed = 0
             for listing_idx, listing in enumerate(listings, start=1):
                 logger.info(
-                    "[DELIST] wallet=%s domain %s/%s %s | order_id=%s",
+                    "[DELIST] wallet=%s domain %s/%s %s | network=%s | order_id=%s",
                     wallet,
                     listing_idx,
                     len(listings),
                     listing.name,
+                    listing.network_id,
                     listing.order_id,
                 )
                 ok, tx_hash, reason = _run_domain_cancel_listing_helper(
