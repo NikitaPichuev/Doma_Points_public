@@ -3799,21 +3799,26 @@ def _run_domain_listing_helper(
         "orderbookBaseUrl": _doma_orderbook_base_url(cfg),
         "apiKey": _first_doma_api_key(cfg),
         "proxy": proxy or "",
+        "timeoutMs": 120000,
     }
     env = dict(os.environ)
     if proxy:
         env["HTTP_PROXY"] = proxy
         env["HTTPS_PROXY"] = proxy
     env["NODE_NO_WARNINGS"] = "1"
-    result = subprocess.run(
-        ["node", "--loader", loader_path.as_uri(), str(helper_path)],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        cwd=str(helper_path.parent),
-        env=env,
-        timeout=600,
-    )
+    try:
+        result = subprocess.run(
+            ["node", "--loader", loader_path.as_uri(), str(helper_path)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(helper_path.parent),
+            env=env,
+            timeout=150,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = "\n".join(str(x or "").strip() for x in (exc.stderr, exc.stdout) if x)
+        return False, "", f"listing helper timed out after 150 seconds; output={partial[:1000]}"
     for line in result.stderr.splitlines():
         line = line.strip()
         if not line:
@@ -3846,10 +3851,18 @@ def _run_domain_listing_helper(
             logger.warning("[LIST] wallet=%s domain=%s helper error: %s", wallet, domain.name, event.get("error"))
     if result.returncode != 0:
         return False, "", (result.stderr or result.stdout or f"node exited with {result.returncode}").strip()
-    try:
-        data = json.loads(result.stdout.splitlines()[-1])
-    except Exception as exc:
-        return False, "", f"failed to parse helper output: {exc}; stdout={result.stdout.strip()}"
+    data = None
+    for line in reversed(result.stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+            break
+        except Exception:
+            continue
+    if data is None:
+        return False, "", f"failed to parse helper output; stdout={result.stdout.strip()}"
     if not data.get("ok"):
         return False, "", str(data.get("error") or "unknown helper error")
     orders = (data.get("result") or {}).get("orders") or []
@@ -3882,21 +3895,26 @@ def _run_domain_cancel_listing_helper(
         "orderbookBaseUrl": _doma_orderbook_base_url(cfg),
         "apiKey": _first_doma_api_key(cfg),
         "proxy": proxy or "",
+        "timeoutMs": 120000,
     }
     env = dict(os.environ)
     if proxy:
         env["HTTP_PROXY"] = proxy
         env["HTTPS_PROXY"] = proxy
     env["NODE_NO_WARNINGS"] = "1"
-    result = subprocess.run(
-        ["node", "--loader", loader_path.as_uri(), str(helper_path)],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        cwd=str(helper_path.parent),
-        env=env,
-        timeout=600,
-    )
+    try:
+        result = subprocess.run(
+            ["node", "--loader", loader_path.as_uri(), str(helper_path)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(helper_path.parent),
+            env=env,
+            timeout=150,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = "\n".join(str(x or "").strip() for x in (exc.stderr, exc.stdout) if x)
+        return False, "", f"cancel listing helper timed out after 150 seconds; output={partial[:1000]}"
     for line in result.stderr.splitlines():
         line = line.strip()
         if not line:
@@ -3920,10 +3938,18 @@ def _run_domain_cancel_listing_helper(
             logger.warning("[DELIST] wallet=%s domain=%s helper error: %s", wallet, listing.name, event.get("error"))
     if result.returncode != 0:
         return False, "", (result.stderr or result.stdout or f"node exited with {result.returncode}").strip()
-    try:
-        data = json.loads(result.stdout.splitlines()[-1])
-    except Exception as exc:
-        return False, "", f"failed to parse helper output: {exc}; stdout={result.stdout.strip()}"
+    data = None
+    for line in reversed(result.stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+            break
+        except Exception:
+            continue
+    if data is None:
+        return False, "", f"failed to parse helper output; stdout={result.stdout.strip()}"
     if not data.get("ok"):
         return False, "", str(data.get("error") or "unknown helper error")
     tx_hash = str(((data.get("result") or {}).get("transactionHash")) or "")
@@ -3964,21 +3990,26 @@ def _run_domain_place_offer_helper(
         "orderbookBaseUrl": _doma_orderbook_base_url(cfg),
         "apiKey": _first_doma_api_key(cfg),
         "proxy": proxy or "",
+        "timeoutMs": 120000,
     }
     env = dict(os.environ)
     if proxy:
         env["HTTP_PROXY"] = proxy
         env["HTTPS_PROXY"] = proxy
     env["NODE_NO_WARNINGS"] = "1"
-    result = subprocess.run(
-        ["node", "--loader", loader_path.as_uri(), str(helper_path)],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        cwd=str(helper_path.parent),
-        env=env,
-        timeout=600,
-    )
+    try:
+        result = subprocess.run(
+            ["node", "--loader", loader_path.as_uri(), str(helper_path)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(helper_path.parent),
+            env=env,
+            timeout=150,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = "\n".join(str(x or "").strip() for x in (exc.stderr, exc.stdout) if x)
+        return False, "", f"place offer helper timed out after 150 seconds; output={partial[:1000]}"
     for line in result.stderr.splitlines():
         line = line.strip()
         if not line:
@@ -4011,10 +4042,18 @@ def _run_domain_place_offer_helper(
             logger.warning("[OFFER] wallet=%s domain=%s helper error: %s", wallet, domain.name, event.get("error"))
     if result.returncode != 0:
         return False, "", (result.stderr or result.stdout or f"node exited with {result.returncode}").strip()
-    try:
-        data = json.loads(result.stdout.splitlines()[-1])
-    except Exception as exc:
-        return False, "", f"failed to parse helper output: {exc}; stdout={result.stdout.strip()}"
+    data = None
+    for line in reversed(result.stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+            break
+        except Exception:
+            continue
+    if data is None:
+        return False, "", f"failed to parse helper output; stdout={result.stdout.strip()}"
     if not data.get("ok"):
         return False, "", str(data.get("error") or "unknown helper error")
     orders = (data.get("result") or {}).get("orders") or []
