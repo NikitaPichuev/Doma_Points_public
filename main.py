@@ -5583,6 +5583,59 @@ def _eligible_cheap_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token
     return eligible
 
 
+def _supports_20_40_subdomain_claim(exec_client: EvmExecutionClient, token_address: str) -> bool:
+    prices_raw = exec_client.get_subdomain_staking_prices(token_address)
+    if not prices_raw:
+        return False
+    lengths = list(range(20, 41))
+    random.shuffle(lengths)
+    for length in lengths[:5]:
+        label = _random_subdomain_label(length)
+        if exec_client.is_subdomain_claim_available(token_address, label):
+            return True
+    return False
+
+
+def _select_cheap_tokens_with_subdomains(
+    logger: logging.Logger,
+    exec_client: EvmExecutionClient,
+    wallet: str,
+    catalog: List[LaunchpadTokenInfo],
+    quote_token: Token,
+    max_price_usd: Decimal,
+    existing_token_addresses: set[str],
+    count: int,
+) -> List[LaunchpadTokenInfo]:
+    if count <= 0:
+        return []
+    selected: List[LaunchpadTokenInfo] = []
+    checked = 0
+    skipped_no_subdomain = 0
+    for info in _eligible_cheap_tokens(catalog, quote_token, max_price_usd):
+        address = (info.address or "").strip().lower()
+        if not address or address in existing_token_addresses:
+            continue
+        checked += 1
+        try:
+            if not _supports_20_40_subdomain_claim(exec_client, info.address):
+                skipped_no_subdomain += 1
+                continue
+        except Exception:
+            skipped_no_subdomain += 1
+            continue
+        selected.append(info)
+        if len(selected) >= count:
+            break
+    logger.info(
+        "[CHEAP_BUY] wallet=%s subdomain-capable token filter | selected=%s | checked=%s | skipped_no_subdomain=%s",
+        wallet,
+        len(selected),
+        checked,
+        skipped_no_subdomain,
+    )
+    return selected
+
+
 def _top_tvl_com_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token, limit: int) -> List[LaunchpadTokenInfo]:
     quote_address = quote_token.address.lower()
     eligible: List[LaunchpadTokenInfo] = []
@@ -5894,10 +5947,16 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             existing_subdomains_claimed = 0
 
             tokens_to_buy = max(0, tokens_per_wallet - existing_subdomains_claimed)
-            selected_tokens = [
-                t for t in _eligible_cheap_tokens(catalog, quote_token, max_price_usd)
-                if (t.address or "").strip().lower() not in existing_token_addresses
-            ][:tokens_to_buy]
+            selected_tokens = _select_cheap_tokens_with_subdomains(
+                logger,
+                exec_client,
+                wallet,
+                catalog,
+                quote_token,
+                max_price_usd,
+                existing_token_addresses,
+                tokens_to_buy,
+            )
             if tokens_to_buy <= 0:
                 success_wallets += 1
                 logger.info("[CHEAP_BUY] wallet=%s target satisfied from existing token balances | claimed_subdomains=%s", wallet, existing_subdomains_claimed)
