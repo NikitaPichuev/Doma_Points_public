@@ -110,6 +110,8 @@ function configureAxiosProxy(proxy) {
 async function main() {
   const inputRaw = fs.readFileSync(0, 'utf8');
   const input = JSON.parse(inputRaw);
+  const timeoutMs = Number(input.timeoutMs || 120000);
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
 
   const chainId = Number(requireField(input, 'chainId'));
   const rpcUrls = rpcUrlCandidates(input);
@@ -142,6 +144,8 @@ async function main() {
     baseUrl,
     defaultHeaders,
   });
+  axios.defaults.timeout = timeoutMs;
+  axios.defaults.signal = timeoutSignal;
 
   apiClient.getSupportedCurrencies = async () => ({
     currencies: [
@@ -161,8 +165,9 @@ async function main() {
 
   let lastError = null;
   for (const rpcUrl of rpcUrls) {
+    let provider = null;
     try {
-      const provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: 'doma' });
+      provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: 'doma' });
       const signer = new ethers.Wallet(privateKey, provider);
       const config = {
         source,
@@ -197,10 +202,17 @@ async function main() {
       });
 
       console.log(JSON.stringify({ ok: true, rpcUrl, result }));
+      if (provider && typeof provider.destroy === 'function') {
+        provider.destroy();
+      }
       return;
     } catch (error) {
       lastError = error;
       console.error(JSON.stringify({ type: 'rpc_retry', rpc_url: rpcUrl, error: summarizeError(error) }));
+    } finally {
+      if (provider && typeof provider.destroy === 'function') {
+        provider.destroy();
+      }
     }
   }
   throw new Error(`All listing RPC attempts failed: ${summarizeError(lastError)}`);
