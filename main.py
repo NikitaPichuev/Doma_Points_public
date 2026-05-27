@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from web3 import Web3
 
@@ -127,7 +127,13 @@ DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC = Decimal("4")
 DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC = Decimal("10")
 DOMAIN_LISTING_SOURCE = "doma-swap-bot-public"
 PROXY_DOMA_RECORD_ADDRESS = "0xd0000000000067CB44aE7b6aC3AB5764dE20A3E2"
+BASE_CHAIN_ID = 8453
 BASE_CHAIN_CAIP2 = "eip155:8453"
+BASE_RPC_FALLBACK_URLS = [
+    "https://mainnet.base.org",
+    "https://base-rpc.publicnode.com",
+    "https://base.llamarpc.com",
+]
 DOMAIN_OFFER_MIN_ETH_EQUIVALENT = Decimal("0.0001")
 
 
@@ -3765,6 +3771,44 @@ def _domain_listing_loader_path() -> Path:
     return Path(__file__).with_name("doma_node_esm_loader.mjs")
 
 
+def _chain_id_from_network_id(network_id: str, fallback_chain_id: int) -> int:
+    match = re.fullmatch(r"eip155:(\d+)", (network_id or "").strip())
+    return int(match.group(1)) if match else fallback_chain_id
+
+
+def _unique_nonempty(values: List[str]) -> List[str]:
+    out: List[str] = []
+    for value in values:
+        item = (value or "").strip()
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def _base_rpc_candidates() -> List[str]:
+    env_values: List[str] = []
+    for key in ("BASE_RPC_URL", "BASE_RPC_URLS"):
+        raw = os.getenv(key, "")
+        if raw:
+            env_values.extend(x.strip() for x in raw.split(","))
+    return _unique_nonempty([*env_values, *BASE_RPC_FALLBACK_URLS])
+
+
+def _supported_listing_chain_ids(cfg: BotConfig) -> set[int]:
+    return {cfg.chain_id, BASE_CHAIN_ID}
+
+
+def _listing_chain_context(cfg: BotConfig, domain: OwnedDomain) -> Tuple[int, str, List[str]]:
+    chain_id = _chain_id_from_network_id(domain.network_id, cfg.chain_id)
+    if chain_id == BASE_CHAIN_ID:
+        rpc_urls = _base_rpc_candidates()
+    else:
+        rpc_urls = _doma_rpc_candidates(cfg)
+    if not rpc_urls:
+        raise ValueError(f"No RPC URL configured for chain_id={chain_id}")
+    return chain_id, rpc_urls[0], rpc_urls
+
+
 def _run_domain_listing_helper(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -3785,10 +3829,11 @@ def _run_domain_listing_helper(
     if price_raw <= 0:
         raise ValueError(f"Listing price is too small after USDC.E conversion: {price}")
     duration_ms = int(duration_days * Decimal("86400000"))
+    chain_id, rpc_url, rpc_urls = _listing_chain_context(cfg, domain)
     payload = {
-        "chainId": cfg.chain_id,
-        "rpcUrl": cfg.rpc_url,
-        "rpcUrls": _doma_rpc_candidates(cfg),
+        "chainId": chain_id,
+        "rpcUrl": rpc_url,
+        "rpcUrls": rpc_urls,
         "privateKey": private_key,
         "contract": domain.token_address,
         "tokenId": domain.token_id,
@@ -4146,22 +4191,52 @@ def _run_domain_accept_offer_helper(
 
 
 def _eligible_unlisted_domains(all_domains: List[OwnedDomain], listed_domains: List[OwnedDomain], chain_id: int) -> List[OwnedDomain]:
+    out, _ = _eligible_unlisted_domains_with_reasons(all_domains, listed_domains, chain_id)
+    return out
+
+
+def _eligible_unlisted_domains_with_reasons(
+    all_domains: List[OwnedDomain],
+    listed_domains: List[OwnedDomain],
+    chain_id: int,
+    supported_chain_ids: Optional[set[int]] = None,
+) -> Tuple[List[OwnedDomain], Dict[str, Any]]:
     listed_names = {d.name.lower() for d in listed_domains}
-    target_network = f"eip155:{chain_id}"
+    allowed_chain_ids = supported_chain_ids or {chain_id}
     out: List[OwnedDomain] = []
     seen: set[str] = set()
+    skipped = {
+        "listed": 0,
+        "duplicate": 0,
+        "wrong_network": 0,
+        "orderbook_disabled": 0,
+        "examples": [],
+    }
+    def add_example(domain: OwnedDomain, reason: str) -> None:
+        examples = skipped["examples"]
+        if isinstance(examples, list) and len(examples) < 5:
+            examples.append(f"{domain.name}:{reason}")
+
     for domain in all_domains:
         if domain.name.lower() in listed_names:
+            skipped["listed"] += 1
+            add_example(domain, "listed")
             continue
         if domain.name.lower() in seen:
+            skipped["duplicate"] += 1
+            add_example(domain, "duplicate")
             continue
         seen.add(domain.name.lower())
-        if domain.network_id and domain.network_id != target_network:
+        if domain.network_id and _chain_id_from_network_id(domain.network_id, chain_id) not in allowed_chain_ids:
+            skipped["wrong_network"] += 1
+            add_example(domain, f"wrong_network:{domain.network_id}")
             continue
         if domain.orderbook_disabled:
+            skipped["orderbook_disabled"] += 1
+            add_example(domain, "orderbook_disabled")
             continue
         out.append(domain)
-    return out
+    return out, skipped
 
 
 def _eligible_bridge_domains(
@@ -4287,22 +4362,28 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             )
             all_domains = doma_api.fetch_owned_domains(wallet, chain_id=cfg.chain_id, listed=None)
             listed_domains = doma_api.fetch_owned_domains(wallet, chain_id=cfg.chain_id, listed=True)
-            unlisted_domains = _eligible_unlisted_domains(all_domains, listed_domains, cfg.chain_id)
+            unlisted_domains, unlisted_skip_reasons = _eligible_unlisted_domains_with_reasons(
+                all_domains,
+                listed_domains,
+                cfg.chain_id,
+                supported_chain_ids=_supported_listing_chain_ids(cfg),
+            )
             if not unlisted_domains:
                 skipped_wallets += 1
                 skipped_wallet_details.append(
-                    f"wallet {wallet_number}/{total_loaded_wallets} | wallet={wallet} | reason=no unlisted domains | owned={len(all_domains)} listed={len(listed_domains)}"
+                    f"wallet {wallet_number}/{total_loaded_wallets} | wallet={wallet} | reason=no eligible unlisted domains | owned={len(all_domains)} listed={len(listed_domains)} | skipped={unlisted_skip_reasons}"
                 )
                 logger.info(
-                    "[LIST] wallet=%s no unlisted domains | owned=%s listed=%s",
+                    "[LIST] wallet=%s no eligible unlisted domains | owned=%s listed=%s | skipped=%s",
                     wallet,
                     len(all_domains),
                     len(listed_domains),
+                    unlisted_skip_reasons,
                 )
                 continue
             selected_domains = _select_domains_for_listing(unlisted_domains, count_mode_raw, count_min, count_max)
             logger.info(
-                "[LIST] wallet=%s selected=%s/%s unlisted domains | owned=%s listed=%s | proxy=%s",
+                "[LIST] wallet=%s selected=%s/%s eligible unlisted domains | owned=%s listed=%s | proxy=%s",
                 wallet,
                 len(selected_domains),
                 len(unlisted_domains),
@@ -4315,11 +4396,12 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             for domain_idx, domain in enumerate(selected_domains, start=1):
                 price = _random_listing_price(min_price, max_price)
                 logger.info(
-                    "[LIST] wallet=%s domain %s/%s %s | price=%s USDC.E",
+                    "[LIST] wallet=%s domain %s/%s %s | network=%s | price=%s USDC.E",
                     wallet,
                     domain_idx,
                     len(selected_domains),
                     domain.name,
+                    domain.network_id or f"eip155:{cfg.chain_id}",
                     _format_decimal_plain(price),
                 )
                 ok, order_id, reason = _run_domain_listing_helper(
