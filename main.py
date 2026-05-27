@@ -3399,7 +3399,7 @@ def run_domain_quest_volume_once(
     )
 
 
-def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str, str]]:
+def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str, str, str]]:
     print("\nList unlisted domains for sale:")
     min_raw = input("Minimum price in USDC.E: ").strip()
     max_raw = input("Maximum price in USDC.E: ").strip()
@@ -3417,6 +3417,15 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, s
     duration_days = _parse_decimal_input(duration_raw)
     if duration_days <= 0:
         raise ValueError("Listing duration must be > 0")
+    print("Domain network:")
+    print("1) Doma")
+    print("2) Base")
+    print("3) Any available")
+    network_mode_raw = input("Select [1-3, default 3]: ").strip()
+    if not network_mode_raw:
+        network_mode_raw = "3"
+    if network_mode_raw not in {"1", "2", "3"}:
+        raise ValueError("Invalid domain network mode")
     print("Listing count:")
     print("1) All unlisted domains")
     print("2) Random amount from min/max")
@@ -3450,7 +3459,17 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, s
         raise ValueError("Domain listing delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum domain listing delay cannot be lower than minimum delay")
-    return min_raw, max_raw, duration_raw, count_mode_raw, count_min_raw, count_max_raw, delay_min_raw, delay_max_raw
+    return (
+        min_raw,
+        max_raw,
+        duration_raw,
+        network_mode_raw,
+        count_mode_raw,
+        count_min_raw,
+        count_max_raw,
+        delay_min_raw,
+        delay_max_raw,
+    )
 
 
 def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str]]:
@@ -3796,6 +3815,22 @@ def _base_rpc_candidates() -> List[str]:
 
 def _supported_listing_chain_ids(cfg: BotConfig) -> set[int]:
     return {cfg.chain_id, BASE_CHAIN_ID}
+
+
+def _listing_network_filter_chain_ids(cfg: BotConfig, network_mode_raw: str) -> set[int]:
+    if network_mode_raw == "1":
+        return {cfg.chain_id}
+    if network_mode_raw == "2":
+        return {BASE_CHAIN_ID}
+    return _supported_listing_chain_ids(cfg)
+
+
+def _listing_network_label(cfg: BotConfig, network_mode_raw: str) -> str:
+    if network_mode_raw == "1":
+        return f"Doma/eip155:{cfg.chain_id}"
+    if network_mode_raw == "2":
+        return f"Base/eip155:{BASE_CHAIN_ID}"
+    return "any supported"
 
 
 def _listing_chain_context(cfg: BotConfig, domain: OwnedDomain) -> Tuple[int, str, List[str]]:
@@ -4269,7 +4304,17 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     if not picked:
         logger.info("[LIST] canceled by user.")
         return
-    min_raw, max_raw, duration_raw, count_mode_raw, count_min_raw, count_max_raw, delay_min_raw, delay_max_raw = picked
+    (
+        min_raw,
+        max_raw,
+        duration_raw,
+        network_mode_raw,
+        count_mode_raw,
+        count_min_raw,
+        count_max_raw,
+        delay_min_raw,
+        delay_max_raw,
+    ) = picked
     min_price = _parse_decimal_input(min_raw)
     max_price = _parse_decimal_input(max_raw)
     duration_days = _parse_decimal_input(duration_raw)
@@ -4305,9 +4350,10 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     )
 
     logger.info(
-        "[LIST] mode started | wallets=%s | start_wallet=%s | price=%s-%s USDC.E | duration=%s days | count=%s | delay=%s-%s sec | currency=USDC.E",
+        "[LIST] mode started | wallets=%s | start_wallet=%s | network=%s | price=%s-%s USDC.E | duration=%s days | count=%s | delay=%s-%s sec | currency=USDC.E",
         len(wallet_key_records),
         wallet_start_offset + 1,
+        _listing_network_label(cfg, network_mode_raw),
         _format_decimal_plain(min_price),
         _format_decimal_plain(max_price),
         _format_decimal_plain(duration_days),
@@ -4366,7 +4412,7 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 all_domains,
                 listed_domains,
                 cfg.chain_id,
-                supported_chain_ids=_supported_listing_chain_ids(cfg),
+                supported_chain_ids=_listing_network_filter_chain_ids(cfg, network_mode_raw),
             )
             if not unlisted_domains:
                 skipped_wallets += 1
