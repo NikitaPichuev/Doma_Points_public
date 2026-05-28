@@ -101,6 +101,7 @@ DOMAIN_QUEST_TOKENS = [
     "loancrypto.ai",
     "coinlogic.ai",
     "agenticconsultant.ai",
+    "boner.com",
     "gobitcoin.xyz",
     "closingbells.com",
     "get.cash",
