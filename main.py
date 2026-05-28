@@ -2781,7 +2781,7 @@ def get_domain_quest_token_choice() -> Optional[str]:
     return DOMAIN_QUEST_TOKENS[picked_idx - 1]
 
 
-def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str, str, str, str]]:
+def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str, str, str, str, str]]:
     _ = state
     domain_name = get_domain_quest_token_choice()
     if not domain_name:
@@ -2803,6 +2803,13 @@ def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str
     if volume_mode_raw not in {"1", "2"}:
         raise ValueError("Invalid volume mode selection")
     volume_mode = "single_swap" if volume_mode_raw == "1" else "volume_only"
+    print("\nExisting volume check:")
+    print("1) Check last 7 days and skip completed wallets")
+    print("2) Ignore history and run selected wallets")
+    history_mode_raw = input("Select [1-2, default 1]: ").strip() or "1"
+    if history_mode_raw not in {"1", "2"}:
+        raise ValueError("Invalid existing volume check selection")
+    history_mode = "check_skip" if history_mode_raw == "1" else "ignore"
     print("\nFinal asset:")
     print("1) USDC.E")
     print("2) ETH")
@@ -2810,7 +2817,7 @@ def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str
     if final_raw not in {"1", "2"}:
         raise ValueError("Invalid final asset selection")
     final_asset = "USDC.E" if final_raw == "1" else "ETH"
-    return domain_name, min_raw, max_raw, target_raw, final_asset, volume_mode
+    return domain_name, min_raw, max_raw, target_raw, final_asset, volume_mode, history_mode
 
 
 def run_domain_quest_volume_once(
@@ -2837,11 +2844,18 @@ def run_domain_quest_volume_once(
     if len(picked) == 5:
         domain_name, min_raw, max_raw, target_raw, final_asset = picked
         volume_mode = "volume_only"
-    else:
+        history_mode = "check_skip"
+    elif len(picked) == 6:
         domain_name, min_raw, max_raw, target_raw, final_asset, volume_mode = picked
+        history_mode = "check_skip"
+    else:
+        domain_name, min_raw, max_raw, target_raw, final_asset, volume_mode, history_mode = picked
     if volume_mode not in {"single_swap", "volume_only"}:
         raise ValueError("Invalid quest volume mode")
+    if history_mode not in {"check_skip", "ignore"}:
+        raise ValueError("Invalid quest history mode")
     require_min_single_swap = volume_mode == "single_swap"
+    check_existing_volume = history_mode == "check_skip"
     target_volume = _parse_decimal_input(target_raw)
     quest_target_volume = min(target_volume, DOMAIN_QUEST_COMPLETION_THRESHOLD_USD)
     execution_target_volume = quest_target_volume + max(Decimal("1"), quest_target_volume * Decimal("0.10"))
@@ -2902,12 +2916,13 @@ def run_domain_quest_volume_once(
     rides_pool_addresses = [launchpad_info.pool_address]
 
     logger.info(
-        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | lookback=%s days since=%s | target=%s USDC.E | quest_target=%s USDC.E | volume_mode=%s | min_single_swap=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
+        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | lookback=%s days since=%s | history_mode=%s | target=%s USDC.E | quest_target=%s USDC.E | volume_mode=%s | min_single_swap=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
         domain_name,
         len(wallet_key_records),
         wallet_start_offset + 1,
         DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
         volume_since.isoformat(),
+        history_mode,
         _format_decimal_plain(target_volume),
         _format_decimal_plain(quest_target_volume),
         volume_mode,
@@ -3077,18 +3092,27 @@ def run_domain_quest_volume_once(
                 log_prefix=_quest_log(""),
             )
 
-            try:
-                accumulated_volume = _fetch_recent_quest_volume(doma_api, wallet)
-            except Exception as exc:
-                logger.warning(
-                    _quest_log("wallet=%s recent %s volume fetch failed, assuming 0: %s"),
+            if check_existing_volume:
+                try:
+                    accumulated_volume = _fetch_recent_quest_volume(doma_api, wallet)
+                except Exception as exc:
+                    logger.warning(
+                        _quest_log("wallet=%s recent %s volume fetch failed, assuming 0: %s"),
+                        wallet,
+                        domain_name,
+                        exc,
+                    )
+                    accumulated_volume = Decimal("0")
+            else:
+                accumulated_volume = Decimal("0")
+                logger.info(
+                    _quest_log("wallet=%s existing %s volume check disabled | starting from 0/%s"),
                     wallet,
                     domain_name,
-                    exc,
+                    _format_decimal_plain(target_volume),
                 )
-                accumulated_volume = Decimal("0")
             rides_completion_threshold = quest_target_volume
-            if accumulated_volume >= rides_completion_threshold:
+            if check_existing_volume and accumulated_volume >= rides_completion_threshold:
                 logger.info(
                     _quest_log("wallet=%s already has %s volume for last %s days since %s = %s/%s | completion_threshold=%s | skipping wallet"),
                     wallet,
@@ -3101,7 +3125,7 @@ def run_domain_quest_volume_once(
                 )
                 skipped_wallets += 1
                 continue
-            if accumulated_volume > 0:
+            if check_existing_volume and accumulated_volume > 0:
                 logger.info(
                     _quest_log("wallet=%s recent %s volume for last %s days since %s = %s/%s | remaining_to_target=%s | planned_topup_to=%s"),
                     wallet,
@@ -3113,7 +3137,7 @@ def run_domain_quest_volume_once(
                     _format_decimal_plain(target_volume - accumulated_volume),
                     _format_decimal_plain(execution_target_volume),
                 )
-            else:
+            elif check_existing_volume:
                 logger.info(
                     _quest_log("wallet=%s recent %s volume for last %s days since %s = 0/%s | planned_topup_to=%s"),
                     wallet,
