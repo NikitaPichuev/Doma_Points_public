@@ -9056,7 +9056,7 @@ def run_doma_cost_report_once(
             _format_decimal_plain(wallet_total_cost),
             _format_decimal_plain(swap_volume),
         )
-        append_csv_row(
+        append_csv(
             cfg.points_csv_file.parent / DOMA_COST_REPORT_CSV.name,
             [
                 datetime.now(timezone.utc).isoformat(),
