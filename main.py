@@ -2752,7 +2752,7 @@ def get_domain_quest_token_choice() -> Optional[str]:
     return DOMAIN_QUEST_TOKENS[picked_idx - 1]
 
 
-def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str, str, str]]:
+def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str, str, str, str]]:
     _ = state
     domain_name = get_domain_quest_token_choice()
     if not domain_name:
@@ -2767,6 +2767,13 @@ def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str
 
     target_raw = input("Target volume in USDC.E [25]: ").strip() or "25"
     _ = _parse_decimal_input(target_raw)
+    print("\nVolume mode:")
+    print("1) Minimum single swap")
+    print("2) Total volume only")
+    volume_mode_raw = input("Select [1-2, default 2]: ").strip() or "2"
+    if volume_mode_raw not in {"1", "2"}:
+        raise ValueError("Invalid volume mode selection")
+    volume_mode = "single_swap" if volume_mode_raw == "1" else "volume_only"
     print("\nFinal asset:")
     print("1) USDC.E")
     print("2) ETH")
@@ -2774,14 +2781,14 @@ def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str
     if final_raw not in {"1", "2"}:
         raise ValueError("Invalid final asset selection")
     final_asset = "USDC.E" if final_raw == "1" else "ETH"
-    return domain_name, min_raw, max_raw, target_raw, final_asset
+    return domain_name, min_raw, max_raw, target_raw, final_asset, volume_mode
 
 
 def run_domain_quest_volume_once(
     cfg: BotConfig,
     logger: logging.Logger,
     state: BotState,
-    preset: Optional[Tuple[str, str, str, str, str]] = None,
+    preset: Optional[Tuple[str, ...]] = None,
 ) -> None:
     success_wallets = 0
     failed_wallets = 0
@@ -2798,11 +2805,18 @@ def run_domain_quest_volume_once(
     if not picked:
         logger.info("Domain quest volume canceled by user.")
         return
-    domain_name, min_raw, max_raw, target_raw, final_asset = picked
+    if len(picked) == 5:
+        domain_name, min_raw, max_raw, target_raw, final_asset = picked
+        volume_mode = "volume_only"
+    else:
+        domain_name, min_raw, max_raw, target_raw, final_asset, volume_mode = picked
+    if volume_mode not in {"single_swap", "volume_only"}:
+        raise ValueError("Invalid quest volume mode")
+    require_min_single_swap = volume_mode == "single_swap"
     target_volume = _parse_decimal_input(target_raw)
     quest_target_volume = min(target_volume, DOMAIN_QUEST_COMPLETION_THRESHOLD_USD)
     execution_target_volume = quest_target_volume + max(Decimal("1"), quest_target_volume * Decimal("0.10"))
-    min_single_swap_usd = quest_target_volume
+    min_single_swap_usd = quest_target_volume if require_min_single_swap else Decimal("0")
     partial_min = _parse_decimal_input(min_raw)
     partial_max = _parse_decimal_input(max_raw)
     if partial_min <= 0 or partial_max <= 0:
@@ -2859,7 +2873,7 @@ def run_domain_quest_volume_once(
     rides_pool_addresses = [launchpad_info.pool_address]
 
     logger.info(
-        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | lookback=%s days since=%s | target=%s USDC.E | quest_target=%s USDC.E | min_single_swap=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
+        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | lookback=%s days since=%s | target=%s USDC.E | quest_target=%s USDC.E | volume_mode=%s | min_single_swap=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
         domain_name,
         len(wallet_key_records),
         wallet_start_offset + 1,
@@ -2867,6 +2881,7 @@ def run_domain_quest_volume_once(
         volume_since.isoformat(),
         _format_decimal_plain(target_volume),
         _format_decimal_plain(quest_target_volume),
+        volume_mode,
         _format_decimal_plain(min_single_swap_usd),
         _format_decimal_plain(execution_target_volume),
         min_raw,
@@ -3081,7 +3096,7 @@ def run_domain_quest_volume_once(
                 )
             cycle = 0
             wallet_failed = False
-            min_single_swap_done = accumulated_volume >= quest_target_volume
+            min_single_swap_done = True if not require_min_single_swap else accumulated_volume >= quest_target_volume
 
             while accumulated_volume < execution_target_volume:
                 cycle += 1
@@ -3211,7 +3226,7 @@ def run_domain_quest_volume_once(
                     )
                     wallet_failed = True
                     break
-                if not min_single_swap_done and full_trade_usd < min_single_swap_usd:
+                if require_min_single_swap and not min_single_swap_done and full_trade_usd < min_single_swap_usd:
                     logger.warning(
                         _quest_log("wallet=%s cannot satisfy quest single-swap requirement | need >=%s USDC.E in one swap, available %s via %s"),
                         wallet,
@@ -3222,7 +3237,7 @@ def run_domain_quest_volume_once(
                     wallet_failed = True
                     break
                 if remaining_volume > 0 and remaining_volume < (full_trade_usd * Decimal("2")):
-                    min_full_step_usd = min_single_swap_usd if not min_single_swap_done else MIN_EXECUTABLE_TRADE_USD
+                    min_full_step_usd = min_single_swap_usd if require_min_single_swap and not min_single_swap_done else MIN_EXECUTABLE_TRADE_USD
                     capped_full_usd = min(
                         full_trade_usd,
                         max(min_full_step_usd, remaining_volume / Decimal("2")),
@@ -3282,7 +3297,7 @@ def run_domain_quest_volume_once(
                 if not ok_full or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
                     wallet_failed = True
                     break
-                if not min_single_swap_done and full_trade_usd < min_single_swap_usd:
+                if require_min_single_swap and not min_single_swap_done and full_trade_usd < min_single_swap_usd:
                     logger.warning(
                         _quest_log("wallet=%s executed swap below quest single-swap requirement | swap=%s/%s USDC.E"),
                         wallet,
@@ -3291,7 +3306,7 @@ def run_domain_quest_volume_once(
                     )
                     wallet_failed = True
                     break
-                if not min_single_swap_done and full_trade_usd >= min_single_swap_usd:
+                if require_min_single_swap and not min_single_swap_done and full_trade_usd >= min_single_swap_usd:
                     min_single_swap_done = True
                     logger.info(
                         _quest_log("wallet=%s single-swap requirement met | swap=%s/%s USDC.E"),
