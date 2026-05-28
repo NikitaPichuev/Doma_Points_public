@@ -81,7 +81,6 @@ ANSI_RED = "\033[91m"
 ANSI_YELLOW = "\033[93m"
 ANSI_CYAN = "\033[96m"
 MIN_EXECUTABLE_TRADE_USD = Decimal("0.10")
-DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS = 7
 DOMAIN_QUEST_COMPLETION_THRESHOLD_USD = Decimal("25")
 DOMAIN_QUEST_TOKENS = [
     "agenticconsultant.ai",
@@ -2804,7 +2803,7 @@ def get_domain_quest_menu_input(state: BotState) -> Optional[Tuple[str, str, str
         raise ValueError("Invalid volume mode selection")
     volume_mode = "single_swap" if volume_mode_raw == "1" else "volume_only"
     print("\nExisting volume check:")
-    print("1) Check last 7 days and skip completed wallets")
+    print("1) Check current UTC week and skip completed wallets")
     print("2) Ignore history and run selected wallets")
     history_mode_raw = input("Select [1-2, default 1]: ").strip() or "1"
     if history_mode_raw not in {"1", "2"}:
@@ -2872,7 +2871,7 @@ def run_domain_quest_volume_once(
     def _quest_log(message: str) -> str:
         return f"[{mode_label}] {message}"
 
-    volume_since = datetime.now(timezone.utc) - timedelta(days=DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS)
+    volume_since = _current_week_start_utc()
 
     wallet_key_records = _build_wallet_key_records(cfg, logger, "QUEST")
     if not wallet_key_records:
@@ -2916,11 +2915,10 @@ def run_domain_quest_volume_once(
     rides_pool_addresses = [launchpad_info.pool_address]
 
     logger.info(
-        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | lookback=%s days since=%s | history_mode=%s | target=%s USDC.E | quest_target=%s USDC.E | volume_mode=%s | min_single_swap=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
+        _quest_log("mode started | source=AUTO pair=USDC.E<->%s wallets=%s | start_wallet=%s | current_week_since=%s | history_mode=%s | target=%s USDC.E | quest_target=%s USDC.E | volume_mode=%s | min_single_swap=%s USDC.E | execution_target=%s USDC.E | pattern=auto-100%%->%s-%s%% | final=%s"),
         domain_name,
         len(wallet_key_records),
         wallet_start_offset + 1,
-        DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
         volume_since.isoformat(),
         history_mode,
         _format_decimal_plain(target_volume),
@@ -3114,10 +3112,9 @@ def run_domain_quest_volume_once(
             rides_completion_threshold = quest_target_volume
             if check_existing_volume and accumulated_volume >= rides_completion_threshold:
                 logger.info(
-                    _quest_log("wallet=%s already has %s volume for last %s days since %s = %s/%s | completion_threshold=%s | skipping wallet"),
+                    _quest_log("wallet=%s already has %s volume for current UTC week since %s = %s/%s | completion_threshold=%s | skipping wallet"),
                     wallet,
                     domain_name,
-                    DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
                     volume_since.isoformat(),
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(target_volume),
@@ -3127,10 +3124,9 @@ def run_domain_quest_volume_once(
                 continue
             if check_existing_volume and accumulated_volume > 0:
                 logger.info(
-                    _quest_log("wallet=%s recent %s volume for last %s days since %s = %s/%s | remaining_to_target=%s | planned_topup_to=%s"),
+                    _quest_log("wallet=%s current UTC week %s volume since %s = %s/%s | remaining_to_target=%s | planned_topup_to=%s"),
                     wallet,
                     domain_name,
-                    DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
                     volume_since.isoformat(),
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(target_volume),
@@ -3139,10 +3135,9 @@ def run_domain_quest_volume_once(
                 )
             elif check_existing_volume:
                 logger.info(
-                    _quest_log("wallet=%s recent %s volume for last %s days since %s = 0/%s | planned_topup_to=%s"),
+                    _quest_log("wallet=%s current UTC week %s volume since %s = 0/%s | planned_topup_to=%s"),
                     wallet,
                     domain_name,
-                    DOMAIN_QUEST_VOLUME_LOOKBACK_DAYS,
                     volume_since.isoformat(),
                     _format_decimal_plain(target_volume),
                     _format_decimal_plain(execution_target_volume),
