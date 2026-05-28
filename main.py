@@ -40,6 +40,7 @@ from doma_api import (
     pick_token_usd_price,
     raw_to_decimal,
 )
+from okx_api import OkxApiClient
 from relay_bridge import NATIVE_ETH, execute_relay_swap, run_bridge_tasks
 from strategy import StrategyEngine
 from position_manager import PositionManagerClient
@@ -115,6 +116,7 @@ DOMAIN_QUESTS_CSV = Path("quests.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
 DOMA_COST_REPORT_CSV = Path("doma_cost_report.csv")
+OKX_WITHDRAWALS_CSV = Path("okx_withdrawals.csv")
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.18")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
 WEEKLY_VOLUME_TOPUP_BUFFER_USD = Decimal("1")
@@ -2058,6 +2060,214 @@ def _format_decimal_plain(value: Decimal) -> str:
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s or "0"
+
+
+def _format_decimal_for_api(value: Decimal) -> str:
+    return _format_decimal_plain(value.normalize())
+
+
+def _random_okx_decimal_between(min_value: Decimal, max_value: Decimal, precision: int = 8) -> Decimal:
+    if max_value < min_value:
+        raise ValueError("Maximum amount must be >= minimum amount")
+    step = Decimal(1).scaleb(-precision)
+    min_units = int((min_value / step).to_integral_value(rounding=ROUND_CEILING))
+    max_units = int((max_value / step).to_integral_value(rounding=ROUND_FLOOR))
+    if max_units < min_units:
+        max_units = min_units
+    return (Decimal(random.randint(min_units, max_units)) * step).quantize(step)
+
+
+def _prompt_positive_decimal(prompt: str, default: str = "") -> Decimal:
+    suffix = f" [{default}]" if default else ""
+    while True:
+        raw = input(f"{prompt}{suffix}: ").strip() or default
+        try:
+            value = _parse_decimal_input(raw)
+        except Exception:
+            print("Enter a positive number.")
+            continue
+        if value > 0:
+            return value
+        print("Enter a positive number.")
+
+
+def _load_okx_withdraw_addresses(cfg: BotConfig, logger: logging.Logger) -> List[Tuple[int, str]]:
+    lines = _read_nonempty_lines(cfg.okx_withdraw_addresses_file)
+    records: List[Tuple[int, str]] = []
+    for line_idx, raw in enumerate(lines):
+        address = raw.split(";", 1)[0].split(",", 1)[0].strip()
+        if not _is_valid_evm_address(address):
+            logger.warning("[OKX_WITHDRAW] skip address line %s: invalid EVM address", line_idx + 1)
+            continue
+        records.append((line_idx, address.lower()))
+    return records
+
+
+def _apply_address_order(records: List[Tuple[int, str]], order: str) -> List[Tuple[int, str]]:
+    selected = list(records)
+    if order == "random":
+        random.shuffle(selected)
+    return selected
+
+
+def _append_okx_withdraw_csv(
+    cfg: BotConfig,
+    status: str,
+    address: str,
+    line_idx: int,
+    ccy: str,
+    chain: str,
+    amount: Decimal,
+    fee: Decimal,
+    withdraw_id: str,
+    client_id: str,
+    reason: str,
+) -> None:
+    append_csv(
+        cfg.points_csv_file.parent / OKX_WITHDRAWALS_CSV.name,
+        [
+            datetime.now(timezone.utc).isoformat(),
+            status,
+            address,
+            line_idx + 1,
+            ccy,
+            chain,
+            _format_decimal_for_api(amount),
+            _format_decimal_for_api(fee),
+            withdraw_id,
+            client_id,
+            reason,
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+
+def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    if not (cfg.okx_api_key and cfg.okx_secret_key and cfg.okx_passphrase):
+        raise RuntimeError(
+            f"OKX credentials are missing. Put api_key, secret_key and passphrase into {cfg.okx_api_keys_file} "
+            "on separate lines, or set OKX_API_KEY/OKX_SECRET_KEY/OKX_PASSPHRASE."
+        )
+
+    records = _load_okx_withdraw_addresses(cfg, logger)
+    if not records:
+        raise RuntimeError(f"No valid EVM addresses found in {cfg.okx_withdraw_addresses_file}")
+
+    print("\nWithdraw from OKX to addresses:")
+    ccy = input("Currency, e.g. ETH/USDT/USDC [ETH]: ").strip().upper() or "ETH"
+    chain = input("OKX chain, e.g. ETH-Base / USDT-Polygon / ETH-Arbitrum One: ").strip()
+    if not chain:
+        raise ValueError("OKX chain is required")
+
+    print("Amount mode:")
+    print("1) Fixed amount")
+    print("2) Random amount from min/max")
+    amount_mode = input("Select [1-2, default 1]: ").strip() or "1"
+    if amount_mode == "2":
+        min_amount = _prompt_positive_decimal("Minimum amount per address")
+        max_amount = _prompt_positive_decimal("Maximum amount per address")
+        if max_amount < min_amount:
+            raise ValueError("Maximum amount must be >= minimum amount")
+        fixed_amount = Decimal("0")
+    else:
+        fixed_amount = _prompt_positive_decimal("Amount per address")
+        min_amount = fixed_amount
+        max_amount = fixed_amount
+
+    client = OkxApiClient(
+        cfg.okx_api_key,
+        cfg.okx_secret_key,
+        cfg.okx_passphrase,
+        base_url=cfg.okx_base_url,
+    )
+    fee_raw = input("Withdraw fee [blank = OKX minimum fee for this chain]: ").strip()
+    if fee_raw:
+        fee = _parse_decimal_input(fee_raw)
+    else:
+        fee = client.get_min_withdraw_fee(ccy, chain)
+        logger.info("[OKX_WITHDRAW] fee resolved from OKX | ccy=%s | chain=%s | fee=%s", ccy, chain, fee)
+
+    delay_min = _prompt_positive_decimal("Minimum delay between withdrawals sec", "10")
+    delay_max = _prompt_positive_decimal("Maximum delay between withdrawals sec", "30")
+    if delay_max < delay_min:
+        raise ValueError("Maximum delay must be >= minimum delay")
+
+    start_number = _prompt_start_wallet_number(len(records))
+    order = _prompt_wallet_order(default_random=True)
+    selected = _apply_address_order(records[start_number - 1 :], order)
+
+    print("Execution:")
+    print("1) Dry-run only")
+    print("2) LIVE withdraw")
+    execution = input("Select [1-2, default 1]: ").strip() or "1"
+    live = execution == "2"
+    if live:
+        confirm = input("Type WITHDRAW OKX to confirm real exchange withdrawals: ").strip()
+        if confirm != "WITHDRAW OKX":
+            logger.warning("[OKX_WITHDRAW] live mode canceled: confirmation phrase mismatch")
+            return
+
+    logger.info(
+        "[OKX_WITHDRAW] mode started | addresses=%s | start_address=%s | order=%s | ccy=%s | chain=%s | amount=%s-%s | fee=%s | live=%s",
+        len(records),
+        start_number,
+        order,
+        ccy,
+        chain,
+        _format_decimal_for_api(min_amount),
+        _format_decimal_for_api(max_amount),
+        _format_decimal_for_api(fee),
+        live,
+    )
+
+    success = 0
+    failed = 0
+    failed_addresses: List[str] = []
+    for position, (line_idx, address) in enumerate(selected, start=start_number):
+        amount = fixed_amount if amount_mode != "2" else _random_okx_decimal_between(min_amount, max_amount)
+        client_id = f"doma{line_idx + 1}{int(time.time() * 1000)}"[:32]
+        try:
+            if not live:
+                logger.info(
+                    "[OKX_WITHDRAW] dry-run address %s/%s line=%s to=%s | %s %s | fee=%s",
+                    position,
+                    len(records),
+                    line_idx + 1,
+                    address,
+                    _format_decimal_for_api(amount),
+                    ccy,
+                    _format_decimal_for_api(fee),
+                )
+                _append_okx_withdraw_csv(cfg, "dry_run", address, line_idx, ccy, chain, amount, fee, "", client_id, "")
+            else:
+                logger.info(
+                    "[OKX_WITHDRAW] address %s/%s line=%s to=%s | %s %s | fee=%s",
+                    position,
+                    len(records),
+                    line_idx + 1,
+                    address,
+                    _format_decimal_for_api(amount),
+                    ccy,
+                    _format_decimal_for_api(fee),
+                )
+                result = client.withdraw(ccy, chain, amount, fee, address, client_id=client_id)
+                withdraw_id = str(result.get("wdId") or result.get("id") or "")
+                logger.info("[OKX_WITHDRAW] sent | address=%s | withdraw_id=%s | client_id=%s", address, withdraw_id, client_id)
+                _append_okx_withdraw_csv(cfg, "sent", address, line_idx, ccy, chain, amount, fee, withdraw_id, client_id, "")
+            success += 1
+        except Exception as exc:
+            failed += 1
+            failed_addresses.append(address)
+            logger.warning("[OKX_WITHDRAW] address=%s failed: %s", address, exc)
+            _append_okx_withdraw_csv(cfg, "failed", address, line_idx, ccy, chain, amount, fee, "", client_id, str(exc))
+
+        if position < len(records):
+            delay_sec = random.uniform(float(delay_min), float(delay_max))
+            logger.info("[OKX_WITHDRAW] delay before next address: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    _print_mode_summary("OKX_WITHDRAW", len(selected), success, failed, 0, failed_addresses)
 
 
 def _volume_added_from_usdc_balance_change(before_usdc: Decimal, after_usdc: Decimal, input_symbol: str) -> Decimal:
@@ -9186,8 +9396,9 @@ def get_menu_choice() -> str:
     print("16) Weekly ETH/USDC.E volume")
     print("17) Daily .com top TVL swaps")
     print("18) Close/unstake subdomains")
-    print("19) Exit")
-    return input("Select [1-19]: ").strip()
+    print("19) Withdraw from OKX to addresses")
+    print("20) Exit")
+    return input("Select [1-20]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -9331,6 +9542,23 @@ def main() -> None:
             "completed",
             "completed_at",
             "available_at",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+    ensure_csv(
+        cfg.points_csv_file.parent / OKX_WITHDRAWALS_CSV.name,
+        [
+            "timestamp_utc",
+            "status",
+            "address",
+            "line",
+            "ccy",
+            "chain",
+            "amount",
+            "fee",
+            "withdraw_id",
+            "client_id",
+            "reason",
         ],
         delimiter=cfg.csv_delimiter,
     )
@@ -9510,6 +9738,14 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Subdomain close mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "19":
+            try:
+                run_okx_withdrawals_once(cfg, logger, state)
+            except Exception as exc:
+                logger.exception("OKX withdrawal mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return
