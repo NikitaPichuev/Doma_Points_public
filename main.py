@@ -8576,7 +8576,7 @@ def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) 
     )
 
 
-def get_volume_farm_menu_input(state: BotState) -> Optional[Tuple[str, str, str]]:
+def get_volume_farm_menu_input(state: BotState, default_check_weekly: bool = False) -> Optional[Tuple[str, str, str, str]]:
     _ = state
     print("\nFarm volume ETH <-> USDC.E:")
     print("\nPartial return percent range:")
@@ -8587,7 +8587,15 @@ def get_volume_farm_menu_input(state: BotState) -> Optional[Tuple[str, str, str]
 
     target_raw = input("Target volume in USDC.E [251]: ").strip() or "251"
     _ = _parse_decimal_input(target_raw)
-    return min_raw, max_raw, target_raw
+    print("\nExisting ETH/USDC.E volume check:")
+    print("1) Check current UTC week and only top up remaining volume")
+    print("2) Ignore history and run selected wallets")
+    default_raw = "1" if default_check_weekly else "2"
+    history_mode_raw = input(f"Select [1-2, default {default_raw}]: ").strip() or default_raw
+    if history_mode_raw not in {"1", "2"}:
+        raise ValueError("Invalid ETH/USDC.E volume check selection")
+    history_mode = "check_topup" if history_mode_raw == "1" else "ignore"
+    return min_raw, max_raw, target_raw, history_mode
 
 
 def _eth_usdce_pool_addresses_from_pools(pools: List[Pool]) -> List[str]:
@@ -8653,7 +8661,7 @@ def run_volume_farm_once(
     cfg: BotConfig,
     logger: logging.Logger,
     state: BotState,
-    preset: Optional[Tuple[str, str, str]] = None,
+    preset: Optional[Tuple[str, ...]] = None,
     weekly_remaining: bool = False,
 ) -> None:
     success_wallets = 0
@@ -8667,13 +8675,20 @@ def run_volume_farm_once(
         if wallet not in failed_wallet_addresses:
             failed_wallet_addresses.append(wallet)
 
-    picked = preset or get_volume_farm_menu_input(state)
+    picked = preset or get_volume_farm_menu_input(state, default_check_weekly=weekly_remaining)
     if not picked:
         logger.info("Volume farm canceled by user.")
         return
-    min_raw, max_raw, target_raw = picked
+    if len(picked) == 3:
+        min_raw, max_raw, target_raw = picked
+        history_mode = "check_topup" if weekly_remaining else "ignore"
+    else:
+        min_raw, max_raw, target_raw, history_mode = picked
+    if history_mode not in {"check_topup", "ignore"}:
+        raise ValueError("Invalid ETH/USDC.E history mode")
     target_volume = _parse_decimal_input(target_raw)
-    weekly_since = _current_week_start_utc() if weekly_remaining else None
+    check_weekly_volume = history_mode == "check_topup"
+    weekly_since = _current_week_start_utc() if check_weekly_volume else None
 
     wallet_key_records = _build_wallet_key_records(cfg, logger, "VOLUME")
     if not wallet_key_records:
@@ -8684,11 +8699,11 @@ def run_volume_farm_once(
     wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
 
     logger.info(
-        "[VOLUME] mode started | source=AUTO pair=ETH<->USDC.E wallets=%s | start_wallet=%s | target=%s USDC.E | weekly_remaining=%s%s | pattern=auto-100%%->%s-%s%% | final=ETH",
+        "[VOLUME] mode started | source=AUTO pair=ETH<->USDC.E wallets=%s | start_wallet=%s | target=%s USDC.E | history_mode=%s%s | pattern=auto-100%%->%s-%s%% | final=ETH",
         len(wallet_key_records),
         wallet_start_offset + 1,
         _format_decimal_plain(target_volume),
-        "yes" if weekly_remaining else "no",
+        history_mode,
         f" since={weekly_since.isoformat()}" if weekly_since else "",
         min_raw,
         max_raw,
