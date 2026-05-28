@@ -455,6 +455,23 @@ def _prompt_start_wallet_number(total_wallets: int) -> int:
         print(f"Enter a number from 1 to {total_wallets}.")
 
 
+def _prompt_end_wallet_number(total_wallets: int, start_number: int) -> int:
+    if total_wallets <= 1:
+        return total_wallets
+    while True:
+        raw = input(f"End at wallet number [{start_number}-{total_wallets}, default {total_wallets}]: ").strip()
+        if not raw:
+            return total_wallets
+        try:
+            value = int(raw)
+        except ValueError:
+            print(f"Enter a number from {start_number} to {total_wallets}.")
+            continue
+        if start_number <= value <= total_wallets:
+            return value
+        print(f"Enter a number from {start_number} to {total_wallets}.")
+
+
 def _prompt_wallet_order(default_random: bool = True) -> str:
     default = "1" if default_random else "2"
     while True:
@@ -479,9 +496,10 @@ def _apply_wallet_order(records: List[Tuple[int, str, str]], order: str) -> List
 def _apply_wallet_start_selection(records: List[Tuple[int, str, str]]) -> Tuple[List[Tuple[int, str, str]], int, int]:
     total_wallets = len(records)
     start_number = _prompt_start_wallet_number(total_wallets)
+    end_number = _prompt_end_wallet_number(total_wallets, start_number)
     order = _prompt_wallet_order(default_random=True)
     start_offset = start_number - 1
-    return _apply_wallet_order(records[start_offset:], order), start_offset, total_wallets
+    return _apply_wallet_order(records[start_offset:end_number], order), start_offset, total_wallets
 
 
 def _proxy_for_line(
@@ -1572,8 +1590,9 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
         logger.warning("Points check skipped: no wallets configured")
         return
     start_number = _prompt_start_wallet_number(len(wallets))
+    end_number = _prompt_end_wallet_number(len(wallets), start_number)
     start_offset = start_number - 1
-    wallet_records = list(enumerate(wallets))[start_offset:]
+    wallet_records = list(enumerate(wallets))[start_offset:end_number]
     points_wallet_order = _prompt_wallet_order(default_random=True)
     if points_wallet_order == "random":
         random.shuffle(wallet_records)
@@ -1603,13 +1622,20 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
 
     try:
         cost_since = datetime.now(timezone.utc) - timedelta(days=7)
-        run_doma_cost_report_once(cfg, logger, state, preset=(cost_since, start_offset), report_label="last_7d", wallet_order=points_wallet_order)
+        run_doma_cost_report_once(
+            cfg,
+            logger,
+            state,
+            preset=(cost_since, start_offset, end_number),
+            report_label="last_7d",
+            wallet_order=points_wallet_order,
+        )
         for period_label, period_since, period_until in _derive_current_season_ranges(cfg, logger, wallets):
             run_doma_cost_report_once(
                 cfg,
                 logger,
                 state,
-                preset=(period_since, start_offset),
+                preset=(period_since, start_offset, end_number),
                 report_label=period_label,
                 until=period_until,
                 wallet_order=points_wallet_order,
@@ -2194,8 +2220,9 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         raise ValueError("Maximum delay must be >= minimum delay")
 
     start_number = _prompt_start_wallet_number(len(records))
+    end_number = _prompt_end_wallet_number(len(records), start_number)
     order = _prompt_wallet_order(default_random=True)
-    selected = _apply_address_order(records[start_number - 1 :], order)
+    selected = _apply_address_order(records[start_number - 1 : end_number], order)
 
     print("Execution:")
     print("1) Dry-run only")
@@ -2209,9 +2236,10 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             return
 
     logger.info(
-        "[OKX_WITHDRAW] mode started | addresses=%s | start_address=%s | order=%s | ccy=%s | chain=%s | amount=%s-%s | fee=%s | live=%s",
+        "[OKX_WITHDRAW] mode started | addresses=%s | start_address=%s | end_address=%s | order=%s | ccy=%s | chain=%s | amount=%s-%s | fee=%s | live=%s",
         len(records),
         start_number,
+        end_number,
         order,
         ccy,
         chain,
@@ -2224,15 +2252,16 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     success = 0
     failed = 0
     failed_addresses: List[str] = []
-    for position, (line_idx, address) in enumerate(selected, start=start_number):
+    selected_count = len(selected)
+    for offset, (line_idx, address) in enumerate(selected):
         amount = fixed_amount if amount_mode != "2" else _random_okx_decimal_between(min_amount, max_amount)
         client_id = f"doma{line_idx + 1}{int(time.time() * 1000)}"[:32]
         try:
             if not live:
                 logger.info(
                     "[OKX_WITHDRAW] dry-run address %s/%s line=%s to=%s | %s %s | fee=%s",
-                    position,
-                    len(records),
+                    offset + 1,
+                    selected_count,
                     line_idx + 1,
                     address,
                     _format_decimal_for_api(amount),
@@ -2243,8 +2272,8 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             else:
                 logger.info(
                     "[OKX_WITHDRAW] address %s/%s line=%s to=%s | %s %s | fee=%s",
-                    position,
-                    len(records),
+                    offset + 1,
+                    selected_count,
                     line_idx + 1,
                     address,
                     _format_decimal_for_api(amount),
@@ -2262,7 +2291,7 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             logger.warning("[OKX_WITHDRAW] address=%s failed: %s", address, exc)
             _append_okx_withdraw_csv(cfg, "failed", address, line_idx, ccy, chain, amount, fee, "", client_id, str(exc))
 
-        if position < len(records):
+        if offset < selected_count - 1:
             delay_sec = random.uniform(float(delay_min), float(delay_max))
             logger.info("[OKX_WITHDRAW] delay before next address: %.2f sec", delay_sec)
             time.sleep(delay_sec)
@@ -9051,18 +9080,16 @@ def run_volume_farm_once(
     )
 
 
-def get_doma_cost_report_menu_input(wallet_count: int) -> Optional[Tuple[Optional[datetime], int]]:
+def get_doma_cost_report_menu_input(wallet_count: int) -> Optional[Tuple[Optional[datetime], int, int]]:
     print("\nDoma cost report:")
     lookback_raw = input("Lookback days [7, 0 = all available explorer history]: ").strip() or "7"
     lookback_days = int(_parse_decimal_input(lookback_raw))
     if lookback_days < 0:
         raise ValueError("Lookback days cannot be negative")
     since = None if lookback_days == 0 else datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    start_raw = input(f"Start from wallet number [1-{wallet_count}, default 1]: ").strip() or "1"
-    start_number = int(start_raw)
-    if start_number < 1 or start_number > wallet_count:
-        raise ValueError("Invalid start wallet number")
-    return since, start_number - 1
+    start_number = _prompt_start_wallet_number(wallet_count)
+    end_number = _prompt_end_wallet_number(wallet_count, start_number)
+    return since, start_number - 1, end_number
 
 
 def _safe_decimal_from_raw(value: object, decimals: int) -> Decimal:
@@ -9166,7 +9193,7 @@ def run_doma_cost_report_once(
     cfg: BotConfig,
     logger: logging.Logger,
     state: BotState,
-    preset: Optional[Tuple[Optional[datetime], int]] = None,
+    preset: Optional[Tuple[Optional[datetime], ...]] = None,
     report_label: str = "custom",
     until: Optional[datetime] = None,
     wallet_order: str = "random",
@@ -9174,7 +9201,12 @@ def run_doma_cost_report_once(
     wallets = [w for w in cfg.points_wallets if _is_valid_evm_address(w)]
     if not wallets:
         raise ValueError("No wallets available for Doma cost report")
-    since, start_offset = preset or get_doma_cost_report_menu_input(len(wallets))
+    picked = preset or get_doma_cost_report_menu_input(len(wallets))
+    if len(picked) == 2:
+        since, start_offset = picked
+        end_number = len(wallets)
+    else:
+        since, start_offset, end_number = picked
     quote_token = _usdce_token_from_config(cfg)
 
     ensure_csv(
@@ -9205,15 +9237,16 @@ def run_doma_cost_report_once(
     total_cost = Decimal("0")
 
     logger.info(
-        "[COST] mode started | period=%s | wallets=%s | start_wallet=%s | since=%s | until=%s | slippage=estimated",
+        "[COST] mode started | period=%s | wallets=%s | start_wallet=%s | end_wallet=%s | since=%s | until=%s | slippage=estimated",
         report_label,
         len(wallets),
         start_offset + 1,
+        end_number,
         since.isoformat() if since else "all",
         until.isoformat() if until else "now",
     )
 
-    wallet_records = list(enumerate(wallets))[start_offset:]
+    wallet_records = list(enumerate(wallets))[start_offset:end_number]
     if preset is None:
         wallet_order = _prompt_wallet_order(default_random=True)
     if wallet_order == "random":
