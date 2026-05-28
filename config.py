@@ -78,6 +78,7 @@ class BotConfig:
     api_keys_file: Path = Path(os.getenv("API_KEYS_FILE", "api_keys.txt"))
     wallets_file: Path = Path(os.getenv("WALLETS_FILE", "wallets.txt"))
     proxy_file: Path = Path(os.getenv("PROXY_FILE", "proxies.txt"))
+    okx_api_keys_file: Path = Path(os.getenv("OKX_API_KEYS_FILE", "okx_api_keys.txt"))
     contracts_file: Path = Path(os.getenv("CONTRACTS_FILE", "contracts.json"))
     allowlist_pools_file: Path = Path(os.getenv("ALLOWLIST_POOLS_FILE", "allowlist_pools.txt"))
     state_file: Path = Path(os.getenv("STATE_FILE", "state.json"))
@@ -86,6 +87,7 @@ class BotConfig:
     trades_csv_file: Path = Path(os.getenv("TRADES_CSV_FILE", "trades.csv"))
     points_csv_file: Path = Path(os.getenv("POINTS_CSV_FILE", "points.csv"))
     replay_csv_file: Path = Path(os.getenv("REPLAY_CSV_FILE", "trades.csv"))
+    okx_withdraw_addresses_file: Path = Path(os.getenv("OKX_WITHDRAW_ADDRESSES_FILE", os.getenv("WALLETS_FILE", "wallets.txt")))
 
     # Account
     account_address: str = os.getenv("ACCOUNT_ADDRESS", "").lower()
@@ -183,7 +185,26 @@ class BotConfig:
     wallet_delay_min_sec: float = float(os.getenv("WALLET_DELAY_MIN_SEC", "10"))
     wallet_delay_max_sec: float = float(os.getenv("WALLET_DELAY_MAX_SEC", "20"))
 
+    # OKX withdrawals
+    okx_api_key: str = os.getenv("OKX_API_KEY", "")
+    okx_secret_key: str = os.getenv("OKX_SECRET_KEY", "")
+    okx_passphrase: str = os.getenv("OKX_PASSPHRASE", "")
+    okx_base_url: str = os.getenv("OKX_BASE_URL", "https://www.okx.com")
+
     def __post_init__(self) -> None:
+        if not (self.okx_api_key and self.okx_secret_key and self.okx_passphrase):
+            okx_lines = _read_nonempty_lines(self.okx_api_keys_file)
+            if len(okx_lines) >= 3:
+                self.okx_api_key = self.okx_api_key or okx_lines[0]
+                self.okx_secret_key = self.okx_secret_key or okx_lines[1]
+                self.okx_passphrase = self.okx_passphrase or okx_lines[2]
+            elif len(okx_lines) == 1:
+                parts = [x.strip() for x in re.split(r"[;,|]", okx_lines[0]) if x.strip()]
+                if len(parts) >= 3:
+                    self.okx_api_key = self.okx_api_key or parts[0]
+                    self.okx_secret_key = self.okx_secret_key or parts[1]
+                    self.okx_passphrase = self.okx_passphrase or parts[2]
+
         if not self.private_key:
             self.private_key = _read_first_nonempty_line(self.keys_file)
         file_api_keys = _read_nonempty_lines(self.api_keys_file)

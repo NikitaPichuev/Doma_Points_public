@@ -1,6 +1,7 @@
 .env
 keys.txt
 api_keys.txt
+okx_api_keys.txt
 proxies.txt
 wallets.txt
 state.json

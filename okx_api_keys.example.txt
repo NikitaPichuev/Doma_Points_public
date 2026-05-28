@@ -1,0 +1,10 @@
+# Copy to okx_api_keys.txt and fill real values.
+# Do not commit okx_api_keys.txt.
+#
+# Format 1, three lines:
+OKX_API_KEY_HERE
+OKX_SECRET_KEY_HERE
+OKX_API_PASSPHRASE_HERE
+#
+# Format 2, one line:
+# OKX_API_KEY_HERE;OKX_SECRET_KEY_HERE;OKX_API_PASSPHRASE_HERE
