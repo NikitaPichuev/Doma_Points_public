@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import requests
 import signal
 import subprocess
 import sys
@@ -151,6 +152,40 @@ def _current_week_start_utc() -> datetime:
     now = datetime.now(timezone.utc)
     today_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     return today_utc - timedelta(days=now.weekday())
+
+
+def _fetch_public_eth_price_usd(proxies: Optional[Dict[str, str]] = None) -> Decimal:
+    errors: List[str] = []
+    try:
+        resp = requests.get(
+            "https://api.coinbase.com/v2/exchange-rates",
+            params={"currency": "ETH"},
+            timeout=15,
+            proxies=proxies,
+        )
+        resp.raise_for_status()
+        usd_raw = ((resp.json().get("data") or {}).get("rates") or {}).get("USD")
+        price = Decimal(str(usd_raw or "0"))
+        if price > 0:
+            return price
+    except Exception as exc:
+        errors.append(f"coinbase: {exc}")
+
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": "ETHUSDT"},
+            timeout=15,
+            proxies=proxies,
+        )
+        resp.raise_for_status()
+        price = Decimal(str(resp.json().get("price") or "0"))
+        if price > 0:
+            return price
+    except Exception as exc:
+        errors.append(f"binance: {exc}")
+
+    raise RuntimeError("Failed to resolve public ETH/USD price: " + " | ".join(errors))
 
 
 def _is_proxy_connectivity_error(exc: Exception) -> bool:
@@ -1755,6 +1790,9 @@ def run_bridge_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     for raw in bridge_tasks:
         try:
             _left, _pair, amount_expr = [x.strip() for x in raw.split(":", 2)]
+            amount_expr_lc = amount_expr.strip().lower()
+            if amount_expr_lc.startswith(("rand_percent(", "rand_token(")):
+                continue
             mode, _ = parse_trade_amount_expression(amount_expr)
             if mode == "usd":
                 need_eth_price = True
@@ -1766,8 +1804,22 @@ def run_bridge_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     def _resolve_eth_price(active_proxies: Optional[Dict[str, str]]) -> Decimal:
         if not need_eth_price:
             return Decimal("0")
-        subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=active_proxies)
-        return subgraph.fetch_eth_price_usd()
+        errors: List[str] = []
+        try:
+            subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=active_proxies)
+            price = subgraph.fetch_eth_price_usd()
+            if price > 0:
+                return price
+        except Exception as exc:
+            errors.append(f"doma_subgraph: {exc}")
+        try:
+            price = _fetch_public_eth_price_usd(active_proxies)
+            if price > 0:
+                logger.info("[BRIDGE] ETH/USD resolved via public fallback: %s", _format_decimal_plain(price))
+                return price
+        except Exception as exc:
+            errors.append(str(exc))
+        raise RuntimeError("Failed to resolve ETH/USD for bridge: " + " | ".join(errors))
 
     def _expand_bridge_tasks_for_wallet(tasks: List[str]) -> List[str]:
         expanded: List[str] = []
