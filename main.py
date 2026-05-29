@@ -9383,25 +9383,41 @@ def run_doma_cost_report_once(
 
 
 def get_bridge_tasks_from_menu(state: BotState) -> Optional[List[str]]:
+    _ = state
+    bridge_routes = {
+        "1": ("Base -> Doma | ETH -> ETH", "base", "doma", "ETH", "ETH"),
+        "2": ("Base -> Doma | ETH -> USDC.E", "base", "doma", "ETH", "USDC.E"),
+        "3": ("Arbitrum -> Doma | ETH -> ETH", "arbitrum", "doma", "ETH", "ETH"),
+        "4": ("Arbitrum -> Doma | ETH -> USDC.E", "arbitrum", "doma", "ETH", "USDC.E"),
+        "5": ("Optimism -> Doma | ETH -> ETH", "optimism", "doma", "ETH", "ETH"),
+        "6": ("Optimism -> Doma | ETH -> USDC.E", "optimism", "doma", "ETH", "USDC.E"),
+        "7": ("Doma -> Arbitrum | ETH -> ETH", "doma", "arbitrum", "ETH", "ETH"),
+        "8": ("Doma -> Arbitrum | USDC.E -> USDC", "doma", "arbitrum", "USDC.E", "USDC"),
+        "9": ("Doma -> Optimism | ETH -> ETH", "doma", "optimism", "ETH", "ETH"),
+        "10": ("Doma -> Optimism | USDC.E -> USDC", "doma", "optimism", "USDC.E", "USDC"),
+    }
+    back_choice = str(len(bridge_routes) + 2)
     print("\nBridge routes (Relay):")
-    print("1) Base -> Doma | ETH -> ETH")
-    print("2) Base -> Doma | ETH -> USDC.E")
-    print("3) Mantle + Blast -> Doma | all native ETH -> ETH")
-    print("4) Back")
-    route = input("Select [1-4]: ").strip()
-    if route == "4":
+    for key, (label, *_rest) in bridge_routes.items():
+        print(f"{key}) {label}")
+    mantle_blast_choice = str(len(bridge_routes) + 1)
+    print(f"{mantle_blast_choice}) Mantle + Blast -> Doma | all native ETH -> ETH")
+    print(f"{back_choice}) Back")
+    route = input(f"Select [1-{back_choice}]: ").strip()
+    if route == back_choice:
         return None
-    if route not in {"1", "2", "3"}:
+    if route not in set(bridge_routes) | {mantle_blast_choice}:
         raise ValueError("Invalid bridge route selection")
 
-    if route == "3":
+    if route == mantle_blast_choice:
         return [
             "mantle>doma:ETH>ETH:100%",
             "blast>doma:ETH>ETH:100%",
         ]
 
+    _label, src_chain, dst_chain, src_symbol, dst_symbol = bridge_routes[route]
     print("\nAmount mode:")
-    print("1) Number (ETH)")
+    print(f"1) Number ({src_symbol})")
     print("2) Percent (%)")
     amount_mode_raw = input("Select [1-2]: ").strip()
     if amount_mode_raw not in {"1", "2"}:
@@ -9418,9 +9434,7 @@ def get_bridge_tasks_from_menu(state: BotState) -> Optional[List[str]]:
         else f"rand_percent({min_raw}|{max_raw})"
     )
 
-    if route == "1":
-        return [f"base>doma:ETH>ETH:{expr_1}"]
-    return [f"base>doma:ETH>USDC.E:{expr_1}"]
+    return [f"{src_chain}>{dst_chain}:{src_symbol}>{dst_symbol}:{expr_1}"]
 
 
 def run_swap_loop(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
