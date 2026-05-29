@@ -9384,29 +9384,46 @@ def run_doma_cost_report_once(
 
 def get_bridge_tasks_from_menu(state: BotState) -> Optional[List[str]]:
     _ = state
-    bridge_routes = {
-        "1": ("Base -> Doma | ETH -> ETH", "base", "doma", "ETH", "ETH"),
-        "2": ("Base -> Doma | ETH -> USDC.E", "base", "doma", "ETH", "USDC.E"),
-        "3": ("Arbitrum -> Doma | ETH -> ETH", "arbitrum", "doma", "ETH", "ETH"),
-        "4": ("Arbitrum -> Doma | ETH -> USDC.E", "arbitrum", "doma", "ETH", "USDC.E"),
-        "5": ("Optimism -> Doma | ETH -> ETH", "optimism", "doma", "ETH", "ETH"),
-        "6": ("Optimism -> Doma | ETH -> USDC.E", "optimism", "doma", "ETH", "USDC.E"),
-        "7": ("Doma -> Arbitrum | ETH -> ETH", "doma", "arbitrum", "ETH", "ETH"),
-        "8": ("Doma -> Arbitrum | USDC.E -> USDC", "doma", "arbitrum", "USDC.E", "USDC"),
-        "9": ("Doma -> Optimism | ETH -> ETH", "doma", "optimism", "ETH", "ETH"),
-        "10": ("Doma -> Optimism | USDC.E -> USDC", "doma", "optimism", "USDC.E", "USDC"),
+    route_groups = {
+        "1": (
+            "Base <-> Doma",
+            [
+                ("Base -> Doma | ETH -> ETH", "base", "doma", "ETH", "ETH"),
+                ("Base -> Doma | ETH -> USDC.E", "base", "doma", "ETH", "USDC.E"),
+                ("Doma -> Base | ETH -> ETH", "doma", "base", "ETH", "ETH"),
+                ("Doma -> Base | USDC.E -> USDC", "doma", "base", "USDC.E", "USDC"),
+            ],
+        ),
+        "2": (
+            "Arbitrum <-> Doma",
+            [
+                ("Arbitrum -> Doma | ETH -> ETH", "arbitrum", "doma", "ETH", "ETH"),
+                ("Arbitrum -> Doma | ETH -> USDC.E", "arbitrum", "doma", "ETH", "USDC.E"),
+                ("Doma -> Arbitrum | ETH -> ETH", "doma", "arbitrum", "ETH", "ETH"),
+                ("Doma -> Arbitrum | USDC.E -> USDC", "doma", "arbitrum", "USDC.E", "USDC"),
+            ],
+        ),
+        "3": (
+            "Optimism <-> Doma",
+            [
+                ("Optimism -> Doma | ETH -> ETH", "optimism", "doma", "ETH", "ETH"),
+                ("Optimism -> Doma | ETH -> USDC.E", "optimism", "doma", "ETH", "USDC.E"),
+                ("Doma -> Optimism | ETH -> ETH", "doma", "optimism", "ETH", "ETH"),
+                ("Doma -> Optimism | USDC.E -> USDC", "doma", "optimism", "USDC.E", "USDC"),
+            ],
+        ),
     }
-    back_choice = str(len(bridge_routes) + 2)
     print("\nBridge routes (Relay):")
-    for key, (label, *_rest) in bridge_routes.items():
+    for key, (label, _routes) in route_groups.items():
         print(f"{key}) {label}")
-    mantle_blast_choice = str(len(bridge_routes) + 1)
+    mantle_blast_choice = str(len(route_groups) + 1)
+    back_choice = str(len(route_groups) + 2)
     print(f"{mantle_blast_choice}) Mantle + Blast -> Doma | all native ETH -> ETH")
     print(f"{back_choice}) Back")
     route = input(f"Select [1-{back_choice}]: ").strip()
     if route == back_choice:
         return None
-    if route not in set(bridge_routes) | {mantle_blast_choice}:
+    if route not in set(route_groups) | {mantle_blast_choice}:
         raise ValueError("Invalid bridge route selection")
 
     if route == mantle_blast_choice:
@@ -9415,7 +9432,23 @@ def get_bridge_tasks_from_menu(state: BotState) -> Optional[List[str]]:
             "blast>doma:ETH>ETH:100%",
         ]
 
-    _label, src_chain, dst_chain, src_symbol, dst_symbol = bridge_routes[route]
+    group_label, group_routes = route_groups[route]
+    group_back_choice = str(len(group_routes) + 1)
+    print(f"\n{group_label}:")
+    for idx, (label, *_rest) in enumerate(group_routes, start=1):
+        print(f"{idx}) {label}")
+    print(f"{group_back_choice}) Back")
+    route_raw = input(f"Select [1-{group_back_choice}]: ").strip()
+    if route_raw == group_back_choice:
+        return None
+    try:
+        route_idx = int(route_raw)
+    except ValueError as exc:
+        raise ValueError("Invalid bridge sub-route selection") from exc
+    if not 1 <= route_idx <= len(group_routes):
+        raise ValueError("Invalid bridge sub-route selection")
+
+    _label, src_chain, dst_chain, src_symbol, dst_symbol = group_routes[route_idx - 1]
     print("\nAmount mode:")
     print(f"1) Number ({src_symbol})")
     print("2) Percent (%)")
