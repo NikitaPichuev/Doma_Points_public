@@ -2909,7 +2909,7 @@ def run_domain_quest_volume_once(
     check_existing_volume = history_mode == "check_skip"
     target_volume = _parse_decimal_input(target_raw)
     quest_target_volume = min(target_volume, DOMAIN_QUEST_COMPLETION_THRESHOLD_USD)
-    execution_target_volume = quest_target_volume + max(Decimal("1"), quest_target_volume * Decimal("0.10"))
+    execution_target_volume = quest_target_volume + max(Decimal("0.10"), quest_target_volume * Decimal("0.10"))
     min_single_swap_usd = quest_target_volume if require_min_single_swap else Decimal("0")
     partial_min = _parse_decimal_input(min_raw)
     partial_max = _parse_decimal_input(max_raw)
