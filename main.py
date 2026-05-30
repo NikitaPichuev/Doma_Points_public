@@ -2219,7 +2219,39 @@ def _append_okx_withdraw_csv(
     )
 
 
-def _prompt_okx_currency_and_chain(client: OkxApiClient, logger: logging.Logger) -> Tuple[str, str]:
+def _okx_decimal_field(item: Dict[str, Any], names: List[str]) -> Optional[Decimal]:
+    for name in names:
+        raw = str(item.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            return Decimal(raw)
+        except Exception:
+            continue
+    return None
+
+
+def _okx_chain_limits(item: Dict[str, Any]) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    min_withdraw = _okx_decimal_field(
+        item,
+        ["minWd", "minWdAmt", "minWdAmount", "minWithdraw", "minWithdrawAmt", "minWithdrawalAmt"],
+    )
+    fee = _okx_decimal_field(item, ["minFee", "minWdFee"])
+    return min_withdraw, fee
+
+
+def _prompt_okx_withdraw_amount(prompt: str, min_withdraw: Optional[Decimal], default: str = "") -> Decimal:
+    while True:
+        value = _prompt_positive_decimal(prompt, default)
+        if min_withdraw is None or value >= min_withdraw:
+            return value
+        print(f"Minimum withdrawal amount is {_format_decimal_plain(min_withdraw)}.")
+
+
+def _prompt_okx_currency_and_chain(
+    client: OkxApiClient,
+    logger: logging.Logger,
+) -> Tuple[str, str, Optional[Decimal], Optional[Decimal]]:
     currency_options = ["ETH", "USDT", "USDC"]
     print("Currency:")
     for idx, currency in enumerate(currency_options, start=1):
@@ -2245,21 +2277,29 @@ def _prompt_okx_currency_and_chain(client: OkxApiClient, logger: logging.Logger)
     except Exception as exc:
         logger.warning("[OKX_WITHDRAW] failed to load OKX chains for %s, use Custom chain: %s", ccy, exc)
 
-    chain_options: List[Tuple[str, str]] = []
+    chain_options: List[Tuple[str, str, Optional[Decimal], Optional[Decimal]]] = []
+    seen_chains = set()
     for item in chain_items:
         chain = str(item.get("chain") or "").strip()
-        if not chain:
+        chain_key = chain.lower()
+        if not chain or chain_key in seen_chains:
             continue
+        seen_chains.add(chain_key)
         can_withdraw = str(item.get("canWd") or item.get("canWithdraw") or "true").strip().lower()
         if can_withdraw in {"false", "0", "no"}:
             continue
-        fee = str(item.get("minFee") or item.get("minWdFee") or "").strip()
-        label = f"{chain} | fee={fee}" if fee else chain
-        chain_options.append((chain, label))
-    chain_options = sorted(set(chain_options), key=lambda pair: pair[0].lower())
+        min_withdraw, fee = _okx_chain_limits(item)
+        label_parts = [chain]
+        if min_withdraw is not None:
+            label_parts.append(f"min={_format_decimal_plain(min_withdraw)}")
+        if fee is not None:
+            label_parts.append(f"fee={_format_decimal_plain(fee)}")
+        chain_options.append((chain, " | ".join(label_parts), min_withdraw, fee))
+    chain_options = sorted(chain_options, key=lambda pair: pair[0].lower())
 
     print("OKX chain:")
-    for idx, (_, label) in enumerate(chain_options, start=1):
+    for idx, option in enumerate(chain_options, start=1):
+        label = option[1]
         print(f"{idx}) {label}")
     custom_chain_idx = len(chain_options) + 1
     print(f"{custom_chain_idx}) Custom")
@@ -2273,9 +2313,16 @@ def _prompt_okx_currency_and_chain(client: OkxApiClient, logger: logging.Logger)
         chain = input("OKX chain, e.g. ETH-Base / USDT-Polygon / ETH-Arbitrum One: ").strip()
         if not chain:
             raise ValueError("OKX chain is required")
+        min_withdraw = None
+        fee = None
+        chain_key = chain.lower()
+        for item in chain_items:
+            if str(item.get("chain") or "").strip().lower() == chain_key:
+                min_withdraw, fee = _okx_chain_limits(item)
+                break
     else:
-        chain = chain_options[chain_idx - 1][0]
-    return ccy, chain
+        chain, _, min_withdraw, fee = chain_options[chain_idx - 1]
+    return ccy, chain, min_withdraw, fee
 
 
 def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -2297,24 +2344,34 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         cfg.okx_passphrase,
         base_url=cfg.okx_base_url,
     )
-    ccy, chain = _prompt_okx_currency_and_chain(client, logger)
+    ccy, chain, min_withdraw_amount, fee = _prompt_okx_currency_and_chain(client, logger)
+    if min_withdraw_amount is None:
+        logger.warning("[OKX_WITHDRAW] minimum withdrawal amount not found in OKX metadata | ccy=%s | chain=%s", ccy, chain)
+    else:
+        logger.info(
+            "[OKX_WITHDRAW] minimum withdrawal amount resolved from OKX | ccy=%s | chain=%s | min=%s",
+            ccy,
+            chain,
+            _format_decimal_plain(min_withdraw_amount),
+        )
 
     print("Amount mode:")
     print("1) Fixed amount")
     print("2) Random amount from min/max")
     amount_mode = input("Select [1-2, default 1]: ").strip() or "1"
     if amount_mode == "2":
-        min_amount = _prompt_positive_decimal("Minimum amount per address")
-        max_amount = _prompt_positive_decimal("Maximum amount per address")
+        min_amount = _prompt_okx_withdraw_amount("Minimum amount per address", min_withdraw_amount)
+        max_amount = _prompt_okx_withdraw_amount("Maximum amount per address", min_withdraw_amount)
         if max_amount < min_amount:
             raise ValueError("Maximum amount must be >= minimum amount")
         fixed_amount = Decimal("0")
     else:
-        fixed_amount = _prompt_positive_decimal("Amount per address")
+        fixed_amount = _prompt_okx_withdraw_amount("Amount per address", min_withdraw_amount)
         min_amount = fixed_amount
         max_amount = fixed_amount
 
-    fee = client.get_min_withdraw_fee(ccy, chain)
+    if fee is None:
+        fee = client.get_min_withdraw_fee(ccy, chain)
     logger.info("[OKX_WITHDRAW] fee resolved from OKX | ccy=%s | chain=%s | fee=%s", ccy, chain, fee)
 
     delay_min = _prompt_positive_decimal("Minimum delay between withdrawals sec", "10")
