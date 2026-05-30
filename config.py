@@ -88,6 +88,7 @@ class BotConfig:
     points_csv_file: Path = Path(os.getenv("POINTS_CSV_FILE", "points.csv"))
     replay_csv_file: Path = Path(os.getenv("REPLAY_CSV_FILE", "trades.csv"))
     okx_withdraw_addresses_file: Path = Path(os.getenv("OKX_WITHDRAW_ADDRESSES_FILE", os.getenv("WALLETS_FILE", "wallets.txt")))
+    exchange_deposit_addresses_file: Path = Path(os.getenv("EXCHANGE_DEPOSIT_ADDRESSES_FILE", "exchange_deposit_addresses.txt"))
 
     # Account
     account_address: str = os.getenv("ACCOUNT_ADDRESS", "").lower()

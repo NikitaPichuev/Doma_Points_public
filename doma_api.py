@@ -2186,6 +2186,15 @@ class EvmExecutionClient:
         wei = self.web3.eth.get_balance(self.account_address)
         return Decimal(wei) / Decimal(10**18)
 
+    def send_native(self, to_address: str, amount_raw: int) -> str:
+        tx = {
+            **self._base_tx(),
+            "to": Web3.to_checksum_address(to_address),
+            "value": int(amount_raw),
+        }
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        return self._send_tx(tx)
+
     def get_chain_id(self) -> int:
         return int(self.web3.eth.chain_id)
 

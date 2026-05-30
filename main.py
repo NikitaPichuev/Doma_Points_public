@@ -147,6 +147,7 @@ DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
 DOMA_COST_REPORT_CSV = Path("doma_cost_report.csv")
 OKX_WITHDRAWALS_CSV = Path("okx_withdrawals.csv")
+EXCHANGE_DEPOSITS_CSV = Path("exchange_deposits.csv")
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1")
 DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
@@ -270,6 +271,51 @@ def _doma_rpc_candidates(cfg: BotConfig) -> List[str]:
         if normalized and normalized not in candidates:
             candidates.append(normalized)
     return candidates
+
+
+def _l2_deposit_networks() -> List[Tuple[str, int, str, List[str], Decimal]]:
+    return [
+        ("Base | native ETH", 8453, "ETH", ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.llamarpc.com"], Decimal("0.00002")),
+        ("Arbitrum | native ETH", 42161, "ETH", ["https://arbitrum-one.publicnode.com", "https://arb1.arbitrum.io/rpc"], Decimal("0.00002")),
+        ("Optimism | native ETH", 10, "ETH", ["https://optimism-rpc.publicnode.com", "https://mainnet.optimism.io"], Decimal("0.00002")),
+        ("Blast | native ETH", 81457, "ETH", ["https://rpc.blast.io", "https://blast-rpc.publicnode.com"], Decimal("0.00002")),
+        ("Mantle | native MNT", 5000, "MNT", ["https://rpc.mantle.xyz", "https://mantle-rpc.publicnode.com"], Decimal("0.2")),
+    ]
+
+
+def _build_exec_client_for_chain_rpcs(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    private_key: str,
+    chain_id: int,
+    rpc_urls: List[str],
+    proxies: Optional[Dict[str, str]],
+    log_prefix: str,
+) -> EvmExecutionClient:
+    errors: List[str] = []
+    proxy_variants: List[Tuple[str, Optional[Dict[str, str]]]] = [("proxy", proxies)] if proxies else [("direct", None)]
+    for rpc_url in rpc_urls:
+        for proxy_label, request_proxies in proxy_variants:
+            try:
+                client = EvmExecutionClient(
+                    rpc_url=rpc_url,
+                    chain_id=chain_id,
+                    account_address=wallet,
+                    private_key=private_key,
+                    router_address="",
+                    quoter_address="",
+                    router_variant=cfg.router_variant,
+                    request_proxies=request_proxies,
+                )
+                actual_chain_id = client.get_chain_id()
+                if actual_chain_id != chain_id:
+                    raise RuntimeError(f"chain_id mismatch: rpc={actual_chain_id} expected={chain_id}")
+                logger.info("%s wallet=%s RPC selected | url=%s | mode=%s", log_prefix, wallet, rpc_url, proxy_label)
+                return client
+            except Exception as exc:
+                errors.append(f"{rpc_url} ({proxy_label}): {exc}")
+    raise RuntimeError("All RPC attempts failed: " + " | ".join(errors))
 
 
 def _build_exec_client_with_rpc_fallback(
@@ -2467,6 +2513,179 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             time.sleep(delay_sec)
 
     _print_mode_summary("OKX_WITHDRAW", len(selected), success, failed, 0, failed_addresses)
+
+
+def _load_exchange_deposit_addresses(cfg: BotConfig) -> List[str]:
+    return [line.split(";", 1)[0].split(",", 1)[0].strip().lower() for line in _read_nonempty_lines(cfg.exchange_deposit_addresses_file)]
+
+
+def _deposit_address_for_wallet(deposit_addresses: List[str], wallet_idx: int) -> str:
+    if not deposit_addresses:
+        raise RuntimeError("No deposit addresses loaded")
+    if len(deposit_addresses) == 1:
+        return deposit_addresses[0]
+    if wallet_idx < len(deposit_addresses):
+        return deposit_addresses[wallet_idx]
+    return ""
+
+
+def _append_exchange_deposit_csv(
+    cfg: BotConfig,
+    status: str,
+    wallet_idx: int,
+    deposit_address: str,
+    chain_label: str,
+    symbol: str,
+    amount: Decimal,
+    tx_hash: str,
+    reason: str,
+) -> None:
+    append_csv(
+        cfg.points_csv_file.parent / EXCHANGE_DEPOSITS_CSV.name,
+        [
+            datetime.now(timezone.utc).isoformat(),
+            status,
+            wallet_idx + 1,
+            deposit_address,
+            chain_label,
+            symbol,
+            _format_decimal_for_api(amount),
+            tx_hash,
+            reason,
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+
+def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "EXCHANGE_DEPOSIT")
+    if not wallet_key_records:
+        raise RuntimeError("No wallets with private keys found")
+    deposit_addresses = _load_exchange_deposit_addresses(cfg)
+    if not any(_is_valid_evm_address(address) for address in deposit_addresses):
+        raise RuntimeError(f"No valid EVM deposit addresses found in {cfg.exchange_deposit_addresses_file}")
+
+    networks = _l2_deposit_networks()
+    print("\nDeposit to exchange from L2:")
+    print("Network:")
+    for idx, (label, *_rest) in enumerate(networks, start=1):
+        print(f"{idx}) {label}")
+    network_raw = input(f"Select [1-{len(networks)}]: ").strip()
+    if not network_raw.isdigit() or not 1 <= int(network_raw) <= len(networks):
+        raise ValueError("Invalid network selection")
+    chain_label, chain_id, symbol, rpc_urls, native_reserve = networks[int(network_raw) - 1]
+
+    print("Amount mode:")
+    print(f"1) Fixed amount ({symbol})")
+    print("2) Random amount from min/max")
+    print("3) Percent of spendable balance")
+    amount_mode = input("Select [1-3, default 1]: ").strip() or "1"
+    if amount_mode == "2":
+        min_amount = _prompt_positive_decimal(f"Minimum amount per wallet {symbol}")
+        max_amount = _prompt_positive_decimal(f"Maximum amount per wallet {symbol}")
+        if max_amount < min_amount:
+            raise ValueError("Maximum amount must be >= minimum amount")
+        fixed_amount = Decimal("0")
+        percent_amount = Decimal("0")
+    elif amount_mode == "3":
+        percent_amount = _prompt_positive_decimal("Percent of spendable balance", "100")
+        if percent_amount > 100:
+            raise ValueError("Percent cannot be > 100")
+        fixed_amount = Decimal("0")
+        min_amount = Decimal("0")
+        max_amount = Decimal("0")
+    else:
+        fixed_amount = _prompt_positive_decimal(f"Amount per wallet {symbol}")
+        min_amount = fixed_amount
+        max_amount = fixed_amount
+        percent_amount = Decimal("0")
+
+    delay_min = _prompt_positive_decimal("Minimum delay between deposits sec", "10")
+    delay_max = _prompt_positive_decimal("Maximum delay between deposits sec", "30")
+    if delay_max < delay_min:
+        raise ValueError("Maximum delay must be >= minimum delay")
+
+    start_number = _prompt_start_wallet_number(len(wallet_key_records))
+    end_number = _prompt_end_wallet_number(len(wallet_key_records), start_number)
+    order = _prompt_wallet_order(default_random=True)
+    selected = _apply_wallet_order(wallet_key_records[start_number - 1 : end_number], order)
+
+    logger.info(
+        "[EXCHANGE_DEPOSIT] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | network=%s | symbol=%s | deposit_addresses=%s",
+        len(wallet_key_records),
+        start_number,
+        end_number,
+        order,
+        chain_label,
+        symbol,
+        len(deposit_addresses),
+    )
+
+    success = 0
+    failed = 0
+    failed_wallets: List[str] = []
+    for order_idx, (wallet_idx, wallet, private_key) in enumerate(selected):
+        wallet_number = wallet_idx + 1
+        deposit_address = _deposit_address_for_wallet(deposit_addresses, wallet_idx)
+        if not _is_valid_evm_address(deposit_address):
+            failed += 1
+            failed_wallets.append(wallet)
+            reason = f"missing/invalid deposit address for wallet line {wallet_number}"
+            logger.warning("[EXCHANGE_DEPOSIT] wallet %s skipped | %s", wallet_number, reason)
+            _append_exchange_deposit_csv(cfg, "failed", wallet_idx, deposit_address, chain_label, symbol, Decimal("0"), "", reason)
+            continue
+
+        try:
+            proxies = _proxy_for_index(cfg, wallet_idx)
+            exec_client = _build_exec_client_for_chain_rpcs(
+                cfg,
+                logger,
+                wallet,
+                private_key,
+                chain_id,
+                rpc_urls,
+                proxies=proxies,
+                log_prefix="[EXCHANGE_DEPOSIT]",
+            )
+            balance = exec_client.get_native_balance()
+            spendable = max(Decimal("0"), balance - native_reserve)
+            if amount_mode == "2":
+                amount = _random_okx_decimal_between(min_amount, max_amount)
+            elif amount_mode == "3":
+                amount = (spendable * percent_amount / Decimal("100")).quantize(Decimal("0.00000001"))
+            else:
+                amount = fixed_amount
+            if amount <= 0 or amount > spendable:
+                raise RuntimeError(
+                    f"insufficient spendable balance: amount={_format_decimal_plain(amount)} {symbol}, "
+                    f"spendable={_format_decimal_plain(spendable)} {symbol}, reserve={_format_decimal_plain(native_reserve)} {symbol}"
+                )
+            amount_raw = decimal_to_raw(amount, 18)
+            logger.info(
+                "[EXCHANGE_DEPOSIT] wallet %s/%s | to=%s | %s %s on %s",
+                wallet_number,
+                len(wallet_key_records),
+                deposit_address,
+                _format_decimal_plain(amount),
+                symbol,
+                chain_label,
+            )
+            tx_hash = exec_client.send_native(deposit_address, amount_raw)
+            logger.info("[EXCHANGE_DEPOSIT] wallet %s tx sent: %s", wallet_number, tx_hash)
+            _append_exchange_deposit_csv(cfg, "sent", wallet_idx, deposit_address, chain_label, symbol, amount, tx_hash, "")
+            success += 1
+        except Exception as exc:
+            failed += 1
+            failed_wallets.append(wallet)
+            logger.warning("[EXCHANGE_DEPOSIT] wallet %s failed: %s", wallet_number, exc)
+            _append_exchange_deposit_csv(cfg, "failed", wallet_idx, deposit_address, chain_label, symbol, Decimal("0"), "", str(exc))
+        if order_idx < len(selected) - 1:
+            delay_sec = random.uniform(float(delay_min), float(delay_max))
+            logger.info("[EXCHANGE_DEPOSIT] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    _print_mode_summary("EXCHANGE_DEPOSIT", len(selected), success, failed, 0, failed_wallets)
 
 
 def _volume_added_from_usdc_balance_change(before_usdc: Decimal, after_usdc: Decimal, input_symbol: str) -> Decimal:
@@ -9729,8 +9948,9 @@ def get_menu_choice() -> str:
     print("17) Daily .com top TVL swaps")
     print("18) Close/unstake subdomains")
     print("19) Withdraw from OKX to addresses")
-    print("20) Exit")
-    return input("Select [1-20]: ").strip()
+    print("20) Deposit to exchange from L2")
+    print("21) Exit")
+    return input("Select [1-21]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -9891,6 +10111,21 @@ def main() -> None:
             "fee",
             "withdraw_id",
             "client_id",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+    ensure_csv(
+        cfg.points_csv_file.parent / EXCHANGE_DEPOSITS_CSV.name,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet_line",
+            "deposit_address",
+            "chain",
+            "symbol",
+            "amount",
+            "tx_hash",
             "reason",
         ],
         delimiter=cfg.csv_delimiter,
@@ -10079,6 +10314,14 @@ def main() -> None:
                 run_okx_withdrawals_once(cfg, logger, state)
             except Exception as exc:
                 logger.exception("OKX withdrawal mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "20":
+            try:
+                run_exchange_deposit_once(cfg, logger, state)
+            except Exception as exc:
+                logger.exception("Exchange deposit mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

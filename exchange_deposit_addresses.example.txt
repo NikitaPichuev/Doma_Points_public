@@ -1,0 +1,6 @@
+# One EVM deposit address: used for all wallets
+# 0x0000000000000000000000000000000000000000
+#
+# Or one address per wallet line:
+# wallet 1 -> line 1
+# wallet 2 -> line 2
