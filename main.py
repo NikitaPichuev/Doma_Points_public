@@ -117,7 +117,8 @@ DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
 DOMA_COST_REPORT_CSV = Path("doma_cost_report.csv")
 OKX_WITHDRAWALS_CSV = Path("okx_withdrawals.csv")
-DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.18")
+DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1")
+DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
 WEEKLY_VOLUME_TOPUP_BUFFER_USD = Decimal("1")
 KNOWN_ETH_USDCE_POOL_ADDRESSES = [
@@ -5571,7 +5572,10 @@ def _top_up_liquidity_token(
     if missing_usd <= Decimal("0.05"):
         return True
 
-    buy_usd = (missing_usd * Decimal("1.08")).quantize(Decimal("0.000001"))
+    if token.address.lower() == quote_token.address.lower():
+        buy_usd = missing_usd.quantize(Decimal("0.000001"))
+    else:
+        buy_usd = (missing_usd * DOMAIN_LIQUIDITY_SWAP_BUFFER).quantize(Decimal("0.000001"))
     if token.address.lower() == weth_token.address.lower():
         required_raw = decimal_to_raw(target_usd / eth_price, weth_token.decimals)
         try:
