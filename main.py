@@ -62,6 +62,36 @@ class BotState:
         return cls(day_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d"), daily_volume_usd=Decimal("0"))
 
 
+WALLET_LOG_NAMES: Dict[str, str] = {}
+
+
+def _redact_wallet_addresses(text: str) -> str:
+    out = str(text)
+    for address, label in WALLET_LOG_NAMES.items():
+        out = re.sub(re.escape(address), label, out, flags=re.IGNORECASE)
+    return out
+
+
+class WalletAddressRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not WALLET_LOG_NAMES:
+            return True
+        record.msg = _redact_wallet_addresses(record.getMessage())
+        record.args = ()
+        return True
+
+
+def install_wallet_log_names(logger: logging.Logger, wallets: List[str]) -> None:
+    WALLET_LOG_NAMES.clear()
+    for idx, wallet in enumerate(wallets, start=1):
+        if _is_valid_evm_address(wallet):
+            WALLET_LOG_NAMES[wallet.lower()] = f"wallet#{idx}"
+    redaction_filter = WalletAddressRedactionFilter()
+    logger.addFilter(redaction_filter)
+    for handler in logger.handlers:
+        handler.addFilter(redaction_filter)
+
+
 def setup_logger(log_path: Path) -> logging.Logger:
     logger = logging.getLogger("doma_swap_bot")
     logger.setLevel(logging.INFO)
@@ -384,7 +414,7 @@ def _print_mode_summary(
     parts.append(f"обработано: {processed}")
     print("\n" + " | ".join(parts))
     if failed_wallets:
-        print(_color(f"[{mode}] wallets with errors: {', '.join(failed_wallets)}", ANSI_RED))
+        print(_color(_redact_wallet_addresses(f"[{mode}] wallets with errors: {', '.join(failed_wallets)}"), ANSI_RED))
 
 
 def ensure_csv(path: Path, header: List[str], delimiter: str = ",") -> None:
@@ -9796,6 +9826,7 @@ def run_doma_quests_menu_once(cfg: BotConfig, logger: logging.Logger, state: Bot
 def main() -> None:
     cfg = BotConfig()
     logger = setup_logger(cfg.log_file)
+    install_wallet_log_names(logger, cfg.points_wallets)
     ensure_csv(
         cfg.trades_csv_file,
         [
