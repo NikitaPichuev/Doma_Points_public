@@ -988,8 +988,9 @@ def _execute_trade_via_doma_ui_route(
     is_eth_source: bool = False,
     unwrap_to_native: bool = False,
     wait_for_pre_tx: bool = False,
+    cleanup_weth_before_eth_source: bool = True,
 ) -> bool:
-    if is_eth_source:
+    if is_eth_source and cleanup_weth_before_eth_source:
         _cleanup_weth_balance(
             logger=logger,
             exec_client=exec_client,
@@ -5561,6 +5562,7 @@ def _top_up_liquidity_token(
     target_usd: Decimal,
     label: str,
     reserve_quote_usd: Decimal = Decimal("0"),
+    preserve_weth_balance: bool = False,
 ) -> bool:
     token_price = pick_token_usd_price(token, eth_price)
     if token_price <= 0:
@@ -5647,6 +5649,7 @@ def _top_up_liquidity_token(
         label=f"{label} ETH>{token.symbol} TOPUP",
         is_eth_source=True,
         wait_for_pre_tx=True,
+        cleanup_weth_before_eth_source=not preserve_weth_balance,
     )
 
 
@@ -5814,6 +5817,9 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             token1_addr = pool.token1.address.lower()
             token0_reserve_quote = half_mint_usd if token0_addr != quote_addr and token1_addr == quote_addr else Decimal("0")
             token1_reserve_quote = half_mint_usd if token1_addr != quote_addr and token0_addr == quote_addr else Decimal("0")
+            weth_addr = weth_token.address.lower()
+            token0_preserve_weth = token0_addr != weth_addr and token1_addr == weth_addr
+            token1_preserve_weth = token1_addr != weth_addr and token0_addr == weth_addr
 
             prev_tx_hash = state.last_tx_hash
             ok0 = _top_up_liquidity_token(
@@ -5830,6 +5836,7 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 half_mint_usd,
                 label,
                 reserve_quote_usd=token0_reserve_quote,
+                preserve_weth_balance=token0_preserve_weth,
             )
             if ok0 and state.last_tx_hash and state.last_tx_hash != prev_tx_hash:
                 _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
@@ -5848,6 +5855,7 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 half_mint_usd,
                 label,
                 reserve_quote_usd=token1_reserve_quote,
+                preserve_weth_balance=token1_preserve_weth,
             )
             if ok1 and state.last_tx_hash and state.last_tx_hash != prev_tx_hash:
                 _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
