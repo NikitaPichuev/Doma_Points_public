@@ -2219,6 +2219,65 @@ def _append_okx_withdraw_csv(
     )
 
 
+def _prompt_okx_currency_and_chain(client: OkxApiClient, logger: logging.Logger) -> Tuple[str, str]:
+    currency_options = ["ETH", "USDT", "USDC"]
+    print("Currency:")
+    for idx, currency in enumerate(currency_options, start=1):
+        print(f"{idx}) {currency}")
+    custom_currency_idx = len(currency_options) + 1
+    print(f"{custom_currency_idx}) Custom")
+    while True:
+        raw = input(f"Select [1-{custom_currency_idx}, default 1]: ").strip() or "1"
+        if raw.isdigit() and 1 <= int(raw) <= custom_currency_idx:
+            currency_idx = int(raw)
+            break
+        print("Invalid selection.")
+    if currency_idx == custom_currency_idx:
+        ccy = input("Currency: ").strip().upper()
+        if not ccy:
+            raise ValueError("Currency is required")
+    else:
+        ccy = currency_options[currency_idx - 1]
+
+    chain_items: List[Dict[str, Any]] = []
+    try:
+        chain_items = client.get_currencies(ccy)
+    except Exception as exc:
+        logger.warning("[OKX_WITHDRAW] failed to load OKX chains for %s, use Custom chain: %s", ccy, exc)
+
+    chain_options: List[Tuple[str, str]] = []
+    for item in chain_items:
+        chain = str(item.get("chain") or "").strip()
+        if not chain:
+            continue
+        can_withdraw = str(item.get("canWd") or item.get("canWithdraw") or "true").strip().lower()
+        if can_withdraw in {"false", "0", "no"}:
+            continue
+        fee = str(item.get("minFee") or item.get("minWdFee") or "").strip()
+        label = f"{chain} | fee={fee}" if fee else chain
+        chain_options.append((chain, label))
+    chain_options = sorted(set(chain_options), key=lambda pair: pair[0].lower())
+
+    print("OKX chain:")
+    for idx, (_, label) in enumerate(chain_options, start=1):
+        print(f"{idx}) {label}")
+    custom_chain_idx = len(chain_options) + 1
+    print(f"{custom_chain_idx}) Custom")
+    while True:
+        raw = input(f"Select [1-{custom_chain_idx}]: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= custom_chain_idx:
+            chain_idx = int(raw)
+            break
+        print("Invalid selection.")
+    if chain_idx == custom_chain_idx:
+        chain = input("OKX chain, e.g. ETH-Base / USDT-Polygon / ETH-Arbitrum One: ").strip()
+        if not chain:
+            raise ValueError("OKX chain is required")
+    else:
+        chain = chain_options[chain_idx - 1][0]
+    return ccy, chain
+
+
 def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
     _ = state
     if not (cfg.okx_api_key and cfg.okx_secret_key and cfg.okx_passphrase):
@@ -2232,10 +2291,13 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         raise RuntimeError(f"No valid EVM addresses found in {cfg.okx_withdraw_addresses_file}")
 
     print("\nWithdraw from OKX to addresses:")
-    ccy = input("Currency, e.g. ETH/USDT/USDC [ETH]: ").strip().upper() or "ETH"
-    chain = input("OKX chain, e.g. ETH-Base / USDT-Polygon / ETH-Arbitrum One: ").strip()
-    if not chain:
-        raise ValueError("OKX chain is required")
+    client = OkxApiClient(
+        cfg.okx_api_key,
+        cfg.okx_secret_key,
+        cfg.okx_passphrase,
+        base_url=cfg.okx_base_url,
+    )
+    ccy, chain = _prompt_okx_currency_and_chain(client, logger)
 
     print("Amount mode:")
     print("1) Fixed amount")
@@ -2252,12 +2314,6 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         min_amount = fixed_amount
         max_amount = fixed_amount
 
-    client = OkxApiClient(
-        cfg.okx_api_key,
-        cfg.okx_secret_key,
-        cfg.okx_passphrase,
-        base_url=cfg.okx_base_url,
-    )
     fee_raw = input("Withdraw fee [blank = OKX minimum fee for this chain]: ").strip()
     if fee_raw:
         fee = _parse_decimal_input(fee_raw)
