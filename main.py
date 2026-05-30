@@ -3337,10 +3337,15 @@ def run_domain_quest_volume_once(
                     wallet_failed = True
                     break
                 if remaining_volume > 0 and remaining_volume < (full_trade_usd * Decimal("2")):
-                    min_full_step_usd = min_single_swap_usd if require_min_single_swap and not min_single_swap_done else MIN_EXECUTABLE_TRADE_USD
+                    if require_min_single_swap and not min_single_swap_done:
+                        min_full_step_usd = min_single_swap_usd
+                        target_full_step_usd = max(min_full_step_usd, execution_target_volume - accumulated_volume)
+                    else:
+                        min_full_step_usd = MIN_EXECUTABLE_TRADE_USD
+                        target_full_step_usd = remaining_volume / Decimal("2")
                     capped_full_usd = min(
                         full_trade_usd,
-                        max(min_full_step_usd, remaining_volume / Decimal("2")),
+                        max(min_full_step_usd, target_full_step_usd),
                     )
                     if capped_full_usd >= MIN_EXECUTABLE_TRADE_USD:
                         full_trade_usd = capped_full_usd
@@ -3438,6 +3443,12 @@ def run_domain_quest_volume_once(
                     _format_decimal_plain(quest_target_volume),
                 )
                 if accumulated_volume >= execution_target_volume:
+                    break
+                if require_min_single_swap and min_single_swap_done and accumulated_volume >= quest_target_volume:
+                    logger.info(
+                        _quest_log("wallet=%s single-swap target reached | skipping partial top-up below minimum swap"),
+                        wallet,
+                    )
                     break
                 _sleep_between_swaps()
 
