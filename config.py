@@ -207,19 +207,11 @@ class BotConfig:
 
         if not self.private_key:
             self.private_key = _read_first_nonempty_line(self.keys_file)
-        file_api_keys = _read_nonempty_lines(self.api_keys_file)
-        self.file_api_keys = file_api_keys
-        env_key = self.doma_api_key.strip()
-        merged_keys: List[str] = []
-        if env_key:
-            merged_keys.append(env_key)
-        for key in file_api_keys:
-            k = key.strip()
-            if k and k not in merged_keys:
-                merged_keys.append(k)
-        self.doma_api_keys = merged_keys
-        if merged_keys:
-            self.doma_api_key = merged_keys[0]
+        # Doma API requests intentionally use the public fallback key from doma_api.py.
+        # User-provided Doma API keys are ignored so api_keys.txt can stay empty.
+        self.file_api_keys = []
+        self.doma_api_keys = []
+        self.doma_api_key = ""
 
         wallets = [w.strip() for w in _read_nonempty_lines(self.wallets_file) if _is_valid_evm_address(w.strip())]
         env_account = (self.account_address or "").strip()
