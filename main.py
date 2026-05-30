@@ -5577,18 +5577,28 @@ def _top_up_liquidity_token(
     else:
         buy_usd = (missing_usd * DOMAIN_LIQUIDITY_SWAP_BUFFER).quantize(Decimal("0.000001"))
     if token.address.lower() == weth_token.address.lower():
-        required_raw = decimal_to_raw(target_usd / eth_price, weth_token.decimals)
-        try:
-            wrap_tx = exec_client.ensure_weth_balance(weth_token.address, required_raw)
-            if wrap_tx:
-                state.last_tx_hash = wrap_tx
-                logger.info("[%s] WETH wrap tx sent: %s", label, wrap_tx)
-                if not _wait_tx_receipt(exec_client, wrap_tx, timeout_sec=180):
-                    logger.warning("[%s] WETH wrap did not confirm", label)
-                    return False
-            return True
-        except Exception as exc:
-            logger.info("[%s] WETH direct wrap unavailable, trying swap route: %s", label, exc)
+        target_weth = target_usd / eth_price
+        missing_weth = target_weth - balance
+        native_spendable = max(Decimal("0"), exec_client.get_native_balance() - Decimal("0.00001"))
+        wrap_amount = min(missing_weth, native_spendable)
+        if wrap_amount > Decimal("0"):
+            required_after_wrap_raw = decimal_to_raw(balance + wrap_amount, weth_token.decimals)
+            try:
+                wrap_tx = exec_client.ensure_weth_balance(weth_token.address, required_after_wrap_raw)
+                if wrap_tx:
+                    state.last_tx_hash = wrap_tx
+                    logger.info("[%s] WETH wrap tx sent: %s", label, wrap_tx)
+                    if not _wait_tx_receipt(exec_client, wrap_tx, timeout_sec=180):
+                        logger.warning("[%s] WETH wrap did not confirm", label)
+                        return False
+                balance = exec_client.get_erc20_balance(token.address, token.decimals)
+                balance_usd = balance * token_price
+                missing_usd = target_usd - balance_usd
+                if missing_usd <= Decimal("0.05"):
+                    return True
+                buy_usd = (missing_usd * DOMAIN_LIQUIDITY_SWAP_BUFFER).quantize(Decimal("0.000001"))
+            except Exception as exc:
+                logger.info("[%s] WETH partial wrap unavailable, trying swap route: %s", label, exc)
 
     usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
     spendable_usdc = usdc_balance
