@@ -2314,12 +2314,8 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         min_amount = fixed_amount
         max_amount = fixed_amount
 
-    fee_raw = input("Withdraw fee [blank = OKX minimum fee for this chain]: ").strip()
-    if fee_raw:
-        fee = _parse_decimal_input(fee_raw)
-    else:
-        fee = client.get_min_withdraw_fee(ccy, chain)
-        logger.info("[OKX_WITHDRAW] fee resolved from OKX | ccy=%s | chain=%s | fee=%s", ccy, chain, fee)
+    fee = client.get_min_withdraw_fee(ccy, chain)
+    logger.info("[OKX_WITHDRAW] fee resolved from OKX | ccy=%s | chain=%s | fee=%s", ccy, chain, fee)
 
     delay_min = _prompt_positive_decimal("Minimum delay between withdrawals sec", "10")
     delay_max = _prompt_positive_decimal("Maximum delay between withdrawals sec", "30")
