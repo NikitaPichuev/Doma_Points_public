@@ -2327,16 +2327,7 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     order = _prompt_wallet_order(default_random=True)
     selected = _apply_address_order(records[start_number - 1 : end_number], order)
 
-    print("Execution:")
-    print("1) Dry-run only")
-    print("2) LIVE withdraw")
-    execution = input("Select [1-2, default 1]: ").strip() or "1"
-    live = execution == "2"
-    if live:
-        confirm = input("Type WITHDRAW OKX to confirm real exchange withdrawals: ").strip()
-        if confirm != "WITHDRAW OKX":
-            logger.warning("[OKX_WITHDRAW] live mode canceled: confirmation phrase mismatch")
-            return
+    live = True
 
     logger.info(
         "[OKX_WITHDRAW] mode started | addresses=%s | start_address=%s | end_address=%s | order=%s | ccy=%s | chain=%s | amount=%s-%s | fee=%s | live=%s",
@@ -2360,33 +2351,20 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         amount = fixed_amount if amount_mode != "2" else _random_okx_decimal_between(min_amount, max_amount)
         client_id = f"doma{line_idx + 1}{int(time.time() * 1000)}"[:32]
         try:
-            if not live:
-                logger.info(
-                    "[OKX_WITHDRAW] dry-run address %s/%s line=%s to=%s | %s %s | fee=%s",
-                    offset + 1,
-                    selected_count,
-                    line_idx + 1,
-                    address,
-                    _format_decimal_for_api(amount),
-                    ccy,
-                    _format_decimal_for_api(fee),
-                )
-                _append_okx_withdraw_csv(cfg, "dry_run", address, line_idx, ccy, chain, amount, fee, "", client_id, "")
-            else:
-                logger.info(
-                    "[OKX_WITHDRAW] address %s/%s line=%s to=%s | %s %s | fee=%s",
-                    offset + 1,
-                    selected_count,
-                    line_idx + 1,
-                    address,
-                    _format_decimal_for_api(amount),
-                    ccy,
-                    _format_decimal_for_api(fee),
-                )
-                result = client.withdraw(ccy, chain, amount, fee, address, client_id=client_id)
-                withdraw_id = str(result.get("wdId") or result.get("id") or "")
-                logger.info("[OKX_WITHDRAW] sent | address=%s | withdraw_id=%s | client_id=%s", address, withdraw_id, client_id)
-                _append_okx_withdraw_csv(cfg, "sent", address, line_idx, ccy, chain, amount, fee, withdraw_id, client_id, "")
+            logger.info(
+                "[OKX_WITHDRAW] address %s/%s line=%s to=%s | %s %s | fee=%s",
+                offset + 1,
+                selected_count,
+                line_idx + 1,
+                address,
+                _format_decimal_for_api(amount),
+                ccy,
+                _format_decimal_for_api(fee),
+            )
+            result = client.withdraw(ccy, chain, amount, fee, address, client_id=client_id)
+            withdraw_id = str(result.get("wdId") or result.get("id") or "")
+            logger.info("[OKX_WITHDRAW] sent | address=%s | withdraw_id=%s | client_id=%s", address, withdraw_id, client_id)
+            _append_okx_withdraw_csv(cfg, "sent", address, line_idx, ccy, chain, amount, fee, withdraw_id, client_id, "")
             success += 1
         except Exception as exc:
             failed += 1
