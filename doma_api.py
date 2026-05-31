@@ -1298,6 +1298,7 @@ class DomaApiClient:
           $take: Int
           $networkIds: [String!]
           $priceRangeMax: Float
+          $priceRangeCurrency: String
         ) {
           names(
             skip: $skip
@@ -1308,6 +1309,7 @@ class DomaApiClient:
             active: true
             networkIds: $networkIds
             priceRangeMax: $priceRangeMax
+            priceRangeCurrency: $priceRangeCurrency
             includeDetokenized: false
           ) {
             items {
@@ -1348,6 +1350,7 @@ class DomaApiClient:
                     "take": page_take,
                     "networkIds": [target_network],
                     "priceRangeMax": float(max_price_usd) if max_price_usd is not None else None,
+                    "priceRangeCurrency": "USDC.E" if max_price_usd is not None else None,
                 },
             )
             names_page = data.get("names") or {}
