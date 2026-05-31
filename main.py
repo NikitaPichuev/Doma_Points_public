@@ -152,6 +152,8 @@ EXCHANGE_DEPOSITS_CSV = Path("exchange_deposits.csv")
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1")
 DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
+DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
+DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
 WEEKLY_VOLUME_TOPUP_BUFFER_USD = Decimal("1")
 KNOWN_ETH_USDCE_POOL_ADDRESSES = [
     "0xd604c96e51DF995bb46FAb0E3FC1b18d985AA8f5",
@@ -5599,6 +5601,9 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             "token_id",
             "order_id",
             "tx_hash",
+            "relist_price_usdce",
+            "relist_order_id",
+            "relist_reason",
             "reason",
         ],
         delimiter=cfg.csv_delimiter,
@@ -5627,13 +5632,15 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         raise RuntimeError(f"No active domain listings found below {max_price} USDC.E")
 
     logger.info(
-        "[BUY_DOMAIN] mode started | wallets=%s | start_wallet=%s | network=%s | max_price=%s USDC.E | buy_per_wallet=%s-%s | candidates=%s | delay=%s-%s sec",
+        "[BUY_DOMAIN] mode started | wallets=%s | start_wallet=%s | network=%s | max_price=%s USDC.E | buy_per_wallet=%s-%s | relist_markup=%s-%s USDC.E | candidates=%s | delay=%s-%s sec",
         total_loaded_wallets,
         wallet_start_offset + 1,
         _listing_network_label(cfg, network_mode_raw),
         _format_decimal_plain(max_price),
         count_min,
         count_max,
+        _format_decimal_plain(DOMAIN_PURCHASE_RELIST_MARKUP_MIN),
+        _format_decimal_plain(DOMAIN_PURCHASE_RELIST_MARKUP_MAX),
         len(listings),
         delay_min_raw,
         delay_max_raw,
@@ -5735,11 +5742,57 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     listing=listing,
                     proxy=proxy,
                 )
+                relist_price = Decimal("0")
+                relist_order_id = ""
+                relist_reason = ""
+                if ok:
+                    markup = Decimal(random.randint(
+                        int(DOMAIN_PURCHASE_RELIST_MARKUP_MIN * Decimal("100")),
+                        int(DOMAIN_PURCHASE_RELIST_MARKUP_MAX * Decimal("100")),
+                    )) / Decimal("100")
+                    relist_price = price + markup
+                    owned_domain = OwnedDomain(
+                        name=listing.name,
+                        token_id=listing.token_id,
+                        token_address=listing.token_address,
+                        network_id=listing.network_id,
+                        owner_address=f"{listing.network_id}:{wallet.lower()}",
+                        token_type="OWNERSHIP_TOKEN",
+                        orderbook_disabled=False,
+                    )
+                    logger.info(
+                        "[BUY_DOMAIN] wallet=%s domain=%s relist | buy=%s USDC.E | markup=%s | list_price=%s USDC.E",
+                        wallet,
+                        listing.name,
+                        _format_decimal_plain(price),
+                        _format_decimal_plain(markup),
+                        _format_decimal_plain(relist_price),
+                    )
+                    relist_ok, relist_order_id, relist_reason = _run_domain_listing_helper(
+                        cfg=cfg,
+                        logger=logger,
+                        wallet=wallet,
+                        private_key=private_key,
+                        domain=owned_domain,
+                        price=relist_price,
+                        duration_days=Decimal(str(DOMAIN_LISTING_DEFAULT_DURATION_DAYS)),
+                        proxy=proxy,
+                    )
+                    if relist_ok:
+                        logger.info(
+                            "[BUY_DOMAIN] wallet=%s domain=%s relisted | price=%s USDC.E | order_id=%s",
+                            wallet,
+                            listing.name,
+                            _format_decimal_plain(relist_price),
+                            relist_order_id,
+                        )
+                    else:
+                        logger.warning("[BUY_DOMAIN] wallet=%s domain=%s relist failed: %s", wallet, listing.name, relist_reason)
                 append_csv(
                     purchase_csv,
                     [
                         datetime.now(timezone.utc).isoformat(),
-                        "ok" if ok else "failed",
+                        "ok" if ok and relist_order_id else ("bought_relist_failed" if ok else "failed"),
                         wallet,
                         listing.name,
                         _format_decimal_plain(price),
@@ -5748,6 +5801,9 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                         listing.token_id,
                         listing.order_id,
                         tx_hash,
+                        _format_decimal_plain(relist_price) if relist_price > 0 else "",
+                        relist_order_id,
+                        relist_reason,
                         reason,
                     ],
                     delimiter=cfg.csv_delimiter,
@@ -5757,6 +5813,8 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     wallet_success += 1
                     bought_total += 1
                     logger.info("[BUY_DOMAIN] wallet=%s domain=%s bought | tx=%s", wallet, listing.name, tx_hash)
+                    if not relist_order_id:
+                        wallet_failed += 1
                 else:
                     wallet_failed += 1
                     logger.warning("[BUY_DOMAIN] wallet=%s domain=%s buy failed: %s", wallet, listing.name, reason)
@@ -10546,6 +10604,9 @@ def main() -> None:
             "token_id",
             "order_id",
             "tx_hash",
+            "relist_price_usdce",
+            "relist_order_id",
+            "relist_reason",
             "reason",
         ],
         delimiter=cfg.csv_delimiter,
