@@ -4157,10 +4157,10 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, s
 
 def get_domain_purchase_menu_input() -> Optional[Tuple[str, str, str, str, str, str]]:
     print("\nBuy cheapest listed domains:")
-    max_price_raw = input("Maximum domain price USDC.E [1]: ").strip() or "1"
+    max_price_raw = input("Buy cheapest domains up to USDC.E price [1]: ").strip() or "1"
     max_price = _parse_decimal_input(max_price_raw)
     if max_price <= 0:
-        raise ValueError("Maximum domain price must be > 0")
+        raise ValueError("Domain price filter must be > 0")
     network_mode_raw = "1"
     min_count_raw = input("Minimum domains to buy per wallet [1]: ").strip() or "1"
     max_count_raw = input("Maximum domains to buy per wallet [1]: ").strip() or "1"
