@@ -2637,7 +2637,13 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             continue
 
         try:
-            proxies = _proxy_for_index(cfg, wallet_idx)
+            proxies, skip_wallet = _proxy_for_line(cfg, wallet_idx, logger, "EXCHANGE_DEPOSIT")
+            if skip_wallet:
+                failed += 1
+                failed_wallets.append(wallet)
+                reason = "missing proxy on matching line"
+                _append_exchange_deposit_csv(cfg, "failed", wallet_idx, deposit_address, chain_label, symbol, Decimal("0"), "", reason)
+                continue
             exec_client = _build_exec_client_for_chain_rpcs(
                 cfg,
                 logger,
@@ -7232,65 +7238,70 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 ", ".join(sorted(already_domains)) or "none",
             )
 
-            required_usdc = swap_max_usdc
-            current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-            if current_usdc < required_usdc:
+            def _topup_usdc_to(required_usdc: Decimal, reason_label: str) -> Tuple[bool, Decimal, str]:
+                current = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                if current >= required_usdc:
+                    return True, current, ""
                 if eth_price <= 0:
-                    topup_reason = "eth_price_unknown"
-                else:
-                    reserve_eth = Decimal("0.05") / eth_price
-                    native_eth = exec_client.get_native_balance()
-                    spendable_eth = native_eth - reserve_eth
-                    missing_usdc = required_usdc - current_usdc
-                    bootstrap_eth = min(max(missing_usdc, MIN_EXECUTABLE_TRADE_USD) / eth_price, spendable_eth)
-                    bootstrap_usd = bootstrap_eth * eth_price
-                    if bootstrap_eth <= 0 or bootstrap_usd < MIN_EXECUTABLE_TRADE_USD:
-                        topup_reason = f"eth_bootstrap_below_min:{_format_decimal_plain(bootstrap_usd)}"
-                    else:
-                        logger.info(
-                            "%s wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
-                            wallet_log_prefix,
-                            wallet,
-                            _format_decimal_plain(bootstrap_eth),
-                            _format_decimal_plain(missing_usdc),
-                        )
-                        topup_ok = _execute_trade_via_doma_ui_route(
-                            cfg=cfg,
-                            logger=logger,
-                            state=state,
-                            doma_api=doma_api,
-                            exec_client=exec_client,
-                            token_in=weth_token,
-                            token_out=quote_token,
-                            display_in_symbol="ETH",
-                            display_out_symbol="USDC.E",
-                            trade_amount_expr=_format_decimal_plain(bootstrap_eth),
-                            eth_price=eth_price,
-                            label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} ETH>USDC.E BOOTSTRAP",
-                            is_eth_source=True,
-                            unwrap_to_native=False,
-                            wait_for_pre_tx=True,
-                        )
-                        if topup_ok and state.last_tx_hash:
-                            topup_ok = _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
-                        topup_reason = "" if topup_ok else "eth_to_usdc_bootstrap_failed"
-                current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-                if current_usdc < swap_min_usdc:
-                    skipped_wallets += 1
-                    logger.warning(
-                        "%s wallet=%s skipped | insufficient USDC.E after bootstrap (%s), reason=%s",
-                        wallet_log_prefix,
-                        wallet,
-                        _format_decimal_plain(current_usdc),
-                        topup_reason,
-                    )
-                    continue
+                    return False, current, "eth_price_unknown"
+                reserve_eth = Decimal("0.05") / eth_price
+                native_eth = exec_client.get_native_balance()
+                spendable_eth = native_eth - reserve_eth
+                missing_usdc = required_usdc - current
+                bootstrap_eth = min(max(missing_usdc, MIN_EXECUTABLE_TRADE_USD) / eth_price, spendable_eth)
+                bootstrap_usd = bootstrap_eth * eth_price
+                if bootstrap_eth <= 0 or bootstrap_usd < MIN_EXECUTABLE_TRADE_USD:
+                    return False, current, f"eth_bootstrap_below_min:{_format_decimal_plain(bootstrap_usd)}"
+                logger.info(
+                    "%s wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E | %s",
+                    wallet_log_prefix,
+                    wallet,
+                    _format_decimal_plain(bootstrap_eth),
+                    _format_decimal_plain(missing_usdc),
+                    reason_label,
+                )
+                topup_ok = _execute_trade_via_doma_ui_route(
+                    cfg=cfg,
+                    logger=logger,
+                    state=state,
+                    doma_api=doma_api,
+                    exec_client=exec_client,
+                    token_in=weth_token,
+                    token_out=quote_token,
+                    display_in_symbol="ETH",
+                    display_out_symbol="USDC.E",
+                    trade_amount_expr=_format_decimal_plain(bootstrap_eth),
+                    eth_price=eth_price,
+                    label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} ETH>USDC.E TOPUP",
+                    is_eth_source=True,
+                    unwrap_to_native=False,
+                    wait_for_pre_tx=True,
+                )
+                if topup_ok and state.last_tx_hash:
+                    topup_ok = _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                current = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                return topup_ok, current, "" if topup_ok else "eth_to_usdc_topup_failed"
+
+            required_usdc = swap_max_usdc
+            _, current_usdc, topup_reason = _topup_usdc_to(required_usdc, "initial")
+            if current_usdc < swap_min_usdc:
+                skipped_wallets += 1
+                logger.warning(
+                    "%s wallet=%s skipped | insufficient USDC.E after bootstrap (%s), reason=%s",
+                    wallet_log_prefix,
+                    wallet,
+                    _format_decimal_plain(current_usdc),
+                    topup_reason,
+                )
+                continue
 
             for token_idx, info in enumerate(selected_tokens, start=1):
                 domain_token = _token_from_launchpad_price(info, eth_price)
                 swap_usdc = _random_decimal_between(swap_min_usdc, swap_max_usdc, swap_min_raw, swap_max_raw)
                 current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                 if current_usdc < swap_usdc:
+                    if current_usdc < swap_min_usdc:
+                        _, current_usdc, topup_reason = _topup_usdc_to(swap_usdc, f"domain={info.name}")
                     if current_usdc >= swap_min_usdc:
                         adjusted_swap_usdc = current_usdc.quantize(
                             Decimal("0.000001"),
@@ -7330,7 +7341,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                             )
                             break
                     else:
-                        reason = f"USDC.E balance below minimum swap amount ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_min_usdc)})"
+                        reason = f"USDC.E balance below minimum swap amount ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_min_usdc)}), topup_reason={topup_reason}"
                         logger.warning("%s wallet=%s domain=%s skipped | %s", wallet_log_prefix, wallet, info.name, reason)
                         wallet_failed += 1
                         total_failed_swaps += 1
@@ -7416,18 +7427,28 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                             reason = "reverse swap failed"
                 else:
                     reason = "forward swap failed"
-                ok = ok_forward and ok_reverse
-                if ok:
+                ok = ok_forward
+                if ok_forward:
                     wallet_success += 1
                     total_success_swaps += 1
-                    logger.info(
-                        "%s wallet=%s domain=%s round trip complete | forward=%s reverse=%s",
-                        wallet_log_prefix,
-                        wallet,
-                        info.name,
-                        forward_tx_hash,
-                        reverse_tx_hash,
-                    )
+                    if ok_reverse:
+                        logger.info(
+                            "%s wallet=%s domain=%s round trip complete | forward=%s reverse=%s",
+                            wallet_log_prefix,
+                            wallet,
+                            info.name,
+                            forward_tx_hash,
+                            reverse_tx_hash,
+                        )
+                    else:
+                        logger.warning(
+                            "%s wallet=%s domain=%s forward swap counted for quest, reverse cleanup failed | forward=%s | %s",
+                            wallet_log_prefix,
+                            wallet,
+                            info.name,
+                            forward_tx_hash,
+                            reason,
+                        )
                 else:
                     wallet_failed += 1
                     total_failed_swaps += 1
@@ -7444,7 +7465,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         _format_decimal_plain(info.tvl_usd),
                         _format_decimal_plain(swap_usdc),
                         "|".join([tx for tx in [forward_tx_hash, reverse_tx_hash] if tx]),
-                        "" if ok else reason,
+                        "" if ok_reverse else reason,
                     ],
                     delimiter=cfg.csv_delimiter,
                 )
