@@ -142,6 +142,7 @@ DOMAIN_DELISTING_CSV = Path("domain_delistings.csv")
 DOMAIN_BRIDGE_CSV = Path("domain_bridges.csv")
 DOMAIN_OFFERS_CSV = Path("domain_offers.csv")
 DOMAIN_ACCEPTED_OFFERS_CSV = Path("domain_accepted_offers.csv")
+DOMAIN_PURCHASES_CSV = Path("domain_purchases.csv")
 DOMAIN_QUESTS_CSV = Path("quests.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
@@ -4154,6 +4155,36 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, s
     )
 
 
+def get_domain_purchase_menu_input() -> Optional[Tuple[str, str, str, str, str, str]]:
+    print("\nBuy cheapest listed domains:")
+    max_price_raw = input("Maximum domain price USDC.E [1]: ").strip() or "1"
+    max_price = _parse_decimal_input(max_price_raw)
+    if max_price <= 0:
+        raise ValueError("Maximum domain price must be > 0")
+    network_mode_raw = "1"
+    min_count_raw = input("Minimum domains to buy per wallet [1]: ").strip() or "1"
+    max_count_raw = input("Maximum domains to buy per wallet [1]: ").strip() or "1"
+    count_min = int(_parse_decimal_input(min_count_raw))
+    count_max = int(_parse_decimal_input(max_count_raw))
+    if count_min <= 0 or count_max <= 0:
+        raise ValueError("Domain buy count must be > 0")
+    if count_max < count_min:
+        raise ValueError("Maximum buy count cannot be lower than minimum")
+    delay_min_raw = input(f"Minimum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Domain buy delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum buy delay cannot be lower than minimum delay")
+    return max_price_raw, network_mode_raw, min_count_raw, max_count_raw, delay_min_raw, delay_max_raw
+
+
 def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str, str]]:
     print("\nCancel active domain listings:")
     cancellation_type = "off-chain"
@@ -4477,6 +4508,10 @@ def _domain_accept_offer_helper_path() -> Path:
     return Path(__file__).with_name("doma_accept_offer.mjs")
 
 
+def _domain_buy_helper_path() -> Path:
+    return Path(__file__).with_name("doma_buy_domain.mjs")
+
+
 def _domain_listing_loader_path() -> Path:
     return Path(__file__).with_name("doma_node_esm_loader.mjs")
 
@@ -4561,6 +4596,39 @@ def _fetch_wallet_domain_listings_for_network_mode(
                 continue
             seen.add(listing.order_id)
             out.append(listing)
+    return out
+
+
+def _listing_price_decimal(listing: DomainListing) -> Decimal:
+    return raw_to_decimal(int(listing.price_raw or "0"), listing.currency_decimals or 0)
+
+
+def _fetch_cheapest_domain_listings_for_network_mode(
+    doma_api: DomaApiClient,
+    cfg: BotConfig,
+    network_mode_raw: str,
+    max_price_usdc: Decimal,
+    take: int = 100,
+    max_pages: int = 5,
+) -> List[DomainListing]:
+    out: List[DomainListing] = []
+    seen: set[str] = set()
+    for chain_id in _listing_network_chain_ids(cfg, network_mode_raw):
+        for listing in doma_api.fetch_cheapest_domain_listings(
+            chain_id=chain_id,
+            take=take,
+            max_pages=max_pages,
+            max_price_usd=max_price_usdc,
+        ):
+            if listing.order_id in seen:
+                continue
+            if "usdc" not in (listing.currency_symbol or "").lower():
+                continue
+            if _listing_price_decimal(listing) > max_price_usdc:
+                continue
+            seen.add(listing.order_id)
+            out.append(listing)
+    out.sort(key=_listing_price_decimal)
     return out
 
 
@@ -4937,6 +5005,104 @@ def _run_domain_accept_offer_helper(
         data = json.loads(result.stdout.splitlines()[-1])
     except Exception as exc:
         return False, "", f"failed to parse helper output: {exc}; stdout={result.stdout.strip()}"
+    if not data.get("ok"):
+        return False, "", str(data.get("error") or "unknown helper error")
+    tx_hash = str(((data.get("result") or {}).get("transactionHash")) or "")
+    status = str(((data.get("result") or {}).get("status")) or "")
+    if status and status != "success":
+        return False, tx_hash, f"transaction status={status}"
+    return True, tx_hash, ""
+
+
+def _run_domain_buy_helper(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    private_key: str,
+    listing: DomainListing,
+    proxy: Optional[str],
+) -> Tuple[bool, str, str]:
+    helper_path = _domain_buy_helper_path()
+    if not helper_path.exists():
+        raise FileNotFoundError(f"Buy domain helper not found: {helper_path}")
+    loader_path = _domain_listing_loader_path()
+    if not loader_path.exists():
+        raise FileNotFoundError(f"Node ESM loader not found: {loader_path}")
+    chain_id, rpc_url, rpc_urls = _listing_chain_context_from_network(cfg, listing.network_id)
+    payload = {
+        "chainId": chain_id,
+        "rpcUrl": rpc_url,
+        "rpcUrls": rpc_urls,
+        "privateKey": private_key,
+        "orderId": listing.order_id,
+        "source": DOMAIN_LISTING_SOURCE,
+        "orderbookBaseUrl": _doma_orderbook_base_url(cfg),
+        "apiKey": _first_doma_api_key(cfg),
+        "proxy": proxy or "",
+        "timeoutMs": 120000,
+    }
+    env = dict(os.environ)
+    if proxy:
+        env["HTTP_PROXY"] = proxy
+        env["HTTPS_PROXY"] = proxy
+    env["NODE_NO_WARNINGS"] = "1"
+    try:
+        result = subprocess.run(
+            ["node", "--loader", loader_path.as_uri(), str(helper_path)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(helper_path.parent),
+            env=env,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = "\n".join(str(x or "").strip() for x in (exc.stderr, exc.stdout) if x)
+        return False, "", f"buy helper timed out after 180 seconds; output={partial[:1000]}"
+    for line in result.stderr.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            logger.info("[BUY_DOMAIN] wallet=%s domain=%s helper: %s", wallet, listing.name, line)
+            continue
+        if event.get("type") == "progress":
+            tx_hashes = event.get("tx_hashes") or ""
+            if tx_hashes:
+                logger.info(
+                    "[BUY_DOMAIN] wallet=%s domain=%s progress | action=%s state=%s tx=%s",
+                    wallet,
+                    listing.name,
+                    event.get("action") or "",
+                    event.get("state") or event.get("status") or "",
+                    tx_hashes,
+                )
+        elif event.get("type") == "rpc_retry":
+            logger.info(
+                "[BUY_DOMAIN] wallet=%s domain=%s rpc retry | url=%s | error=%s",
+                wallet,
+                listing.name,
+                event.get("rpc_url") or "",
+                event.get("error") or "",
+            )
+        elif not event.get("ok", True):
+            logger.warning("[BUY_DOMAIN] wallet=%s domain=%s helper error: %s", wallet, listing.name, event.get("error"))
+    if result.returncode != 0:
+        return False, "", (result.stderr or result.stdout or f"node exited with {result.returncode}").strip()
+    data = None
+    for line in reversed(result.stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+            break
+        except Exception:
+            continue
+    if data is None:
+        return False, "", f"failed to parse helper output; stdout={result.stdout.strip()}"
     if not data.get("ok"):
         return False, "", str(data.get("error") or "unknown helper error")
     tx_hash = str(((data.get("result") or {}).get("transactionHash")) or "")
@@ -5399,6 +5565,221 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         skipped_wallets,
         failed_wallet_addresses,
     )
+
+
+def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    picked = get_domain_purchase_menu_input()
+    if not picked:
+        logger.info("[BUY_DOMAIN] canceled by user.")
+        return
+    max_price_raw, network_mode_raw, min_count_raw, max_count_raw, delay_min_raw, delay_max_raw = picked
+    max_price = _parse_decimal_input(max_price_raw)
+    count_min = int(_parse_decimal_input(min_count_raw))
+    count_max = int(_parse_decimal_input(max_count_raw))
+    buy_delay_min = float(_parse_decimal_input(delay_min_raw))
+    buy_delay_max = float(_parse_decimal_input(delay_max_raw))
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "BUY_DOMAIN")
+    if not wallet_key_records:
+        raise ValueError("No wallet/private-key pairs available for domain purchases")
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
+    quote_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
+    purchase_csv = cfg.trades_csv_file.parent / DOMAIN_PURCHASES_CSV.name
+    ensure_csv(
+        purchase_csv,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "domain",
+            "price_usdce",
+            "network_id",
+            "token_address",
+            "token_id",
+            "order_id",
+            "tx_hash",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+
+    metadata_proxies: Optional[Dict[str, str]] = None
+    for metadata_line_idx, _, _ in wallet_key_records:
+        candidate_proxies, skip_metadata_proxy = _proxy_for_line(cfg, metadata_line_idx, None, "BUY_DOMAIN_METADATA")
+        if not skip_metadata_proxy:
+            metadata_proxies = candidate_proxies
+            break
+    metadata_api = DomaApiClient(
+        cfg.doma_api_url,
+        api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+        proxies=metadata_proxies,
+    )
+    listings = _fetch_cheapest_domain_listings_for_network_mode(
+        metadata_api,
+        cfg,
+        network_mode_raw,
+        max_price_usdc=max_price,
+        take=100,
+        max_pages=10,
+    )
+    if not listings:
+        raise RuntimeError(f"No active domain listings found below {max_price} USDC.E")
+
+    logger.info(
+        "[BUY_DOMAIN] mode started | wallets=%s | start_wallet=%s | network=%s | max_price=%s USDC.E | buy_per_wallet=%s-%s | candidates=%s | delay=%s-%s sec",
+        total_loaded_wallets,
+        wallet_start_offset + 1,
+        _listing_network_label(cfg, network_mode_raw),
+        _format_decimal_plain(max_price),
+        count_min,
+        count_max,
+        len(listings),
+        delay_min_raw,
+        delay_max_raw,
+    )
+
+    used_order_ids: set[str] = set()
+    success_wallets = 0
+    failed_wallets = 0
+    skipped_wallets = 0
+    bought_total = 0
+    failed_wallet_addresses: List[str] = []
+
+    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "BUY_DOMAIN")
+        proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+        wallet_number = wallet_start_offset + idx
+        logger.info("[BUY_DOMAIN] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        if skip_wallet:
+            skipped_wallets += 1
+            continue
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+                proxies=proxies,
+            )
+            eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg=cfg,
+                logger=logger,
+                wallet=wallet,
+                private_key=private_key,
+                proxies=proxies,
+                log_prefix="[BUY_DOMAIN]",
+            )
+
+            owner_prefixes = {
+                f"eip155:{chain_id}:{wallet.lower()}"
+                for chain_id in _listing_network_chain_ids(cfg, network_mode_raw)
+            }
+            eligible = [
+                listing
+                for listing in listings
+                if listing.order_id not in used_order_ids and listing.offerer_address.lower() not in owner_prefixes
+            ]
+            buy_count = min(random.randint(count_min, count_max), len(eligible))
+            if buy_count <= 0:
+                skipped_wallets += 1
+                logger.info("[BUY_DOMAIN] wallet=%s no eligible cheapest listings left", wallet)
+                continue
+            selected = eligible[:buy_count]
+            required_usdc = sum((_listing_price_decimal(listing) for listing in selected), Decimal("0")) * Decimal("1.03")
+            usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+            if usdc_balance < required_usdc:
+                topup_ok = _top_up_usdce_from_eth_for_offer(
+                    cfg=cfg,
+                    logger=logger,
+                    state=state,
+                    doma_api=doma_api,
+                    exec_client=exec_client,
+                    quote_token=quote_token,
+                    weth_token=weth_token,
+                    wallet=wallet,
+                    eth_price=eth_price,
+                    required_usdc=required_usdc,
+                )
+                if topup_ok:
+                    usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+            if usdc_balance < required_usdc:
+                skipped_wallets += 1
+                logger.warning(
+                    "[BUY_DOMAIN] wallet=%s skipped | USDC.E balance below required buy amount (%s < %s)",
+                    wallet,
+                    _format_decimal_plain(usdc_balance),
+                    _format_decimal_plain(required_usdc),
+                )
+                continue
+
+            wallet_success = 0
+            wallet_failed = 0
+            for buy_idx, listing in enumerate(selected, start=1):
+                price = _listing_price_decimal(listing)
+                logger.info(
+                    "[BUY_DOMAIN] wallet=%s domain %s/%s %s | price=%s %s | network=%s | order_id=%s",
+                    wallet,
+                    buy_idx,
+                    len(selected),
+                    listing.name,
+                    _format_decimal_plain(price),
+                    listing.currency_symbol or "USDC.E",
+                    listing.network_id,
+                    listing.order_id,
+                )
+                ok, tx_hash, reason = _run_domain_buy_helper(
+                    cfg=cfg,
+                    logger=logger,
+                    wallet=wallet,
+                    private_key=private_key,
+                    listing=listing,
+                    proxy=proxy,
+                )
+                append_csv(
+                    purchase_csv,
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        "ok" if ok else "failed",
+                        wallet,
+                        listing.name,
+                        _format_decimal_plain(price),
+                        listing.network_id,
+                        listing.token_address,
+                        listing.token_id,
+                        listing.order_id,
+                        tx_hash,
+                        reason,
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+                used_order_ids.add(listing.order_id)
+                if ok:
+                    wallet_success += 1
+                    bought_total += 1
+                    logger.info("[BUY_DOMAIN] wallet=%s domain=%s bought | tx=%s", wallet, listing.name, tx_hash)
+                else:
+                    wallet_failed += 1
+                    logger.warning("[BUY_DOMAIN] wallet=%s domain=%s buy failed: %s", wallet, listing.name, reason)
+                if buy_idx < len(selected):
+                    delay_sec = random.uniform(buy_delay_min, buy_delay_max)
+                    logger.info("[BUY_DOMAIN] delay before next buy: %.2f sec", delay_sec)
+                    time.sleep(delay_sec)
+            if wallet_success > 0:
+                success_wallets += 1
+            if wallet_failed > 0:
+                failed_wallets += 1
+                failed_wallet_addresses.append(wallet)
+        except Exception as exc:
+            failed_wallets += 1
+            failed_wallet_addresses.append(wallet)
+            logger.warning("[BUY_DOMAIN] wallet=%s failed: %s", wallet, exc)
+        if idx < len(wallet_key_records):
+            delay_sec = random.uniform(buy_delay_min, buy_delay_max)
+            logger.info("[BUY_DOMAIN] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    logger.info("[BUY_DOMAIN] bought domains total=%s", bought_total)
+    _print_mode_summary("BUY_DOMAIN", len(wallet_key_records), success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses)
 
 
 def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -9970,8 +10351,9 @@ def get_menu_choice() -> str:
     print("18) Close/unstake subdomains")
     print("19) Withdraw from OKX to addresses")
     print("20) Deposit to exchange from L2")
-    print("21) Exit")
-    return input("Select [1-21]: ").strip()
+    print("21) Buy cheapest listed domains")
+    print("22) Exit")
+    return input("Select [1-22]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -10146,6 +10528,23 @@ def main() -> None:
             "chain",
             "symbol",
             "amount",
+            "tx_hash",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
+    ensure_csv(
+        cfg.points_csv_file.parent / DOMAIN_PURCHASES_CSV.name,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "domain",
+            "price_usdce",
+            "network_id",
+            "token_address",
+            "token_id",
+            "order_id",
             "tx_hash",
             "reason",
         ],
@@ -10343,6 +10742,16 @@ def main() -> None:
                 run_exchange_deposit_once(cfg, logger, state)
             except Exception as exc:
                 logger.exception("Exchange deposit mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "21":
+            validate_config(cfg)
+            try:
+                run_domain_purchase_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Domain purchase mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

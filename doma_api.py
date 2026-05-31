@@ -1285,6 +1285,111 @@ class DomaApiClient:
                 skip += len(items) if items else page_take
         return out
 
+    def fetch_cheapest_domain_listings(
+        self,
+        chain_id: int = 97477,
+        take: int = 100,
+        max_pages: int = 5,
+        max_price_usd: Optional[Decimal] = None,
+    ) -> List[DomainListing]:
+        query = """
+        query CheapestListings(
+          $skip: Int
+          $take: Int
+          $networkIds: [String!]
+          $priceRangeMax: Float
+        ) {
+          names(
+            skip: $skip
+            take: $take
+            sortBy: VALUE
+            sortOrder: ASC
+            listed: true
+            active: true
+            networkIds: $networkIds
+            priceRangeMax: $priceRangeMax
+            includeDetokenized: false
+          ) {
+            items {
+              name
+              tokens {
+                tokenId
+                tokenAddress
+                networkId
+                ownerAddress
+                orderbookDisabled
+                listings {
+                  id
+                  externalId
+                  price
+                  offererAddress
+                  expiresAt
+                  currency {
+                    symbol
+                    decimals
+                    usdExchangeRate
+                  }
+                }
+              }
+            }
+            hasNextPage
+          }
+        }
+        """
+        target_network = f"eip155:{chain_id}"
+        out: List[DomainListing] = []
+        seen: set[str] = set()
+        page_take = max(1, min(int(take), 500))
+        for page in range(max_pages):
+            data = self._post(
+                query,
+                {
+                    "skip": page * page_take,
+                    "take": page_take,
+                    "networkIds": [target_network],
+                    "priceRangeMax": float(max_price_usd) if max_price_usd is not None else None,
+                },
+            )
+            names_page = data.get("names") or {}
+            items = names_page.get("items") or []
+            for item in items:
+                name = str(item.get("name") or "").strip().lower()
+                if not name:
+                    continue
+                for token in item.get("tokens") or []:
+                    if bool(token.get("orderbookDisabled") or False):
+                        continue
+                    token_id = str(token.get("tokenId") or "").strip()
+                    token_address = str(token.get("tokenAddress") or "").strip().lower()
+                    network_id = str(token.get("networkId") or "").strip()
+                    owner_address = str(token.get("ownerAddress") or "").strip().lower()
+                    if not token_id or not token_address or network_id != target_network:
+                        continue
+                    for listing in token.get("listings") or []:
+                        order_id = str(listing.get("externalId") or listing.get("id") or "").strip()
+                        if not order_id or order_id in seen:
+                            continue
+                        seen.add(order_id)
+                        currency = listing.get("currency") or {}
+                        out.append(
+                            DomainListing(
+                                name=name,
+                                order_id=order_id,
+                                token_id=token_id,
+                                token_address=token_address,
+                                network_id=network_id,
+                                offerer_address=str(listing.get("offererAddress") or owner_address).strip().lower(),
+                                price_raw=str(listing.get("price") or "0"),
+                                currency_symbol=str(currency.get("symbol") or ""),
+                                currency_decimals=int(currency.get("decimals") or 0),
+                                expires_at=str(listing.get("expiresAt") or ""),
+                            )
+                        )
+            if not names_page.get("hasNextPage"):
+                break
+        out.sort(key=lambda item: raw_to_decimal(int(item.price_raw or "0"), item.currency_decimals or 0))
+        return out
+
     def fetch_domain_offer_candidates(
         self,
         chain_id: int = 97477,
