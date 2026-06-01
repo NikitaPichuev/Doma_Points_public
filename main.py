@@ -3645,7 +3645,7 @@ def run_domain_quest_volume_once(
                         break
                     _sleep_between_swaps()
                     continue
-                elif full_balance_usdc > 0:
+                elif has_usable_usdc:
                     full_in_symbol = "USDC.E"
                     full_out_symbol = rides_token.symbol
                     partial_in_symbol = rides_token.symbol
@@ -9827,7 +9827,7 @@ def run_volume_farm_once(
                 full_balance_eth = exec_client.get_native_balance() - reserve_eth
                 full_balance_eth = full_balance_eth if full_balance_eth > 0 else Decimal("0")
 
-                if full_balance_usdc > 0:
+                if full_balance_usdc >= MIN_EXECUTABLE_TRADE_USD:
                     full_in_symbol = "USDC.E"
                     full_out_symbol = "ETH"
                     partial_in_symbol = "ETH"
