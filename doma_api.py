@@ -1096,6 +1096,18 @@ class DomaApiClient:
             skip += len(items) if items else page_take
         return out
 
+    def fetch_domain_claimed_by(self, name: str) -> str:
+        query = """
+        query DomainClaimStatus($name: String!) {
+          name(name: $name, includeDetokenized: true) {
+            claimedBy
+          }
+        }
+        """
+        data = self._post(query, {"name": name.strip().lower()})
+        item = data.get("name") or {}
+        return str(item.get("claimedBy") or "").strip()
+
     def fetch_wallet_staked_subdomains(
         self,
         wallet_address: str,

@@ -154,6 +154,8 @@ DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
 DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
 DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
+DOMAIN_PURCHASE_CLAIM_WAIT_TIMEOUT_SEC = 45 * 60
+DOMAIN_PURCHASE_CLAIM_WAIT_INTERVAL_SEC = 30
 WEEKLY_VOLUME_TOPUP_BUFFER_USD = Decimal("1")
 KNOWN_ETH_USDCE_POOL_ADDRESSES = [
     "0xd604c96e51DF995bb46FAb0E3FC1b18d985AA8f5",
@@ -463,7 +465,7 @@ def _print_mode_summary(
     parts.append(f"обработано: {processed}")
     print("\n" + " | ".join(parts))
     if failed_wallets:
-        print(_color(_redact_wallet_addresses(f"[{mode}] wallets with errors: {', '.join(failed_wallets)}"), ANSI_RED))
+        print(_color(f"[{mode}] wallets with errors: {', '.join(failed_wallets)}", ANSI_RED))
 
 
 def ensure_csv(path: Path, header: List[str], delimiter: str = ",") -> None:
@@ -4157,8 +4159,14 @@ def get_domain_listing_menu_input() -> Optional[Tuple[str, str, str, str, str, s
     )
 
 
-def get_domain_purchase_menu_input() -> Optional[Tuple[str, str, str, str, str, str]]:
+def get_domain_purchase_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str]]:
     print("\nBuy cheapest listed domains:")
+    print("Action:")
+    print("1) Buy only")
+    print("2) Buy and list +$0.02-$0.05")
+    action_raw = input("Select [1-2, default 1]: ").strip() or "1"
+    if action_raw not in {"1", "2"}:
+        raise ValueError("Invalid domain purchase action")
     max_price_raw = input("Buy cheapest domains up to USDC.E price [1]: ").strip() or "1"
     max_price = _parse_decimal_input(max_price_raw)
     if max_price <= 0:
@@ -4184,7 +4192,7 @@ def get_domain_purchase_menu_input() -> Optional[Tuple[str, str, str, str, str, 
         raise ValueError("Domain buy delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum buy delay cannot be lower than minimum delay")
-    return max_price_raw, network_mode_raw, min_count_raw, max_count_raw, delay_min_raw, delay_max_raw
+    return action_raw, max_price_raw, network_mode_raw, min_count_raw, max_count_raw, delay_min_raw, delay_max_raw
 
 
 def get_domain_delisting_menu_input() -> Optional[Tuple[str, str, str, str]]:
@@ -4632,6 +4640,45 @@ def _fetch_cheapest_domain_listings_for_network_mode(
             out.append(listing)
     out.sort(key=_listing_price_decimal)
     return out
+
+
+def _wait_for_domain_claim(
+    doma_api: DomaApiClient,
+    logger: logging.Logger,
+    *,
+    wallet: str,
+    domain_name: str,
+    timeout_sec: int = DOMAIN_PURCHASE_CLAIM_WAIT_TIMEOUT_SEC,
+    interval_sec: int = DOMAIN_PURCHASE_CLAIM_WAIT_INTERVAL_SEC,
+) -> Tuple[bool, str]:
+    expected_suffix = f":{wallet.lower()}"
+    deadline = time.time() + max(0, timeout_sec)
+    last_claimed_by = ""
+    while True:
+        try:
+            last_claimed_by = doma_api.fetch_domain_claimed_by(domain_name)
+        except Exception as exc:
+            logger.warning("[BUY_DOMAIN] wallet=%s domain=%s claim status check failed: %s", wallet, domain_name, exc)
+            last_claimed_by = ""
+        if last_claimed_by.lower().endswith(expected_suffix):
+            logger.info("[BUY_DOMAIN] wallet=%s domain=%s claimed", wallet, domain_name)
+            return True, last_claimed_by
+        if time.time() >= deadline:
+            logger.warning(
+                "[BUY_DOMAIN] wallet=%s domain=%s claim not confirmed before timeout | claimed_by=%s",
+                wallet,
+                domain_name,
+                last_claimed_by or "unknown",
+            )
+            return False, last_claimed_by
+        logger.info(
+            "[BUY_DOMAIN] wallet=%s domain=%s waiting registrar claim | claimed_by=%s | next_check=%ss",
+            wallet,
+            domain_name,
+            last_claimed_by or "unknown",
+            interval_sec,
+        )
+        time.sleep(max(1, interval_sec))
 
 
 def _run_domain_listing_helper(
@@ -5574,7 +5621,8 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     if not picked:
         logger.info("[BUY_DOMAIN] canceled by user.")
         return
-    max_price_raw, network_mode_raw, min_count_raw, max_count_raw, delay_min_raw, delay_max_raw = picked
+    action_raw, max_price_raw, network_mode_raw, min_count_raw, max_count_raw, delay_min_raw, delay_max_raw = picked
+    relist_enabled = action_raw == "2"
     max_price = _parse_decimal_input(max_price_raw)
     count_min = int(_parse_decimal_input(min_count_raw))
     count_max = int(_parse_decimal_input(max_count_raw))
@@ -5632,15 +5680,19 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         raise RuntimeError(f"No active domain listings found below {max_price} USDC.E")
 
     logger.info(
-        "[BUY_DOMAIN] mode started | wallets=%s | start_wallet=%s | network=%s | max_price=%s USDC.E | buy_per_wallet=%s-%s | relist_markup=%s-%s USDC.E | candidates=%s | delay=%s-%s sec",
+        "[BUY_DOMAIN] mode started | wallets=%s | start_wallet=%s | network=%s | max_price=%s USDC.E | buy_per_wallet=%s-%s | action=%s | relist_markup=%s | candidates=%s | delay=%s-%s sec",
         total_loaded_wallets,
         wallet_start_offset + 1,
         _listing_network_label(cfg, network_mode_raw),
         _format_decimal_plain(max_price),
         count_min,
         count_max,
-        _format_decimal_plain(DOMAIN_PURCHASE_RELIST_MARKUP_MIN),
-        _format_decimal_plain(DOMAIN_PURCHASE_RELIST_MARKUP_MAX),
+        "buy+list" if relist_enabled else "buy-only",
+        (
+            f"{_format_decimal_plain(DOMAIN_PURCHASE_RELIST_MARKUP_MIN)}-{_format_decimal_plain(DOMAIN_PURCHASE_RELIST_MARKUP_MAX)} USDC.E"
+            if relist_enabled
+            else "off"
+        ),
         len(listings),
         delay_min_raw,
         delay_max_raw,
@@ -5745,7 +5797,16 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 relist_price = Decimal("0")
                 relist_order_id = ""
                 relist_reason = ""
+                claim_ok = False
+                claim_status = ""
                 if ok:
+                    claim_ok, claim_status = _wait_for_domain_claim(
+                        doma_api,
+                        logger,
+                        wallet=wallet,
+                        domain_name=listing.name,
+                    )
+                if ok and relist_enabled and claim_ok:
                     markup = Decimal(random.randint(
                         int(DOMAIN_PURCHASE_RELIST_MARKUP_MIN * Decimal("100")),
                         int(DOMAIN_PURCHASE_RELIST_MARKUP_MAX * Decimal("100")),
@@ -5788,11 +5849,18 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                         )
                     else:
                         logger.warning("[BUY_DOMAIN] wallet=%s domain=%s relist failed: %s", wallet, listing.name, relist_reason)
+                elif ok and relist_enabled and not claim_ok:
+                    relist_reason = f"domain claim not confirmed: {claim_status or 'unknown'}"
+                    logger.warning("[BUY_DOMAIN] wallet=%s domain=%s relist skipped: %s", wallet, listing.name, relist_reason)
                 append_csv(
                     purchase_csv,
                     [
                         datetime.now(timezone.utc).isoformat(),
-                        "ok" if ok and relist_order_id else ("bought_relist_failed" if ok else "failed"),
+                        (
+                            "ok"
+                            if ok and claim_ok and (not relist_enabled or relist_order_id)
+                            else ("bought_claim_pending" if ok and not claim_ok else ("bought_relist_failed" if ok else "failed"))
+                        ),
                         wallet,
                         listing.name,
                         _format_decimal_plain(price),
@@ -5813,7 +5881,7 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     wallet_success += 1
                     bought_total += 1
                     logger.info("[BUY_DOMAIN] wallet=%s domain=%s bought | tx=%s", wallet, listing.name, tx_hash)
-                    if not relist_order_id:
+                    if relist_enabled and not relist_order_id:
                         wallet_failed += 1
                 else:
                     wallet_failed += 1
@@ -6299,7 +6367,10 @@ def _top_up_liquidity_token(
     usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
     spendable_usdc = usdc_balance
     if token.address.lower() != quote_token.address.lower() and reserve_quote_usd > 0:
-        spendable_usdc = max(Decimal("0"), usdc_balance - reserve_quote_usd)
+        quote_price = pick_token_usd_price(quote_token, eth_price)
+        quote_balance_usd = usdc_balance * quote_price if quote_price > 0 else usdc_balance
+        reserve_missing_usd = max(Decimal("0"), reserve_quote_usd - quote_balance_usd)
+        spendable_usdc = max(Decimal("0"), usdc_balance - reserve_missing_usd)
     if token.address.lower() != quote_token.address.lower() and spendable_usdc >= buy_usd:
         return _execute_trade_via_doma_ui_route(
             cfg=cfg,
@@ -7233,8 +7304,26 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     success_wallets = failed_wallets = skipped_wallets = 0
     buy_success_count = buy_failed_count = 0
     subdomain_success_count = subdomain_failed_count = 0
+    failed_wallet_addresses: List[str] = []
+    failed_wallet_seen: set[str] = set()
+    subdomain_failed_wallets: List[str] = []
+    subdomain_failed_seen: set[str] = set()
     insufficient_balance_wallets: List[str] = []
     insufficient_balance_seen: set[str] = set()
+
+    def _remember_failed_wallet(wallet_number: int, wallet_address: str, reason: str) -> None:
+        key = wallet_address.lower()
+        if key in failed_wallet_seen:
+            return
+        failed_wallet_seen.add(key)
+        failed_wallet_addresses.append(f"#{wallet_number} {wallet_address} | {reason}")
+
+    def _remember_subdomain_failed(wallet_number: int, wallet_address: str, reason: str) -> None:
+        key = wallet_address.lower()
+        if key in subdomain_failed_seen:
+            return
+        subdomain_failed_seen.add(key)
+        subdomain_failed_wallets.append(f"#{wallet_number} {wallet_address} | {reason}")
 
     def _remember_insufficient(wallet_number: int, wallet_address: str) -> None:
         if wallet_address.lower() in insufficient_balance_seen:
@@ -7371,9 +7460,13 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                         break
                     if claimed_failed > 0:
                         wallet_failed += 1
+                        reason = f"subdomain creation failed={claimed_failed} token={domain_token.symbol}"
+                        _remember_subdomain_failed(wallet_number, wallet, reason)
+                        _remember_failed_wallet(wallet_number, wallet, reason)
                 else:
                     buy_failed_count += 1
                     wallet_failed += 1
+                    _remember_failed_wallet(wallet_number, wallet, f"buy failed token={domain_token.symbol}")
                 if token_idx < len(selected_tokens):
                     delay_sec = random.uniform(float(delay_min), float(delay_max))
                     logger.info("[CHEAP_BUY] delay before next token: %.2f sec", delay_sec)
@@ -7382,8 +7475,10 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 success_wallets += 1
             elif wallet_failed > 0:
                 failed_wallets += 1
+                _remember_failed_wallet(wallet_number, wallet, "wallet finished with errors")
         except Exception as exc:
             failed_wallets += 1
+            _remember_failed_wallet(wallet_number, wallet, f"exception: {exc}")
             logger.warning("[CHEAP_BUY] wallet=%s failed: %s", wallet, exc)
         if idx < len(wallet_key_records):
             delay_sec = random.uniform(float(delay_min), float(delay_max))
@@ -7393,8 +7488,19 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     if insufficient_balance_wallets:
         print("\n[CHEAP_BUY] wallets with insufficient balance:")
         for entry in insufficient_balance_wallets:
+            print(_redact_wallet_addresses(f"  {entry}"))
+    if subdomain_failed_wallets:
+        print("\n[CHEAP_BUY] wallets with subdomain errors:")
+        for entry in subdomain_failed_wallets:
             print(f"  {entry}")
-    _print_mode_summary("CHEAP_BUY", total=len(wallet_key_records), success=success_wallets, failed=failed_wallets, skipped=skipped_wallets)
+    _print_mode_summary(
+        "CHEAP_BUY",
+        total=len(wallet_key_records),
+        success=success_wallets,
+        failed=failed_wallets,
+        skipped=skipped_wallets,
+        failed_wallets=failed_wallet_addresses,
+    )
 
 
 def _closeable_subdomains(items: List[StakedSubdomain]) -> Tuple[List[StakedSubdomain], List[Tuple[str, str]]]:
