@@ -2778,12 +2778,19 @@ def _normalize_domain_token_symbol(raw: str) -> str:
 
 
 def _wait_tx_receipt(exec_client: EvmExecutionClient, tx_hash: str, timeout_sec: int = 180) -> bool:
-    try:
-        receipt = exec_client.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_sec, poll_latency=2)
-        status = int(getattr(receipt, "status", 0))
-        return status == 1
-    except Exception:
-        return False
+    deadline = time.time() + max(1, timeout_sec)
+    while time.time() < deadline:
+        try:
+            receipt = exec_client.web3.eth.wait_for_transaction_receipt(
+                tx_hash,
+                timeout=min(15, max(1, int(deadline - time.time()))),
+                poll_latency=2,
+            )
+            status = int(getattr(receipt, "status", 0))
+            return status == 1
+        except Exception:
+            time.sleep(2)
+    return False
 
 
 def _find_token_by_address(pools: List[Pool], address: str) -> Optional[Token]:
@@ -3749,7 +3756,11 @@ def run_domain_quest_volume_once(
                         label=f"{mode_label} {wallet} {rides_token.symbol}>USDC.E",
                         wait_for_pre_tx=True,
                     )
-                if not ok_full or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                if not ok_full or not state.last_tx_hash:
+                    wallet_failed = True
+                    break
+                if not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                    logger.warning(_quest_log("wallet=%s full step tx not confirmed before timeout | tx=%s"), wallet, state.last_tx_hash)
                     wallet_failed = True
                     break
                 if require_min_single_swap and not min_single_swap_done and full_trade_usd < min_single_swap_usd:
@@ -3888,7 +3899,11 @@ def run_domain_quest_volume_once(
                         label=f"{mode_label} {wallet} {rides_token.symbol}>USDC.E",
                         wait_for_pre_tx=True,
                     )
-                if not ok_partial or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                if not ok_partial or not state.last_tx_hash:
+                    wallet_failed = True
+                    break
+                if not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                    logger.warning(_quest_log("wallet=%s partial step tx not confirmed before timeout | tx=%s"), wallet, state.last_tx_hash)
                     wallet_failed = True
                     break
                 partial_after_usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
@@ -9884,7 +9899,11 @@ def run_volume_farm_once(
                     unwrap_to_native=full_out_symbol == "ETH",
                     wait_for_pre_tx=True,
                 )
-                if not ok_full or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                if not ok_full or not state.last_tx_hash:
+                    wallet_failed = True
+                    break
+                if not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                    logger.warning("[VOLUME] wallet=%s full step tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
                     wallet_failed = True
                     break
                 full_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
@@ -9969,7 +9988,11 @@ def run_volume_farm_once(
                     unwrap_to_native=partial_out_symbol == "ETH",
                     wait_for_pre_tx=True,
                 )
-                if not ok_partial or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                if not ok_partial or not state.last_tx_hash:
+                    wallet_failed = True
+                    break
+                if not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                    logger.warning("[VOLUME] wallet=%s partial step tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
                     wallet_failed = True
                     break
                 partial_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
@@ -10025,7 +10048,10 @@ def run_volume_farm_once(
                         unwrap_to_native=True,
                         wait_for_pre_tx=True,
                     )
-                    if not ok_settle or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                    if not ok_settle or not state.last_tx_hash:
+                        wallet_failed = True
+                    elif not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                        logger.warning("[VOLUME] wallet=%s final settle tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
                         wallet_failed = True
                     else:
                         final_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
