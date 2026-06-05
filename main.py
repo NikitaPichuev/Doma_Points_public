@@ -1813,7 +1813,7 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             logger.warning("Quest check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
         try:
             if balance_token_catalog is None:
-                balance_token_catalog = api.fetch_fractional_tokens(take=250, max_pages=20)
+                balance_token_catalog = api.fetch_fractional_tokens(take=100, max_pages=20)
             _log_wallet_balances_column(cfg, logger, wallet, idx + 1, api, proxies, balance_token_catalog)
         except Exception as exc:
             logger.warning("Balance check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
