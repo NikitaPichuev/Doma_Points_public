@@ -1780,6 +1780,7 @@ def _log_wallet_balances_column(
 
 
 def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
     wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
     if not wallets:
         logger.warning("Points check skipped: no wallets configured")
@@ -1791,7 +1792,6 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     points_wallet_order = _prompt_wallet_order(default_random=True)
     if points_wallet_order == "random":
         random.shuffle(wallet_records)
-    balance_token_catalog: Optional[List[LaunchpadTokenInfo]] = None
     for order_idx, (idx, wallet) in enumerate(wallet_records):
         ctx = _wallet_api_context(cfg, idx, logger, "Points/quests check")
         if ctx is None:
@@ -1811,12 +1811,6 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             _write_quest_statuses(cfg, logger, wallet, idx + 1, api)
         except Exception as exc:
             logger.warning("Quest check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
-        try:
-            if balance_token_catalog is None:
-                balance_token_catalog = api.fetch_fractional_tokens(take=100, max_pages=20)
-            _log_wallet_balances_column(cfg, logger, wallet, idx + 1, api, proxies, balance_token_catalog)
-        except Exception as exc:
-            logger.warning("Balance check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
         if order_idx < len(wallet_records) - 1:
             delay_sec = random.uniform(2, 5)
             logger.info("Delay before next wallet: %.2f sec", delay_sec)
@@ -1844,6 +1838,45 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             )
     except Exception as exc:
         logger.warning("Doma cost report failed during points/quests check: %s", exc)
+
+
+def run_balances_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
+    if not wallets:
+        logger.warning("Balance check skipped: no wallets configured")
+        return
+    start_number = _prompt_start_wallet_number(len(wallets))
+    end_number = _prompt_end_wallet_number(len(wallets), start_number)
+    wallet_records = list(enumerate(wallets))[start_number - 1:end_number]
+    wallet_order = _prompt_wallet_order(default_random=True)
+    if wallet_order == "random":
+        random.shuffle(wallet_records)
+
+    balance_token_catalog: Optional[List[LaunchpadTokenInfo]] = None
+    logger.info("[BALANCES] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | min_value=$0.01", len(wallets), start_number, end_number)
+    for order_idx, (idx, wallet) in enumerate(wallet_records):
+        logger.info("[BALANCES] wallet %s/%s - %s", idx + 1, len(wallets), wallet)
+        ctx = _wallet_api_context(cfg, idx, logger, "Balance check")
+        if ctx is None:
+            continue
+        api_key, proxies = ctx
+        api = DomaApiClient(
+            cfg.doma_api_url,
+            api_key=api_key,
+            api_keys=[api_key] if api_key else [],
+            proxies=proxies,
+        )
+        try:
+            if balance_token_catalog is None:
+                balance_token_catalog = api.fetch_fractional_tokens(take=100, max_pages=20)
+            _log_wallet_balances_column(cfg, logger, wallet, idx + 1, api, proxies, balance_token_catalog)
+        except Exception as exc:
+            logger.warning("Balance check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
+        if order_idx < len(wallet_records) - 1:
+            delay_sec = random.uniform(2, 5)
+            logger.info("[BALANCES] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
 
 
 def _fetch_wallet_points_snapshot(
@@ -10610,7 +10643,7 @@ def run_swap_loop(cfg: BotConfig, logger: logging.Logger, state: BotState) -> No
 def get_menu_choice() -> str:
     print("\nChoose mode:")
     print("1) Bridge")
-    print("2) Check points + quests")
+    print("2) Check points / quests / balances")
     print("3) Close all positions")
     print("4) Swap domain token")
     print("5) Swap ETH / WETH / USDC.E")
@@ -10632,6 +10665,14 @@ def get_menu_choice() -> str:
     print("21) Buy cheapest listed domains")
     print("22) Exit")
     return input("Select [1-22]: ").strip()
+
+
+def get_points_menu_choice() -> str:
+    print("\nCheck points / quests / balances:")
+    print("1) Points + quests")
+    print("2) Balances only")
+    print("3) Back")
+    return input("Select [1-3]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -10722,6 +10763,20 @@ def run_doma_quests_menu_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         if choice == "10":
             return
         raise ValueError("Invalid Doma quest selection")
+
+
+def run_points_menu_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    while True:
+        choice = get_points_menu_choice()
+        if choice == "1":
+            run_points_once(cfg, logger, state)
+            return
+        if choice == "2":
+            run_balances_once(cfg, logger, state)
+            return
+        if choice == "3":
+            return
+        raise ValueError("Invalid points submenu selection")
 
 
 def main() -> None:
@@ -10860,7 +10915,7 @@ def main() -> None:
                 logger.exception("Bridge mode failed: %s", exc)
             return
         if choice == "2":
-            run_points_once(cfg, logger, state)
+            run_points_menu_once(cfg, logger, state)
             save_state(cfg.state_file, state)
             return
         if choice == "3":
