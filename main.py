@@ -29,6 +29,7 @@ from doma_api import (
     DOMA_INTERFACE_PORTION_BIPS,
     DOMA_INTERFACE_PORTION_RECIPIENT,
     DOMA_NATIVE_TOKEN_SENTINEL,
+    ERC20_ABI,
     EvmExecutionClient,
     LaunchpadTokenInfo,
     OwnedDomain,
@@ -1702,6 +1703,82 @@ def _write_quest_statuses(
     _log_quests_column(logger, wallet, line_no, quests)
 
 
+def _balance_reader_web3(cfg: BotConfig, proxies: Optional[Dict[str, str]]) -> Web3:
+    request_kwargs: Dict[str, Any] = {"timeout": 20}
+    if proxies:
+        request_kwargs["proxies"] = proxies
+    errors: List[str] = []
+    for rpc_url in _doma_rpc_candidates(cfg):
+        try:
+            web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs=request_kwargs))
+            if web3.is_connected():
+                return web3
+            errors.append(f"{rpc_url}: not connected")
+        except Exception as exc:
+            errors.append(f"{rpc_url}: {exc}")
+    raise RuntimeError("All balance RPC attempts failed: " + " | ".join(errors))
+
+
+def _erc20_balance_readonly(web3: Web3, wallet: str, token_address: str, decimals: int) -> Decimal:
+    token = web3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+    raw = token.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+    return Decimal(int(raw)) / (Decimal(10) ** int(decimals))
+
+
+def _log_wallet_balances_column(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet: str,
+    line_no: int,
+    api: DomaApiClient,
+    proxies: Optional[Dict[str, str]],
+    token_catalog: List[LaunchpadTokenInfo],
+) -> None:
+    min_value_usd = Decimal("0.01")
+    web3 = _balance_reader_web3(cfg, proxies)
+    quote_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
+    eth_price = _fetch_eth_price_via_doma_quote(cfg, api, quote_token)
+    balances: List[Tuple[str, Decimal, Decimal]] = []
+
+    native_eth = Decimal(web3.eth.get_balance(Web3.to_checksum_address(wallet))) / Decimal(10**18)
+    native_usd = native_eth * eth_price
+    if native_usd > min_value_usd:
+        balances.append(("ETH", native_eth, native_usd))
+
+    seen_addresses: set[str] = set()
+
+    def _add_erc20(symbol: str, address: str, decimals: int, price_usd: Decimal) -> None:
+        addr = (address or "").strip().lower()
+        if not addr or addr in seen_addresses or price_usd <= 0:
+            return
+        seen_addresses.add(addr)
+        try:
+            balance = _erc20_balance_readonly(web3, wallet, addr, decimals)
+        except Exception as exc:
+            logger.warning("Balances [%s] [line=%s]: token=%s read failed: %s", wallet, line_no, symbol, exc)
+            return
+        value_usd = balance * price_usd
+        if value_usd > min_value_usd:
+            balances.append((symbol, balance, value_usd))
+
+    _add_erc20("WETH", weth_token.address, weth_token.decimals, eth_price)
+    _add_erc20("USDC.E", quote_token.address, quote_token.decimals, Decimal("1"))
+    for info in token_catalog:
+        _add_erc20(canonical_symbol(info.symbol or info.name), info.address, info.decimals, info.price_usd)
+
+    balances.sort(key=lambda item: item[2], reverse=True)
+    if not balances:
+        logger.info("Balances [%s] [line=%s]: no tokens above $0.01", wallet, line_no)
+        return
+    lines = [f"Balances [{wallet}] [line={line_no}] > $0.01"]
+    total_usd = sum((value for _, _, value in balances), Decimal("0"))
+    for symbol, amount, value_usd in balances:
+        lines.append(f"  {symbol}: {_format_decimal_plain(amount)} (~${_format_decimal_plain(value_usd)})")
+    lines.append(f"  TOTAL: ~${_format_decimal_plain(total_usd)}")
+    logger.info("\n".join(lines))
+
+
 def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
     wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
     if not wallets:
@@ -1714,6 +1791,7 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     points_wallet_order = _prompt_wallet_order(default_random=True)
     if points_wallet_order == "random":
         random.shuffle(wallet_records)
+    balance_token_catalog: Optional[List[LaunchpadTokenInfo]] = None
     for order_idx, (idx, wallet) in enumerate(wallet_records):
         ctx = _wallet_api_context(cfg, idx, logger, "Points/quests check")
         if ctx is None:
@@ -1733,6 +1811,12 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             _write_quest_statuses(cfg, logger, wallet, idx + 1, api)
         except Exception as exc:
             logger.warning("Quest check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
+        try:
+            if balance_token_catalog is None:
+                balance_token_catalog = api.fetch_fractional_tokens(take=250, max_pages=20)
+            _log_wallet_balances_column(cfg, logger, wallet, idx + 1, api, proxies, balance_token_catalog)
+        except Exception as exc:
+            logger.warning("Balance check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
         if order_idx < len(wallet_records) - 1:
             delay_sec = random.uniform(2, 5)
             logger.info("Delay before next wallet: %.2f sec", delay_sec)
