@@ -149,7 +149,8 @@ DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
 DOMA_COST_REPORT_CSV = Path("doma_cost_report.csv")
 OKX_WITHDRAWALS_CSV = Path("okx_withdrawals.csv")
 EXCHANGE_DEPOSITS_CSV = Path("exchange_deposits.csv")
-DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1")
+DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.06")
+DOMAIN_LIQUIDITY_MIN_EXTRA_USD = Decimal("0.25")
 DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
 DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
@@ -6542,7 +6543,10 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
 
         target_usd = _random_decimal_between(min_usd, max_usd, min_usd_raw, max_usd_raw)
         pool = random.choice(top_pools)
-        mint_target_usd = (target_usd * DOMAIN_LIQUIDITY_MINT_BUFFER).quantize(Decimal("0.000001"))
+        mint_target_usd = max(
+            target_usd * DOMAIN_LIQUIDITY_MINT_BUFFER,
+            target_usd + DOMAIN_LIQUIDITY_MIN_EXTRA_USD,
+        ).quantize(Decimal("0.000001"))
         half_usd = target_usd / Decimal("2")
         half_mint_usd = mint_target_usd / Decimal("2")
         token0_price = pick_token_usd_price(pool.token0, eth_price)
