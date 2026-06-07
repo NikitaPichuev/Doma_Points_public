@@ -7932,7 +7932,18 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 bootstrap_eth = min(max(missing_usdc, MIN_EXECUTABLE_TRADE_USD) / eth_price, spendable_eth)
                 bootstrap_usd = bootstrap_eth * eth_price
                 if bootstrap_eth <= 0 or bootstrap_usd < MIN_EXECUTABLE_TRADE_USD:
-                    return False, current, f"eth_bootstrap_below_min:{_format_decimal_plain(bootstrap_usd)}"
+                    native_eth_usd = native_eth * eth_price
+                    spendable_eth_usd = spendable_eth * eth_price
+                    return (
+                        False,
+                        current,
+                        "eth_bootstrap_below_min:"
+                        f"native_eth={_format_decimal_plain(native_eth)}(~${_format_decimal_plain(native_eth_usd)}),"
+                        "reserve=$0.05,"
+                        f"spendable=${_format_decimal_plain(spendable_eth_usd)},"
+                        f"missing_usdc={_format_decimal_plain(missing_usdc)},"
+                        f"min_swap=${_format_decimal_plain(swap_min_usdc)}",
+                    )
                 logger.info(
                     "%s wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E | %s",
                     wallet_log_prefix,
