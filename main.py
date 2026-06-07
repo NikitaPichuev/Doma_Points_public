@@ -7925,10 +7925,54 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     return True, current, ""
                 if eth_price <= 0:
                     return False, current, "eth_price_unknown"
+                missing_usdc = required_usdc - current
+
+                weth_balance = exec_client.get_erc20_balance(weth_token.address, weth_token.decimals)
+                weth_balance_usd = weth_balance * eth_price
+                if weth_balance_usd >= MIN_EXECUTABLE_TRADE_USD:
+                    weth_topup_usd = min(max(missing_usdc, MIN_EXECUTABLE_TRADE_USD), weth_balance_usd)
+                    logger.info(
+                        "%s wallet=%s bootstrap | WETH->USDC.E amount=$%s | target_missing=%s USDC.E | WETH_balance=$%s | %s",
+                        wallet_log_prefix,
+                        wallet,
+                        _format_decimal_plain(weth_topup_usd),
+                        _format_decimal_plain(missing_usdc),
+                        _format_decimal_plain(weth_balance_usd),
+                        reason_label,
+                    )
+                    topup_ok = _execute_trade_via_doma_ui_route(
+                        cfg=cfg,
+                        logger=logger,
+                        state=state,
+                        doma_api=doma_api,
+                        exec_client=exec_client,
+                        token_in=weth_token,
+                        token_out=quote_token,
+                        display_in_symbol="WETH",
+                        display_out_symbol="USDC.E",
+                        trade_amount_expr=f"${_format_decimal_plain(weth_topup_usd)}",
+                        eth_price=eth_price,
+                        label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} WETH>USDC.E TOPUP",
+                        is_eth_source=False,
+                        unwrap_to_native=False,
+                        wait_for_pre_tx=True,
+                    )
+                    if topup_ok and state.last_tx_hash:
+                        topup_ok = _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                    current = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                    if current >= required_usdc:
+                        return True, current, ""
+                    if not topup_ok:
+                        logger.warning(
+                            "%s wallet=%s WETH->USDC.E bootstrap failed, trying native ETH fallback",
+                            wallet_log_prefix,
+                            wallet,
+                        )
+
+                missing_usdc = required_usdc - current
                 reserve_eth = Decimal("0.05") / eth_price
                 native_eth = exec_client.get_native_balance()
                 spendable_eth = native_eth - reserve_eth
-                missing_usdc = required_usdc - current
                 bootstrap_eth = min(max(missing_usdc, MIN_EXECUTABLE_TRADE_USD) / eth_price, spendable_eth)
                 bootstrap_usd = bootstrap_eth * eth_price
                 if bootstrap_eth <= 0 or bootstrap_usd < MIN_EXECUTABLE_TRADE_USD:
@@ -7941,6 +7985,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         f"native_eth={_format_decimal_plain(native_eth)}(~${_format_decimal_plain(native_eth_usd)}),"
                         "reserve=$0.05,"
                         f"spendable=${_format_decimal_plain(spendable_eth_usd)},"
+                        f"weth=${_format_decimal_plain(weth_balance_usd)},"
                         f"missing_usdc={_format_decimal_plain(missing_usdc)},"
                         f"min_swap=${_format_decimal_plain(swap_min_usdc)}",
                     )
