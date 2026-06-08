@@ -40,6 +40,10 @@ def _parse_csv_to_set(value: str) -> Set[str]:
     return {x.strip().lower() for x in value.split(",") if x.strip()}
 
 
+def _parse_csv_to_list(value: str) -> List[str]:
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
 def _normalize_proxy(value: str) -> str:
     v = (value or "").strip()
     if not v:
@@ -67,6 +71,7 @@ def _is_valid_evm_address(addr: str) -> bool:
 class BotConfig:
     # Network
     rpc_url: str = os.getenv("RPC_URL", "https://rpc.doma.xyz/")
+    doma_rpc_urls: List[str] = field(default_factory=lambda: _parse_csv_to_list(os.getenv("DOMA_RPC_URLS", "")))
     subgraph_url: str = os.getenv(
         "SUBGRAPH_URL",
         "https://graph.doma.xyz/subgraphs/name/uniswap-v3-doma-mainnet",

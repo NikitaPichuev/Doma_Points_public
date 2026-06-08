@@ -273,7 +273,7 @@ def _random_swap_delay_sec() -> float:
 
 def _doma_rpc_candidates(cfg: BotConfig) -> List[str]:
     candidates: List[str] = []
-    for rpc_url in [cfg.rpc_url, "https://rpc.doma.xyz/", "https://doma.drpc.org/"]:
+    for rpc_url in [cfg.rpc_url, *getattr(cfg, "doma_rpc_urls", []), "https://rpc.doma.xyz/", "https://doma.drpc.org/"]:
         normalized = (rpc_url or "").strip()
         if normalized and normalized not in candidates:
             candidates.append(normalized)

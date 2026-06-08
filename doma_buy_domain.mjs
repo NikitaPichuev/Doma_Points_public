@@ -73,6 +73,10 @@ function emitProgress(steps) {
   );
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function normalizeProxy(value) {
   const v = String(value || '').trim();
   if (!v) {
@@ -144,31 +148,37 @@ async function main() {
   });
 
   let lastError = null;
+  const attemptsPerRpc = Math.max(1, Number(input.rpcAttempts || 3));
   for (const rpcUrl of rpcUrls) {
-    let provider = null;
-    try {
-      provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: `eip155:${chainId}` });
-      const signer = new ethers.Wallet(privateKey, provider);
-      const config = {
-        source,
-        chains: [buildChain(chainId, rpcUrl)],
-        apiClientOptions: {
-          baseUrl,
-          defaultHeaders,
-        },
-      };
-      const handler = new BuyListingHandler(config, apiClient, signer, `eip155:${chainId}`, emitProgress, {
-        seaportBalanceAndApprovalChecksOnOrderCreation: false,
-      });
-      const result = await handler.execute({ orderId });
-      console.log(stringifyJson({ ok: true, rpcUrl, result }));
-      return;
-    } catch (error) {
-      lastError = error;
-      console.error(stringifyJson({ type: 'rpc_retry', rpc_url: rpcUrl, error: summarizeError(error) }));
-    } finally {
-      if (provider && typeof provider.destroy === 'function') {
-        provider.destroy();
+    for (let attempt = 1; attempt <= attemptsPerRpc; attempt += 1) {
+      let provider = null;
+      try {
+        provider = new ethers.JsonRpcProvider(rpcUrl, { chainId, name: `eip155:${chainId}` });
+        const signer = new ethers.Wallet(privateKey, provider);
+        const config = {
+          source,
+          chains: [buildChain(chainId, rpcUrl)],
+          apiClientOptions: {
+            baseUrl,
+            defaultHeaders,
+          },
+        };
+        const handler = new BuyListingHandler(config, apiClient, signer, `eip155:${chainId}`, emitProgress, {
+          seaportBalanceAndApprovalChecksOnOrderCreation: false,
+        });
+        const result = await handler.execute({ orderId });
+        console.log(stringifyJson({ ok: true, rpcUrl, result }));
+        return;
+      } catch (error) {
+        lastError = error;
+        console.error(stringifyJson({ type: 'rpc_retry', rpc_url: rpcUrl, attempt, attempts: attemptsPerRpc, error: summarizeError(error) }));
+        if (attempt < attemptsPerRpc) {
+          await sleep(1000 * attempt);
+        }
+      } finally {
+        if (provider && typeof provider.destroy === 'function') {
+          provider.destroy();
+        }
       }
     }
   }
