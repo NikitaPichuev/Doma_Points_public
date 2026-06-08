@@ -7471,8 +7471,8 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "CHEAP_BUY")
-        wallet_number = wallet_start_offset + idx
-        logger.info("[CHEAP_BUY] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        wallet_number = line_idx + 1
+        logger.info("[CHEAP_BUY] wallet %s/%s | wallet#%s - %s", idx, len(wallet_key_records), wallet_number, wallet)
         if skip_wallet or not proxies:
             skipped_wallets += 1
             logger.warning("[CHEAP_BUY] wallet=%s skipped: proxy is required for cheap token buy", wallet)
