@@ -187,6 +187,10 @@ def _wallet_progress_label(idx: int, total: int, wallet: str) -> str:
     return f"{idx + 1}/{total} - {wallet}"
 
 
+def _wallet_record_progress_label(process_idx: int, selected_total: int, line_idx: int, total_wallets: int, wallet: str) -> str:
+    return f"{process_idx + 1}/{selected_total} | wallet#{line_idx + 1}/{total_wallets} - {wallet}"
+
+
 def _current_week_start_utc() -> datetime:
     now = datetime.now(timezone.utc)
     today_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
@@ -2075,7 +2079,7 @@ def run_bridge_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
         if skip_wallet:
             skipped_wallets += 1
             continue
-        logger.info("[BRIDGE] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
+        logger.info("[BRIDGE] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         wallet_tasks = bridge_tasks
         try:
             wallet_tasks = _expand_bridge_tasks_for_wallet(bridge_tasks)
@@ -2187,7 +2191,7 @@ def run_close_position_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
         if skip_wallet:
             skipped_wallets += 1
             continue
-        logger.info("[POSITION] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
+        logger.info("[POSITION] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         wallet_failed = False
         client: Optional[PositionManagerClient] = None
         init_errors: List[str] = []
@@ -3593,7 +3597,7 @@ def run_domain_quest_volume_once(
         if skip_wallet:
             skipped_wallets += 1
             continue
-        logger.info(_quest_log("wallet %s"), _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
+        logger.info(_quest_log("wallet %s"), _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         before_points_snapshot: Optional[PointsSnapshot] = None
         try:
             try:
@@ -5455,19 +5459,19 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
 
     interrupted = False
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
-        wallet_number = wallet_start_offset + idx + 1
+        wallet_number = line_idx + 1
         try:
             proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "LIST")
             proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
             if skip_wallet:
                 skipped_wallets += 1
                 skipped_wallet_details.append(
-                    f"wallet {wallet_number}/{total_loaded_wallets} | wallet={wallet} | reason=no proxy on matching line"
+                    f"wallet#{wallet_number}/{total_loaded_wallets} | wallet={wallet} | reason=no proxy on matching line"
                 )
                 continue
             logger.info(
                 "[LIST] wallet %s",
-                _wallet_progress_label(idx + wallet_start_offset, total_loaded_wallets, wallet),
+                _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet),
             )
             doma_api = DomaApiClient(
                 cfg.doma_api_url,
@@ -5599,7 +5603,7 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             "No wallet/private-key pairs available for domain delisting "
             "(fill wallets.txt + keys.txt line-by-line or set valid PRIVATE_KEY in .env)"
         )
-    wallet_key_records, wallet_start_offset, _ = _apply_wallet_start_selection(wallet_key_records)
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
 
     delisting_csv = cfg.trades_csv_file.parent / DOMAIN_DELISTING_CSV.name
     ensure_csv(
@@ -5641,7 +5645,7 @@ def run_domain_delisting_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             continue
         logger.info(
             "[DELIST] wallet %s",
-            _wallet_progress_label(idx + wallet_start_offset, len(wallet_key_records) + wallet_start_offset, wallet),
+            _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet),
         )
         try:
             doma_api = DomaApiClient(
@@ -5841,8 +5845,8 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "BUY_DOMAIN")
         proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
-        wallet_number = wallet_start_offset + idx
-        logger.info("[BUY_DOMAIN] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        wallet_number = line_idx + 1
+        logger.info("[BUY_DOMAIN] wallet %s", _wallet_record_progress_label(idx - 1, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         if skip_wallet:
             skipped_wallets += 1
             continue
@@ -6105,8 +6109,8 @@ def run_domain_place_offer_once(cfg: BotConfig, logger: logging.Logger, state: B
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "OFFER")
         proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
-        wallet_number = wallet_start_offset + idx
-        logger.info("[OFFER] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        wallet_number = line_idx + 1
+        logger.info("[OFFER] wallet %s", _wallet_record_progress_label(idx - 1, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         if skip_wallet or not proxies:
             skipped_wallets += 1
             skipped_wallet_details.append((wallet_number, wallet, "proxy is required"))
@@ -6315,8 +6319,8 @@ def run_domain_accept_offer_once(cfg: BotConfig, logger: logging.Logger, state: 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "ACCEPT_OFFER")
         proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
-        wallet_number = wallet_start_offset + idx
-        logger.info("[ACCEPT_OFFER] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        wallet_number = line_idx + 1
+        logger.info("[ACCEPT_OFFER] wallet %s", _wallet_record_progress_label(idx - 1, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         if skip_wallet or not proxies:
             skipped_wallets += 1
             skipped_wallet_details.append((wallet_number, wallet, "proxy is required"))
@@ -6652,9 +6656,9 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     skipped_wallet_details: List[Tuple[int, str, str]] = []
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
-        wallet_number = wallet_start_offset + idx
+        wallet_number = line_idx + 1
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "LIQUIDITY")
-        logger.info("[LIQUIDITY] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        logger.info("[LIQUIDITY] wallet %s", _wallet_record_progress_label(idx - 1, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         if skip_wallet:
             skipped_wallets += 1
             skipped_wallet_details.append((wallet_number, wallet, "proxy is required"))
@@ -7689,8 +7693,8 @@ def run_close_subdomains_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     failed_wallet_addresses: List[str] = []
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
-        wallet_number = wallet_start_offset + idx
-        logger.info("[SUBDOMAIN_CLOSE] wallet %s", _wallet_progress_label(wallet_number - 1, total_loaded_wallets, wallet))
+        wallet_number = line_idx + 1
+        logger.info("[SUBDOMAIN_CLOSE] wallet %s", _wallet_record_progress_label(idx - 1, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "SUBDOMAIN_CLOSE")
         if skip_wallet or not proxies:
             skipped_wallets += 1
@@ -7842,7 +7846,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "COM_DAILY")
-        wallet_number = wallet_start_offset + idx
+        wallet_number = line_idx + 1
         wallet_log_prefix = f"[COM_DAILY wallet {wallet_number}/{total_loaded_wallets}]"
         logger.info("%s wallet=%s", wallet_log_prefix, wallet)
         if skip_wallet:
@@ -8268,7 +8272,7 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
             "No wallet/private-key pairs available for domain bridge "
             "(fill wallets.txt + keys.txt line-by-line or set valid PRIVATE_KEY in .env)"
         )
-    wallet_key_records, wallet_start_offset, _ = _apply_wallet_start_selection(wallet_key_records)
+    wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
 
     bridge_csv = cfg.trades_csv_file.parent / DOMAIN_BRIDGE_CSV.name
     ensure_csv(
@@ -8319,7 +8323,7 @@ def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state
             continue
         logger.info(
             "[DOMAIN_BRIDGE] wallet %s",
-            _wallet_progress_label(idx + wallet_start_offset, len(wallet_key_records) + wallet_start_offset, wallet),
+            _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet),
         )
         try:
             doma_api = DomaApiClient(
@@ -8534,7 +8538,7 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
         if skip_wallet:
             skipped_wallets += 1
             continue
-        logger.info("[DOMAIN] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
+        logger.info("[DOMAIN] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         before_points_snapshot: Optional[PointsSnapshot] = None
         try:
             if pooled_launchpad_info and pooled_quote_token and pooled_domain_token and pooled_weth_token and pooled_eth_price > 0:
@@ -9269,7 +9273,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
         if skip_wallet:
             skipped_wallets += 1
             continue
-        logger.info("[SWEEP] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
+        logger.info("[SWEEP] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
 
         exec_client = _build_exec_client_with_rpc_fallback(
             cfg=cfg,
@@ -9629,7 +9633,7 @@ def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) 
         if skip_wallet:
             skipped_wallets += 1
             continue
-        logger.info("[PAIR] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
+        logger.info("[PAIR] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         before_points_snapshot: Optional[PointsSnapshot] = None
         try:
             try:
@@ -9913,7 +9917,7 @@ def run_volume_farm_once(
         if skip_wallet:
             skipped_wallets += 1
             continue
-        logger.info("[VOLUME] wallet %s", _wallet_progress_label(wallet_start_offset + idx, total_loaded_wallets, wallet))
+        logger.info("[VOLUME] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
         before_points_snapshot: Optional[PointsSnapshot] = None
         try:
             pools: List[Pool] = []
