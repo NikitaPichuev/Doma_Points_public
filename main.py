@@ -5932,13 +5932,15 @@ def run_domain_purchase_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 relist_reason = ""
                 claim_ok = False
                 claim_status = ""
-                if ok:
+                if ok and relist_enabled:
                     claim_ok, claim_status = _wait_for_domain_claim(
                         doma_api,
                         logger,
                         wallet=wallet,
                         domain_name=listing.name,
                     )
+                elif ok:
+                    claim_ok = True
                 if ok and relist_enabled and claim_ok:
                     markup = Decimal(random.randint(
                         int(DOMAIN_PURCHASE_RELIST_MARKUP_MIN * Decimal("100")),
