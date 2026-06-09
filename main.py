@@ -141,6 +141,16 @@ DOMAIN_QUEST_TOKENS = [
     "terabytes.ai",
     "trenches.ai",
 ]
+CHEAP_BUY_TOKEN_BLOCKLIST = {
+    "barbeque.io",
+    "discordwallets.com",
+    "escalations.com",
+    "foundations.xyz",
+    "onlineadvisor.ai",
+    "overweights.xyz",
+    "trenches.ai",
+    "yearofthefirehorse.com",
+}
 DOMAIN_LISTING_CSV = Path("domain_listings.csv")
 DOMAIN_DELISTING_CSV = Path("domain_delistings.csv")
 DOMAIN_BRIDGE_CSV = Path("domain_bridges.csv")
@@ -7437,9 +7447,17 @@ def _select_cheap_tokens_with_subdomains(
     selected: List[LaunchpadTokenInfo] = []
     checked = 0
     skipped_no_subdomain = 0
+    skipped_blocklisted = 0
     for info in _eligible_cheap_tokens(catalog, quote_token, max_price_usd):
         address = (info.address or "").strip().lower()
         if not address or address in existing_token_addresses:
+            continue
+        token_names = {
+            str(info.name or "").strip().lower(),
+            str(info.symbol or "").strip().lower(),
+        }
+        if token_names & CHEAP_BUY_TOKEN_BLOCKLIST:
+            skipped_blocklisted += 1
             continue
         checked += 1
         try:
@@ -7453,11 +7471,12 @@ def _select_cheap_tokens_with_subdomains(
         if len(selected) >= count:
             break
     logger.info(
-        "[CHEAP_BUY] wallet=%s subdomain-capable token filter | selected=%s | checked=%s | skipped_no_subdomain=%s",
+        "[CHEAP_BUY] wallet=%s subdomain-capable token filter | selected=%s | checked=%s | skipped_no_subdomain=%s | skipped_blocklisted=%s",
         wallet,
         len(selected),
         checked,
         skipped_no_subdomain,
+        skipped_blocklisted,
     )
     return selected
 
