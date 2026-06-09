@@ -852,6 +852,7 @@ class DomaApiClient:
                 )
             )
         self._apply_quest_activity_fallback(caip_wallet, out)
+        self._append_daily_rollcall_quest(caip_wallet, out)
         return out
 
     @staticmethod
@@ -936,6 +937,45 @@ class DomaApiClient:
                 continue
             quest.completed = True
             quest.completed_at = allocated_at_raw
+
+    def _append_daily_rollcall_quest(self, caip_wallet: str, quests: List[QuestStatus]) -> None:
+        if any("daily rollcall" in self._normalize_quest_text(q.description) for q in quests):
+            return
+        completed = False
+        completed_at = ""
+        points = Decimal("100")
+        for item in self._fetch_leaderboard_quest_activities(caip_wallet):
+            data = item.get("activityData") or {}
+            if str(data.get("__typename") or "") != "QuestActivityData":
+                continue
+            desc = self._normalize_quest_text(str(data.get("questDescription") or ""))
+            if "daily rollcall" not in desc:
+                continue
+            allocated_at_raw = str(item.get("allocatedAt") or "")
+            allocated_at = self._parse_api_datetime(allocated_at_raw)
+            if not allocated_at or allocated_at.date() != datetime.now(timezone.utc).date():
+                continue
+            completed = True
+            completed_at = allocated_at_raw
+            try:
+                points = Decimal(str(item.get("points") or points))
+            except Exception:
+                pass
+            break
+        quests.append(
+            QuestStatus(
+                wallet_address=caip_wallet,
+                quest_id=-100,
+                quest_type="DAILY_ROLLCALL",
+                description="Daily rollcall",
+                points_to_award=points,
+                reset_period="DAILY",
+                priority=-100,
+                completed=completed,
+                completed_at=completed_at,
+                available_at="",
+            )
+        )
 
     def check_in(self, wallet_address: str, chain_id: int = 97477, access_token: str = "") -> dict:
         caip_wallet = str(wallet_address or "").strip()
