@@ -1,0 +1,11 @@
+# Simple format:
+# one Privy access token per line.
+# Tokens are matched to the selected wallet range in order:
+# first token = first selected wallet, second token = next selected wallet, etc.
+#
+# Example:
+# eyJ...
+# eyJ...
+#
+# Explicit wallet format is also supported:
+# 0x0000000000000000000000000000000000000000;eyJ...

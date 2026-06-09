@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from web3 import Web3
 
 from config import BotConfig
@@ -147,9 +150,13 @@ DOMAIN_PURCHASES_CSV = Path("domain_purchases.csv")
 DOMAIN_QUESTS_CSV = Path("quests.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
+DOMA_DAILY_ROLLCALL_CSV = Path("doma_daily_rollcall.csv")
 DOMA_COST_REPORT_CSV = Path("doma_cost_report.csv")
 OKX_WITHDRAWALS_CSV = Path("okx_withdrawals.csv")
 EXCHANGE_DEPOSITS_CSV = Path("exchange_deposits.csv")
+PRIVY_APP_ID = "cm9jd3vun03ptju0knmkls1zp"
+PRIVY_CLIENT_ID = "client-WY5iumRYaVR7RsCRhMD2ACF3MssqVB59ebRgJbpZwUxZd"
+PRIVY_API_BASE_URL = "https://auth.privy.io"
 DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.06")
 DOMAIN_LIQUIDITY_MIN_EXTRA_USD = Decimal("0.25")
 DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
@@ -1842,6 +1849,297 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             )
     except Exception as exc:
         logger.warning("Doma cost report failed during points/quests check: %s", exc)
+
+
+def _get_privy_access_token_for_wallet(
+    wallet: str,
+    private_key: str,
+    chain_id: int,
+    proxies: Optional[Dict[str, str]] = None,
+) -> str:
+    checksum_wallet = Web3.to_checksum_address(wallet)
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "https://app.doma.xyz",
+        "referer": "https://app.doma.xyz/",
+        "privy-app-id": PRIVY_APP_ID,
+        "privy-client-id": PRIVY_CLIENT_ID,
+        "privy-client": "react-auth:2.17.3",
+    }
+    init_resp = requests.post(
+        f"{PRIVY_API_BASE_URL}/api/v1/siwe/init",
+        json={"address": checksum_wallet},
+        headers=headers,
+        timeout=20,
+        proxies=proxies,
+    )
+    if init_resp.status_code == 401 and "invalid_credentials" in init_resp.text.lower():
+        raise RuntimeError(
+            "Privy SIWE init rejected the request: captcha/access-token gate is required for Doma daily rollcall"
+        )
+    init_resp.raise_for_status()
+    nonce = str(init_resp.json().get("nonce") or "").strip()
+    if not nonce:
+        raise RuntimeError("Privy SIWE nonce is missing")
+
+    issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    message = (
+        "app.doma.xyz wants you to sign in with your Ethereum account:\n"
+        f"{checksum_wallet}\n\n"
+        "By signing, you are proving you own this wallet and logging in. "
+        "This does not initiate a transaction or cost any fees.\n\n"
+        "URI: https://app.doma.xyz\n"
+        "Version: 1\n"
+        f"Chain ID: {int(chain_id)}\n"
+        f"Nonce: {nonce}\n"
+        f"Issued At: {issued_at}\n"
+        "Resources:\n"
+        "- https://privy.io"
+    )
+    signed = Account.sign_message(encode_defunct(text=message), private_key=private_key)
+    signature = Web3.to_hex(signed.signature)
+    auth_resp = requests.post(
+        f"{PRIVY_API_BASE_URL}/api/v1/siwe/authenticate",
+        json={
+            "signature": signature,
+            "message": message,
+            "chainId": f"eip155:{int(chain_id)}",
+            "walletClientType": None,
+            "connectorType": None,
+            "mode": "login-or-sign-up",
+        },
+        headers=headers,
+        timeout=20,
+        proxies=proxies,
+    )
+    if auth_resp.status_code == 401 and "invalid_credentials" in auth_resp.text.lower():
+        raise RuntimeError("Privy SIWE authenticate rejected the signed login")
+    auth_resp.raise_for_status()
+    data = auth_resp.json()
+    token = str(data.get("token") or data.get("access_token") or data.get("accessToken") or "").strip()
+    if not token:
+        raise RuntimeError(f"Privy access token is missing in response keys: {', '.join(sorted(data.keys()))}")
+    return token
+
+
+def _decode_jwt_payload(token: str) -> Dict[str, Any]:
+    parts = (token or "").strip().split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = parts[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        data = json.loads(decoded.decode("utf-8", errors="ignore"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _extract_wallet_from_token_payload(payload: Dict[str, Any]) -> str:
+    if not payload:
+        return ""
+    raw = json.dumps(payload, ensure_ascii=False)
+    match = re.search(r"0x[a-fA-F0-9]{40}", raw)
+    return match.group(0).lower() if match else ""
+
+
+def _read_rollcall_access_tokens(path: Path) -> Tuple[Dict[str, str], List[str]]:
+    wallet_tokens: Dict[str, str] = {}
+    unassigned_tokens: List[str] = []
+    if not path.exists():
+        return wallet_tokens, unassigned_tokens
+
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.replace("\ufeff", "").strip()
+        if not line or line.startswith("#"):
+            continue
+        wallet = ""
+        token = ""
+        if ";" in line:
+            left, right = line.split(";", 1)
+            wallet, token = left.strip().lower(), right.strip()
+        elif "," in line:
+            left, right = line.split(",", 1)
+            wallet, token = left.strip().lower(), right.strip()
+        else:
+            parts = line.split()
+            if len(parts) >= 2 and _is_valid_evm_address(parts[0]):
+                wallet, token = parts[0].strip().lower(), parts[1].strip()
+            else:
+                token = line
+
+        if token.lower().startswith("bearer "):
+            token = token.split(None, 1)[1].strip()
+        if not token:
+            continue
+        if wallet and _is_valid_evm_address(wallet):
+            wallet_tokens[wallet.lower()] = token
+            continue
+        payload_wallet = _extract_wallet_from_token_payload(_decode_jwt_payload(token))
+        if payload_wallet and _is_valid_evm_address(payload_wallet):
+            wallet_tokens[payload_wallet.lower()] = token
+        else:
+            unassigned_tokens.append(token)
+    return wallet_tokens, unassigned_tokens
+
+
+def _pick_rollcall_browser_token(
+    wallet: str,
+    wallet_number: int,
+    wallet_tokens: Dict[str, str],
+    positional_tokens: Dict[int, str],
+) -> str:
+    token = wallet_tokens.get(wallet.lower(), "")
+    if token:
+        return token
+    token = positional_tokens.get(wallet_number, "")
+    if token:
+        payload_wallet = _extract_wallet_from_token_payload(_decode_jwt_payload(token))
+        if payload_wallet and payload_wallet.lower() != wallet.lower():
+            raise RuntimeError(f"browser token belongs to {payload_wallet}, not wallet#{wallet_number}")
+        return token
+    return ""
+
+
+def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "ROLLCALL")
+    if not wallet_key_records:
+        logger.warning("[ROLLCALL] skipped: no wallet/private-key pairs configured")
+        return
+    total_wallets = len(cfg.points_wallets or wallet_key_records)
+    start_number = _prompt_start_wallet_number(total_wallets)
+    end_number = _prompt_end_wallet_number(total_wallets, start_number)
+    wallet_records = [
+        record for record in wallet_key_records
+        if start_number <= record[0] + 1 <= end_number
+    ]
+    wallet_order = _prompt_wallet_order(default_random=True)
+    if wallet_order == "random":
+        random.shuffle(wallet_records)
+
+    selected_total = len(wallet_records)
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    failed_wallets: List[str] = []
+    skipped_details: List[str] = []
+    rollcall_csv = cfg.points_csv_file.parent / DOMA_DAILY_ROLLCALL_CSV.name
+    wallet_tokens, unassigned_tokens = _read_rollcall_access_tokens(cfg.privy_access_tokens_file)
+    positional_tokens = {
+        line_idx + 1: unassigned_tokens[pos]
+        for pos, (line_idx, _wallet, _private_key) in enumerate(sorted(wallet_records, key=lambda item: item[0]))
+        if pos < len(unassigned_tokens)
+    }
+    fatal_auth_error = False
+
+    logger.info(
+        "[ROLLCALL] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | wallet_tokens=%s | positional_tokens=%s",
+        selected_total,
+        start_number,
+        end_number,
+        wallet_order,
+        len(wallet_tokens),
+        len(positional_tokens),
+    )
+
+    for process_idx, (line_idx, wallet, private_key) in enumerate(wallet_records):
+        wallet_number = line_idx + 1
+        logger.info(
+            "[ROLLCALL] wallet %s",
+            _wallet_record_progress_label(process_idx, selected_total, line_idx, total_wallets, wallet),
+        )
+        proxy = cfg.file_proxies[line_idx].strip() if line_idx < len(cfg.file_proxies) else ""
+        if cfg.file_proxies and line_idx >= len(cfg.file_proxies):
+            skipped_count += 1
+            reason = "missing proxy on matching line"
+            skipped_details.append(f"wallet#{wallet_number}: {reason}")
+            append_csv(
+                rollcall_csv,
+                [datetime.now(timezone.utc).isoformat(), "skipped", wallet, wallet_number, "", "", "", reason],
+                delimiter=cfg.csv_delimiter,
+            )
+            continue
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        api = DomaApiClient(
+            cfg.doma_api_url,
+            api_key="",
+            api_keys=[],
+            proxies=proxies,
+        )
+        try:
+            access_token = _pick_rollcall_browser_token(
+                wallet,
+                wallet_number,
+                wallet_tokens,
+                positional_tokens,
+            )
+            if access_token:
+                logger.info("[ROLLCALL] wallet=wallet#%s using browser Privy token", wallet_number)
+            else:
+                logger.info("[ROLLCALL] wallet=wallet#%s browser token missing, trying SIWE fallback", wallet_number)
+                access_token = _get_privy_access_token_for_wallet(wallet, private_key, cfg.chain_id, proxies=proxies)
+            result = api.check_in(wallet, cfg.chain_id, access_token=access_token)
+            points_awarded = result["points_awarded"]
+            check_in_date = result["check_in_date"]
+            ok = bool(result["success"])
+            status = "success" if ok else "skipped"
+            reason = "" if ok else "checkIn returned success=false"
+            if ok:
+                success_count += 1
+                logger.info(
+                    "[ROLLCALL] wallet=wallet#%s claimed | points=%s | date=%s",
+                    wallet_number,
+                    _format_decimal_plain(points_awarded),
+                    check_in_date or "unknown",
+                )
+            else:
+                skipped_count += 1
+                skipped_details.append(f"wallet#{wallet_number}: {reason}")
+                logger.warning("[ROLLCALL] wallet=wallet#%s skipped | %s", wallet_number, reason)
+            append_csv(
+                rollcall_csv,
+                [
+                    datetime.now(timezone.utc).isoformat(),
+                    status,
+                    wallet,
+                    wallet_number,
+                    result["wallet_address"],
+                    str(points_awarded),
+                    check_in_date,
+                    reason,
+                ],
+                delimiter=cfg.csv_delimiter,
+            )
+        except Exception as exc:
+            failed_count += 1
+            failed_wallets.append(f"wallet#{wallet_number}")
+            reason = str(exc)
+            logger.warning("[ROLLCALL] wallet=wallet#%s failed: %s", wallet_number, exc)
+            append_csv(
+                rollcall_csv,
+                [datetime.now(timezone.utc).isoformat(), "failed", wallet, wallet_number, "", "", "", reason],
+                delimiter=cfg.csv_delimiter,
+            )
+            if "captcha/access-token gate" in reason:
+                fatal_auth_error = True
+                logger.error(
+                    "[ROLLCALL] stopped: Doma rollcall requires browser Privy tokens. "
+                    "Put tokens into %s as wallet;token, or run one selected wallet with a single raw token.",
+                    cfg.privy_access_tokens_file,
+                )
+                break
+
+        if process_idx < selected_total - 1:
+            delay_sec = random.uniform(2, 5)
+            logger.info("[ROLLCALL] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    _print_mode_summary("ROLLCALL", selected_total, success_count, failed_count, skipped_count, failed_wallets)
+    if skipped_details:
+        print(_color(f"[ROLLCALL] wallets skipped: {'; '.join(skipped_details)}", ANSI_YELLOW))
 
 
 def run_balances_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -10737,8 +11035,9 @@ def get_menu_choice() -> str:
     print("19) Withdraw from OKX to addresses")
     print("20) Deposit to exchange from L2")
     print("21) Buy cheapest listed domains")
-    print("22) Exit")
-    return input("Select [1-22]: ").strip()
+    print("22) Daily rollcall claim")
+    print("23) Exit")
+    return input("Select [1-23]: ").strip()
 
 
 def get_points_menu_choice() -> str:
@@ -10960,6 +11259,20 @@ def main() -> None:
         ],
         delimiter=cfg.csv_delimiter,
     )
+    ensure_csv(
+        cfg.points_csv_file.parent / DOMA_DAILY_ROLLCALL_CSV.name,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "line",
+            "caip_wallet",
+            "points_awarded",
+            "check_in_date",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
     state = load_state(cfg.state_file)
 
     if cfg.paper_replay_mode:
@@ -11162,6 +11475,15 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Domain purchase mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "22":
+            try:
+                run_daily_rollcall_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Daily rollcall mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

@@ -1,0 +1,26 @@
+// Open app.doma.xyz, log in, open DevTools Console, paste this, then click Daily rollcall Claim.
+// The Privy bearer token will be copied to clipboard and printed as "ROLLCALL_TOKEN_CAPTURED".
+(() => {
+  if (window.__domaRollcallTokenCaptureInstalled) {
+    console.log("ROLLCALL_TOKEN_CAPTURE_ALREADY_INSTALLED");
+    return;
+  }
+  window.__domaRollcallTokenCaptureInstalled = true;
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    const [, init = {}] = args;
+    const headers = new Headers(init.headers || {});
+    const auth = headers.get("authorization") || headers.get("Authorization") || "";
+    if (auth.toLowerCase().startsWith("bearer ")) {
+      const token = auth.slice(7).trim();
+      try {
+        await navigator.clipboard.writeText(token);
+      } catch (_) {
+        // Clipboard can be blocked by browser permissions; console output still has the token.
+      }
+      console.log("ROLLCALL_TOKEN_CAPTURED", token);
+    }
+    return originalFetch(...args);
+  };
+  console.log("ROLLCALL_TOKEN_CAPTURE_READY");
+})();

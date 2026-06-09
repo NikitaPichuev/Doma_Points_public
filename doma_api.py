@@ -629,12 +629,15 @@ class DomaApiClient:
         self.proxies = proxies or None
         self.explorer_api_url = DOMA_EXPLORER_API_URL.rstrip("/")
 
-    def _headers(self, api_key: str = "") -> Dict[str, str]:
+    def _headers(self, api_key: str = "", bearer_token: str = "") -> Dict[str, str]:
         h = {"content-type": "application/json"}
         key = (api_key or "").strip()
         if key:
             h["Api-Key"] = key
             h["x-api-key"] = key
+        token = (bearer_token or "").strip()
+        if token:
+            h["Authorization"] = f"Bearer {token}"
         return h
 
     @staticmethod
@@ -649,7 +652,7 @@ class DomaApiClient:
             or "rate limit" in text
         )
 
-    def _post(self, query: str, variables: Optional[dict] = None) -> dict:
+    def _post(self, query: str, variables: Optional[dict] = None, bearer_token: str = "") -> dict:
         payload = {"query": query, "variables": variables or {}}
         keys_to_try = self.api_keys if self.api_keys else [""]
         last_error: Optional[Exception] = None
@@ -659,7 +662,7 @@ class DomaApiClient:
                 resp = requests.post(
                     self.api_url,
                     json=payload,
-                    headers=self._headers(key),
+                    headers=self._headers(key, bearer_token=bearer_token),
                     timeout=20,
                     proxies=self.proxies,
                 )
@@ -933,6 +936,28 @@ class DomaApiClient:
                 continue
             quest.completed = True
             quest.completed_at = allocated_at_raw
+
+    def check_in(self, wallet_address: str, chain_id: int = 97477, access_token: str = "") -> dict:
+        caip_wallet = str(wallet_address or "").strip()
+        if not caip_wallet.startswith("eip155:"):
+            caip_wallet = f"eip155:{chain_id}:{caip_wallet}"
+        query = """
+        mutation CheckIn($walletAddress: AddressCAIP10!) {
+          checkIn(walletAddress: $walletAddress) {
+            success
+            pointsAwarded
+            checkInDate
+          }
+        }
+        """
+        data = self._post(query, {"walletAddress": caip_wallet}, bearer_token=access_token)
+        item = data.get("checkIn") or {}
+        return {
+            "success": bool(item.get("success")),
+            "points_awarded": Decimal(str(item.get("pointsAwarded") or "0")),
+            "check_in_date": str(item.get("checkInDate") or ""),
+            "wallet_address": caip_wallet,
+        }
 
     def fetch_fractional_token_by_name(self, name: str) -> Optional[LaunchpadTokenInfo]:
         query = """
