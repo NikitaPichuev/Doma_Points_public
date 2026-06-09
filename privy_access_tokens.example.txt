@@ -1,7 +1,8 @@
 # Simple format:
 # one Privy access token per line.
-# Tokens are matched to the selected wallet range in order:
-# first token = first selected wallet, second token = next selected wallet, etc.
+# Token line number matches wallet number from wallets.txt:
+# line 1 = wallet#1, line 20 = wallet#20, etc.
+# This does not shift when you run only a selected range.
 #
 # Example:
 # eyJ...

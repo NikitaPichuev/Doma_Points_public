@@ -2029,9 +2029,8 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     rollcall_csv = cfg.points_csv_file.parent / DOMA_DAILY_ROLLCALL_CSV.name
     wallet_tokens, unassigned_tokens = _read_rollcall_access_tokens(cfg.privy_access_tokens_file)
     positional_tokens = {
-        line_idx + 1: unassigned_tokens[pos]
-        for pos, (line_idx, _wallet, _private_key) in enumerate(sorted(wallet_records, key=lambda item: item[0]))
-        if pos < len(unassigned_tokens)
+        pos + 1: token
+        for pos, token in enumerate(unassigned_tokens)
     }
     fatal_auth_error = False
 
