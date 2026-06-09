@@ -146,6 +146,7 @@ CHEAP_BUY_TOKEN_BLOCKLIST = {
     "discordwallets.com",
     "escalations.com",
     "foundations.xyz",
+    "ilovepunch.xyz",
     "onlineadvisor.ai",
     "overweights.xyz",
     "trenches.ai",
