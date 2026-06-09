@@ -7751,24 +7751,28 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     insufficient_balance_seen: set[str] = set()
 
     def _remember_failed_wallet(wallet_number: int, wallet_address: str, reason: str) -> None:
-        key = wallet_address.lower()
+        _ = wallet_address
+        key = str(wallet_number)
         if key in failed_wallet_seen:
             return
         failed_wallet_seen.add(key)
-        failed_wallet_addresses.append(f"#{wallet_number} {wallet_address} | {reason}")
+        failed_wallet_addresses.append(f"wallet#{wallet_number} | {reason}")
 
     def _remember_subdomain_failed(wallet_number: int, wallet_address: str, reason: str) -> None:
-        key = wallet_address.lower()
+        _ = wallet_address
+        key = str(wallet_number)
         if key in subdomain_failed_seen:
             return
         subdomain_failed_seen.add(key)
-        subdomain_failed_wallets.append(f"#{wallet_number} {wallet_address} | {reason}")
+        subdomain_failed_wallets.append(f"wallet#{wallet_number} | {reason}")
 
     def _remember_insufficient(wallet_number: int, wallet_address: str) -> None:
-        if wallet_address.lower() in insufficient_balance_seen:
+        _ = wallet_address
+        key = str(wallet_number)
+        if key in insufficient_balance_seen:
             return
-        insufficient_balance_seen.add(wallet_address.lower())
-        insufficient_balance_wallets.append(f"#{wallet_number} {wallet_address} | insufficient balance")
+        insufficient_balance_seen.add(key)
+        insufficient_balance_wallets.append(f"wallet#{wallet_number} | insufficient balance")
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "CHEAP_BUY")
@@ -7931,7 +7935,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     if subdomain_failed_wallets:
         print("\n[CHEAP_BUY] wallets with subdomain errors:")
         for entry in subdomain_failed_wallets:
-            print(f"  {entry}")
+            print(_redact_wallet_addresses(f"  {entry}"))
     _print_mode_summary(
         "CHEAP_BUY",
         total=len(wallet_key_records),
