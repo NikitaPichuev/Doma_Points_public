@@ -2159,6 +2159,10 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     total_wallets = len(cfg.points_wallets or wallet_key_records)
     start_number = _prompt_start_wallet_number(total_wallets)
     end_number = _prompt_end_wallet_number(total_wallets, start_number)
+    delay_min = _prompt_positive_decimal("Minimum delay between wallets sec", "2")
+    delay_max = _prompt_positive_decimal("Maximum delay between wallets sec", "5")
+    if delay_max < delay_min:
+        raise ValueError("Maximum delay must be >= minimum delay")
     wallet_records = [
         record for record in wallet_key_records
         if start_number <= record[0] + 1 <= end_number
@@ -2178,11 +2182,13 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     fatal_auth_error = False
 
     logger.info(
-        "[ROLLCALL] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | wallet_tokens=%s | positional_tokens=%s",
+        "[ROLLCALL] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | delay=%s-%s sec | wallet_tokens=%s | positional_tokens=%s",
         selected_total,
         start_number,
         end_number,
         wallet_order,
+        _format_decimal_plain(delay_min),
+        _format_decimal_plain(delay_max),
         len(wallet_tokens),
         len(positional_tokens),
     )
@@ -2275,7 +2281,7 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 break
 
         if process_idx < selected_total - 1:
-            delay_sec = random.uniform(2, 5)
+            delay_sec = random.uniform(float(delay_min), float(delay_max))
             logger.info("[ROLLCALL] delay before next wallet: %.2f sec", delay_sec)
             time.sleep(delay_sec)
 
