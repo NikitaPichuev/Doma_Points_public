@@ -162,6 +162,7 @@ DOMAIN_PURCHASES_CSV = Path("domain_purchases.csv")
 DOMAIN_QUESTS_CSV = Path("quests.csv")
 DOMAIN_LIQUIDITY_CSV = Path("domain_liquidity_positions.csv")
 DOMAIN_COM_DAILY_CSV = Path("domain_com_daily_swaps.csv")
+DOMAIN_BONDING_BUYS_CSV = Path("domain_bonding_buys.csv")
 DOMA_DAILY_ROLLCALL_CSV = Path("doma_daily_rollcall.csv")
 DOMA_COST_REPORT_CSV = Path("doma_cost_report.csv")
 OKX_WITHDRAWALS_CSV = Path("okx_withdrawals.csv")
@@ -4890,6 +4891,32 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
     return max_price_raw, buy_amount_min_raw, buy_amount_max_raw, str(tokens_min), str(tokens_max), str(subdomains_min), str(subdomains_max), delay_min_raw, delay_max_raw
 
 
+def get_bonding_token_buy_menu_input() -> Tuple[str, str, str, str]:
+    print("\nBuy domain tokens currently in bonding:")
+    buy_amount_min_raw = input("Minimum USDC.E amount per wallet [10]: ").strip() or "10"
+    buy_amount_max_raw = input("Maximum USDC.E amount per wallet [10]: ").strip() or "10"
+    delay_min_raw = input(f"Minimum delay between wallets sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
+    delay_max_raw = input(f"Maximum delay between wallets sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
+    if not delay_min_raw:
+        delay_min_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC)
+    if not delay_max_raw:
+        delay_max_raw = _format_decimal_plain(DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC)
+
+    buy_amount_min = _parse_decimal_input(buy_amount_min_raw)
+    buy_amount_max = _parse_decimal_input(buy_amount_max_raw)
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+    if buy_amount_min <= 0 or buy_amount_max <= 0:
+        raise ValueError("Bonding buy amounts must be > 0")
+    if buy_amount_max < buy_amount_min:
+        raise ValueError("Maximum bonding buy amount cannot be lower than minimum")
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("Bonding buy delays cannot be negative")
+    if delay_max < delay_min:
+        raise ValueError("Maximum bonding buy delay cannot be lower than minimum delay")
+    return buy_amount_min_raw, buy_amount_max_raw, delay_min_raw, delay_max_raw
+
+
 def get_close_subdomains_menu_input() -> Optional[Tuple[str, str, str]]:
     print("\nClose/unstake staked subdomains:")
     max_raw = input("Maximum subdomains to close per wallet [all]: ").strip()
@@ -7703,19 +7730,20 @@ def _top_up_usdce_from_eth_for_cheap_buy(
     wallet: str,
     eth_price: Decimal,
     required_usdc: Decimal,
+    log_prefix: str = "CHEAP_BUY",
 ) -> Tuple[bool, str, Decimal, Decimal]:
     current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
     if current_usdc >= required_usdc:
         return True, "", current_usdc, required_usdc
     if eth_price <= 0:
-        logger.warning("[CHEAP_BUY] wallet=%s cannot top up USDC.E from ETH: ETH price is unknown", wallet)
+        logger.warning("[%s] wallet=%s cannot top up USDC.E from ETH: ETH price is unknown", log_prefix, wallet)
         return False, "eth_price_unknown", current_usdc, required_usdc
 
     reserve_eth = Decimal("0.05") / eth_price
     native_eth = exec_client.get_native_balance()
     spendable_eth = native_eth - reserve_eth
     if spendable_eth <= 0:
-        logger.warning("[CHEAP_BUY] wallet=%s skipped | no USDC.E and no spendable ETH", wallet)
+        logger.warning("[%s] wallet=%s skipped | no USDC.E and no spendable ETH", log_prefix, wallet)
         return False, "no_spendable_eth", native_eth, reserve_eth
 
     missing_usdc = required_usdc - current_usdc
@@ -7727,14 +7755,16 @@ def _top_up_usdce_from_eth_for_cheap_buy(
     bootstrap_usd = bootstrap_eth * eth_price
     if bootstrap_eth <= 0:
         logger.warning(
-            "[CHEAP_BUY] wallet=%s skipped | ETH->USDC.E bootstrap has no spendable amount (%s USD)",
+            "[%s] wallet=%s skipped | ETH->USDC.E bootstrap has no spendable amount (%s USD)",
+            log_prefix,
             wallet,
             _format_decimal_plain(bootstrap_usd),
         )
         return False, "eth_bootstrap_no_spendable_amount", bootstrap_usd, missing_usdc
 
     logger.info(
-        "[CHEAP_BUY] wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
+        "[%s] wallet=%s bootstrap | ETH->USDC.E amount=%s ETH | target_missing=%s USDC.E",
+        log_prefix,
         wallet,
         _format_decimal_plain(bootstrap_eth),
         _format_decimal_plain(missing_usdc),
@@ -7751,17 +7781,17 @@ def _top_up_usdce_from_eth_for_cheap_buy(
         display_out_symbol="USDC.E",
         trade_amount_expr=_format_decimal_plain(bootstrap_eth),
         eth_price=eth_price,
-        label=f"CHEAP_BUY {wallet} ETH>USDC.E BOOTSTRAP",
+        label=f"{log_prefix} {wallet} ETH>USDC.E BOOTSTRAP",
         is_eth_source=True,
         unwrap_to_native=False,
         wait_for_pre_tx=True,
     )
     if not ok or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
-        logger.warning("[CHEAP_BUY] wallet=%s ETH->USDC.E bootstrap failed", wallet)
+        logger.warning("[%s] wallet=%s ETH->USDC.E bootstrap failed", log_prefix, wallet)
         return False, "eth_to_usdc_bootstrap_failed", current_usdc, required_usdc
 
     refreshed_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-    logger.info("[CHEAP_BUY] wallet=%s USDC.E after bootstrap=%s", wallet, _format_decimal_plain(refreshed_usdc))
+    logger.info("[%s] wallet=%s USDC.E after bootstrap=%s", log_prefix, wallet, _format_decimal_plain(refreshed_usdc))
     if refreshed_usdc >= required_usdc:
         return True, "", refreshed_usdc, required_usdc
     return False, "usdc_after_bootstrap_below_required", refreshed_usdc, required_usdc
@@ -8101,6 +8131,198 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         failed=failed_wallets,
         skipped=skipped_wallets,
         failed_wallets=failed_wallet_addresses,
+    )
+
+
+def _is_currently_bonding_token(info: LaunchpadTokenInfo, quote_token: Token) -> bool:
+    return bool(
+        info.name.strip()
+        and info.address
+        and info.launchpad_address
+        and not info.pool_address
+        and info.status.strip().upper() == "FRACTIONALIZED"
+        and info.price_usd > 0
+        and info.quote_token_address == quote_token.address.lower()
+        and info.name.strip().lower() not in CHEAP_BUY_TOKEN_BLOCKLIST
+    )
+
+
+def _pick_currently_bonding_token(
+    doma_api: DomaApiClient,
+    candidates: List[LaunchpadTokenInfo],
+    quote_token: Token,
+) -> Optional[LaunchpadTokenInfo]:
+    shuffled = list(candidates)
+    random.shuffle(shuffled)
+    for candidate in shuffled:
+        try:
+            current = doma_api.fetch_fractional_token_by_name(candidate.name)
+        except Exception:
+            continue
+        if current and _is_currently_bonding_token(current, quote_token):
+            return current
+    return None
+
+
+def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    buy_amount_min_raw, buy_amount_max_raw, delay_min_raw, delay_max_raw = get_bonding_token_buy_menu_input()
+    buy_amount_min = _parse_decimal_input(buy_amount_min_raw)
+    buy_amount_max = _parse_decimal_input(buy_amount_max_raw)
+    delay_min = _parse_decimal_input(delay_min_raw)
+    delay_max = _parse_decimal_input(delay_max_raw)
+
+    all_records = _build_wallet_key_records(cfg, logger, "BONDING_BUY")
+    if not all_records:
+        raise RuntimeError("No wallet/private-key pairs available for bonding token buy")
+    total_wallets = len(all_records)
+    start_number = _prompt_start_wallet_number(total_wallets)
+    end_number = _prompt_end_wallet_number(total_wallets, start_number)
+    order = _prompt_wallet_order(default_random=True)
+    wallet_records = _apply_wallet_order(all_records[start_number - 1:end_number], order)
+    quote_token = _usdce_token_from_config(cfg)
+    weth_token = _token_from_config_override(cfg, "WETH", 18)
+
+    metadata_proxies: Optional[Dict[str, str]] = None
+    for line_idx, _, _ in wallet_records:
+        candidate_proxies, skip_proxy = _proxy_for_line(cfg, line_idx, None, "BONDING_BUY_METADATA")
+        if not skip_proxy:
+            metadata_proxies = candidate_proxies
+            break
+    shared_api = DomaApiClient(
+        cfg.doma_api_url,
+        api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+        proxies=metadata_proxies,
+    )
+    catalog = shared_api.fetch_fractional_tokens(take=100, max_pages=10)
+    candidates = [info for info in catalog if _is_currently_bonding_token(info, quote_token)]
+    if not candidates:
+        raise RuntimeError("No active bonding tokens found (status=FRACTIONALIZED, launchpad present, pool absent)")
+
+    logger.info(
+        "[BONDING_BUY] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | amount=%s-%s USDC.E | active_tokens=%s | delay=%s-%s sec",
+        len(wallet_records),
+        start_number,
+        end_number,
+        order,
+        _format_decimal_plain(buy_amount_min),
+        _format_decimal_plain(buy_amount_max),
+        len(candidates),
+        _format_decimal_plain(delay_min),
+        _format_decimal_plain(delay_max),
+    )
+
+    success_wallets = failed_wallets = skipped_wallets = 0
+    failed_entries: List[str] = []
+    for position, (line_idx, wallet, private_key) in enumerate(wallet_records, start=1):
+        wallet_number = line_idx + 1
+        logger.info("[BONDING_BUY] wallet %s/%s | wallet#%s - %s", position, len(wallet_records), wallet_number, wallet)
+        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "BONDING_BUY")
+        if skip_wallet or not proxies:
+            skipped_wallets += 1
+            reason = "proxy is required"
+            failed_entries.append(f"wallet#{wallet_number} | skipped: {reason}")
+            logger.warning("[BONDING_BUY] wallet=%s skipped | %s", wallet, reason)
+            continue
+
+        amount = _random_decimal_between(buy_amount_min, buy_amount_max, buy_amount_min_raw, buy_amount_max_raw)
+        token_name = ""
+        tx_hash = ""
+        try:
+            doma_api = DomaApiClient(
+                cfg.doma_api_url,
+                api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+                proxies=proxies,
+            )
+            current = _pick_currently_bonding_token(doma_api, candidates, quote_token)
+            if current is None:
+                skipped_wallets += 1
+                reason = "no token still in active bonding state"
+                failed_entries.append(f"wallet#{wallet_number} | skipped: {reason}")
+                logger.warning("[BONDING_BUY] wallet=%s skipped | %s", wallet, reason)
+                continue
+            token_name = current.name.strip().lower()
+            exec_client = _build_exec_client_with_rpc_fallback(
+                cfg,
+                logger,
+                wallet,
+                private_key,
+                proxies=proxies,
+                log_prefix="[BONDING_BUY]",
+            )
+            eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+            topup_ok, topup_reason, available_usdc, _ = _top_up_usdce_from_eth_for_cheap_buy(
+                cfg,
+                logger,
+                state,
+                doma_api,
+                exec_client,
+                quote_token,
+                weth_token,
+                wallet,
+                eth_price,
+                amount,
+                log_prefix="BONDING_BUY",
+            )
+            if not topup_ok:
+                skipped_wallets += 1
+                reason = f"insufficient balance after top-up: {topup_reason} (USDC.E={_format_decimal_plain(available_usdc)})"
+                failed_entries.append(f"wallet#{wallet_number} | skipped: {reason}")
+                logger.warning("[BONDING_BUY] wallet=%s skipped | %s", wallet, reason)
+                continue
+
+            logger.info(
+                "[BONDING_BUY] wallet=%s token=%s | status=%s | price=$%s | buy=%s USDC.E | launchpad=%s",
+                wallet,
+                token_name,
+                current.status,
+                _format_decimal_plain(current.price_usd),
+                _format_decimal_plain(amount),
+                current.launchpad_address,
+            )
+            ok = _execute_launchpad_buy(
+                cfg=cfg,
+                logger=logger,
+                state=state,
+                exec_client=exec_client,
+                launchpad=current,
+                quote_token=quote_token,
+                trade_amount_expr=f"${_format_decimal_plain(amount)}",
+                eth_price=eth_price,
+                label=f"BONDING_BUY {wallet} USDC.E>{canonical_symbol(current.symbol or current.name)}",
+                wait_for_pre_tx=True,
+            )
+            tx_hash = state.last_tx_hash if ok else ""
+            if not ok or not tx_hash or not _wait_tx_receipt(exec_client, tx_hash, timeout_sec=180):
+                raise RuntimeError("bonding buy transaction failed or timed out")
+            success_wallets += 1
+            logger.info("[BONDING_BUY] wallet=%s token=%s bought | amount=%s USDC.E | tx=%s", wallet, token_name, _format_decimal_plain(amount), tx_hash)
+            append_csv(
+                cfg.points_csv_file.parent / DOMAIN_BONDING_BUYS_CSV.name,
+                [datetime.now(timezone.utc).isoformat(), "ok", wallet, wallet_number, token_name, current.address, current.launchpad_address, current.status, amount, current.price_usd, tx_hash, ""],
+                delimiter=cfg.csv_delimiter,
+            )
+        except Exception as exc:
+            failed_wallets += 1
+            reason = str(exc)
+            failed_entries.append(f"wallet#{wallet_number} | {token_name or 'no token'} | {reason}")
+            logger.warning("[BONDING_BUY] wallet=%s failed: %s", wallet, exc)
+            append_csv(
+                cfg.points_csv_file.parent / DOMAIN_BONDING_BUYS_CSV.name,
+                [datetime.now(timezone.utc).isoformat(), "failed", wallet, wallet_number, token_name, "", "", "", amount, "", tx_hash, reason],
+                delimiter=cfg.csv_delimiter,
+            )
+        if position < len(wallet_records):
+            delay_sec = random.uniform(float(delay_min), float(delay_max))
+            logger.info("[BONDING_BUY] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    _print_mode_summary(
+        "BONDING_BUY",
+        total=len(wallet_records),
+        success=success_wallets,
+        failed=failed_wallets,
+        skipped=skipped_wallets,
+        failed_wallets=failed_entries,
     )
 
 
@@ -11198,8 +11420,9 @@ def get_menu_choice() -> str:
     print("21) Buy cheapest listed domains")
     print("22) Daily rollcall claim")
     print("23) Generate rollcall Privy tokens")
-    print("24) Exit")
-    return input("Select [1-24]: ").strip()
+    print("24) Buy tokens currently in bonding")
+    print("25) Exit")
+    return input("Select [1-25]: ").strip()
 
 
 def get_points_menu_choice() -> str:
@@ -11435,6 +11658,24 @@ def main() -> None:
         ],
         delimiter=cfg.csv_delimiter,
     )
+    ensure_csv(
+        cfg.points_csv_file.parent / DOMAIN_BONDING_BUYS_CSV.name,
+        [
+            "timestamp_utc",
+            "status",
+            "wallet",
+            "line",
+            "token_name",
+            "token_address",
+            "launchpad_address",
+            "token_status",
+            "amount_usdce",
+            "token_price_usd",
+            "tx_hash",
+            "reason",
+        ],
+        delimiter=cfg.csv_delimiter,
+    )
     state = load_state(cfg.state_file)
 
     if cfg.paper_replay_mode:
@@ -11655,6 +11896,16 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Rollcall token generation failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "24":
+            validate_config(cfg)
+            try:
+                run_bonding_token_buy_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Bonding token buy mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return
