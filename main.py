@@ -4891,8 +4891,16 @@ def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, 
     return max_price_raw, buy_amount_min_raw, buy_amount_max_raw, str(tokens_min), str(tokens_max), str(subdomains_min), str(subdomains_max), delay_min_raw, delay_max_raw
 
 
-def get_bonding_token_buy_menu_input() -> Tuple[str, str, str, str]:
+def get_bonding_token_buy_menu_input() -> Tuple[str, str, str, str, str]:
     print("\nBuy domain tokens currently in bonding:")
+    print("Action:")
+    print("1) Buy only")
+    print("2) Buy and sell")
+    action_raw = input("Select [1-2, default 1]: ").strip() or "1"
+    action_map = {"1": "buy", "2": "buy_sell"}
+    action = action_map.get(action_raw)
+    if not action:
+        raise ValueError("Invalid bonding token action")
     buy_amount_min_raw = input("Minimum USDC.E amount per wallet [10]: ").strip() or "10"
     buy_amount_max_raw = input("Maximum USDC.E amount per wallet [10]: ").strip() or "10"
     delay_min_raw = input(f"Minimum delay between wallets sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
@@ -4914,7 +4922,7 @@ def get_bonding_token_buy_menu_input() -> Tuple[str, str, str, str]:
         raise ValueError("Bonding buy delays cannot be negative")
     if delay_max < delay_min:
         raise ValueError("Maximum bonding buy delay cannot be lower than minimum delay")
-    return buy_amount_min_raw, buy_amount_max_raw, delay_min_raw, delay_max_raw
+    return action, buy_amount_min_raw, buy_amount_max_raw, delay_min_raw, delay_max_raw
 
 
 def get_close_subdomains_menu_input() -> Optional[Tuple[str, str, str]]:
@@ -8165,7 +8173,7 @@ def _pick_currently_bonding_token(
 
 
 def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
-    buy_amount_min_raw, buy_amount_max_raw, delay_min_raw, delay_max_raw = get_bonding_token_buy_menu_input()
+    action, buy_amount_min_raw, buy_amount_max_raw, delay_min_raw, delay_max_raw = get_bonding_token_buy_menu_input()
     buy_amount_min = _parse_decimal_input(buy_amount_min_raw)
     buy_amount_max = _parse_decimal_input(buy_amount_max_raw)
     delay_min = _parse_decimal_input(delay_min_raw)
@@ -8199,11 +8207,12 @@ def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: Bo
         raise RuntimeError("No active bonding tokens found (status=FRACTIONALIZED, launchpad present, pool absent)")
 
     logger.info(
-        "[BONDING_BUY] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | amount=%s-%s USDC.E | active_tokens=%s | delay=%s-%s sec",
+        "[BONDING_BUY] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | action=%s | amount=%s-%s USDC.E | active_tokens=%s | delay=%s-%s sec",
         len(wallet_records),
         start_number,
         end_number,
         order,
+        "buy-only" if action == "buy" else "buy+sell",
         _format_decimal_plain(buy_amount_min),
         _format_decimal_plain(buy_amount_max),
         len(candidates),
@@ -8226,7 +8235,8 @@ def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: Bo
 
         amount = _random_decimal_between(buy_amount_min, buy_amount_max, buy_amount_min_raw, buy_amount_max_raw)
         token_name = ""
-        tx_hash = ""
+        buy_tx_hash = ""
+        sell_tx_hash = ""
         try:
             doma_api = DomaApiClient(
                 cfg.doma_api_url,
@@ -8279,6 +8289,7 @@ def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: Bo
                 _format_decimal_plain(amount),
                 current.launchpad_address,
             )
+            token_balance_before = exec_client.get_erc20_balance(current.address, current.decimals)
             ok = _execute_launchpad_buy(
                 cfg=cfg,
                 logger=logger,
@@ -8291,14 +8302,53 @@ def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: Bo
                 label=f"BONDING_BUY {wallet} USDC.E>{canonical_symbol(current.symbol or current.name)}",
                 wait_for_pre_tx=True,
             )
-            tx_hash = state.last_tx_hash if ok else ""
-            if not ok or not tx_hash or not _wait_tx_receipt(exec_client, tx_hash, timeout_sec=180):
+            buy_tx_hash = state.last_tx_hash if ok else ""
+            if not ok or not buy_tx_hash or not _wait_tx_receipt(exec_client, buy_tx_hash, timeout_sec=180):
                 raise RuntimeError("bonding buy transaction failed or timed out")
+            logger.info("[BONDING_BUY] wallet=%s token=%s bought | amount=%s USDC.E | tx=%s", wallet, token_name, _format_decimal_plain(amount), buy_tx_hash)
+
+            if action == "buy_sell":
+                token_balance_after = exec_client.get_erc20_balance(current.address, current.decimals)
+                bought_token_amount = token_balance_after - token_balance_before
+                if bought_token_amount <= 0:
+                    raise RuntimeError("buy confirmed but purchased token balance did not increase")
+                delay_before_sell = _random_swap_delay_sec()
+                logger.info(
+                    "[BONDING_BUY] wallet=%s delay before sell: %.2f sec | token_amount=%s %s",
+                    wallet,
+                    delay_before_sell,
+                    _format_decimal_plain(bought_token_amount),
+                    canonical_symbol(current.symbol or current.name),
+                )
+                time.sleep(delay_before_sell)
+                sell_ok = _execute_launchpad_sell(
+                    cfg=cfg,
+                    logger=logger,
+                    state=state,
+                    exec_client=exec_client,
+                    launchpad=current,
+                    quote_token=quote_token,
+                    trade_amount_expr=_format_decimal_plain(bought_token_amount),
+                    eth_price=eth_price,
+                    label=f"BONDING_BUY {wallet} {canonical_symbol(current.symbol or current.name)}>USDC.E SELL",
+                    wait_for_pre_tx=True,
+                )
+                sell_tx_hash = state.last_tx_hash if sell_ok else ""
+                if not sell_ok or not sell_tx_hash or not _wait_tx_receipt(exec_client, sell_tx_hash, timeout_sec=180):
+                    raise RuntimeError("buy succeeded but bonding sell transaction failed or timed out; purchased tokens remain in wallet")
+                logger.info(
+                    "[BONDING_BUY] wallet=%s token=%s sold | token_amount=%s | tx=%s",
+                    wallet,
+                    token_name,
+                    _format_decimal_plain(bought_token_amount),
+                    sell_tx_hash,
+                )
+
             success_wallets += 1
-            logger.info("[BONDING_BUY] wallet=%s token=%s bought | amount=%s USDC.E | tx=%s", wallet, token_name, _format_decimal_plain(amount), tx_hash)
+            tx_summary = buy_tx_hash if action == "buy" else f"buy={buy_tx_hash};sell={sell_tx_hash}"
             append_csv(
                 cfg.points_csv_file.parent / DOMAIN_BONDING_BUYS_CSV.name,
-                [datetime.now(timezone.utc).isoformat(), "ok", wallet, wallet_number, token_name, current.address, current.launchpad_address, current.status, amount, current.price_usd, tx_hash, ""],
+                [datetime.now(timezone.utc).isoformat(), "ok", wallet, wallet_number, token_name, current.address, current.launchpad_address, current.status, amount, current.price_usd, tx_summary, f"action={action}"],
                 delimiter=cfg.csv_delimiter,
             )
         except Exception as exc:
@@ -8308,7 +8358,7 @@ def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: Bo
             logger.warning("[BONDING_BUY] wallet=%s failed: %s", wallet, exc)
             append_csv(
                 cfg.points_csv_file.parent / DOMAIN_BONDING_BUYS_CSV.name,
-                [datetime.now(timezone.utc).isoformat(), "failed", wallet, wallet_number, token_name, "", "", "", amount, "", tx_hash, reason],
+                [datetime.now(timezone.utc).isoformat(), "failed", wallet, wallet_number, token_name, "", "", "", amount, "", f"buy={buy_tx_hash};sell={sell_tx_hash}", reason],
                 delimiter=cfg.csv_delimiter,
             )
         if position < len(wallet_records):
