@@ -2015,6 +2015,19 @@ def _write_rollcall_token_lines(path: Path, token_lines: List[str], total_wallet
     path.write_text("\n".join(normalized) + "\n", encoding="utf-8")
 
 
+def _save_env_value(env_path: Path, key: str, value: str) -> None:
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    replaced = False
+    for idx, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[idx] = f"{key}={value}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
 def _pick_rollcall_browser_token(
     wallet: str,
     wallet_number: int,
@@ -2039,7 +2052,14 @@ def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, s
         raise RuntimeError(f"Unsupported CAPTCHA_PROVIDER={cfg.captcha_provider}; only 2captcha is supported")
     twocaptcha_key = (cfg.twocaptcha_api_key or "").strip()
     if not twocaptcha_key:
-        raise RuntimeError("TWOCAPTCHA_API_KEY is missing. Put it into .env or set CAPTCHA_API_KEY.")
+        if not sys.stdin.isatty():
+            raise RuntimeError("TWOCAPTCHA_API_KEY is missing. Put it into .env or set CAPTCHA_API_KEY.")
+        twocaptcha_key = input("2captcha API key [blank = cancel]: ").strip()
+        if not twocaptcha_key:
+            raise RuntimeError("TWOCAPTCHA_API_KEY is missing. Put it into .env or set CAPTCHA_API_KEY.")
+        _save_env_value(Path(".env"), "TWOCAPTCHA_API_KEY", twocaptcha_key)
+        cfg.twocaptcha_api_key = twocaptcha_key
+        logger.info("[ROLLCALL_TOKEN] TWOCAPTCHA_API_KEY saved to .env")
 
     wallet_key_records = _build_wallet_key_records(cfg, logger, "ROLLCALL_TOKEN")
     if not wallet_key_records:
