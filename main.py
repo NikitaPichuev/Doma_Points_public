@@ -2005,8 +2005,11 @@ def _read_rollcall_token_lines(path: Path) -> List[str]:
     ]
 
 
-def _write_rollcall_token_lines(path: Path, token_lines: List[str]) -> None:
-    path.write_text("\n".join(token_lines).rstrip() + "\n", encoding="utf-8")
+def _write_rollcall_token_lines(path: Path, token_lines: List[str], total_wallets: int) -> None:
+    normalized = list(token_lines[:total_wallets])
+    if len(normalized) < total_wallets:
+        normalized.extend([""] * (total_wallets - len(normalized)))
+    path.write_text("\n".join(normalized) + "\n", encoding="utf-8")
 
 
 def _pick_rollcall_browser_token(
@@ -2079,6 +2082,8 @@ def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, s
         bound_proxy = cfg.file_proxies[line_idx].strip() if line_idx < len(cfg.file_proxies) else ""
         proxies = {"http": bound_proxy, "https": bound_proxy} if bound_proxy else None
         try:
+            token_lines[wallet_number - 1] = ""
+            _write_rollcall_token_lines(cfg.privy_access_tokens_file, token_lines, total_wallets)
             candidates = []
             if proxies:
                 candidates.append((f"bound#{wallet_number}", proxies))
@@ -2097,7 +2102,7 @@ def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, s
                 logger=logger,
             )
             token_lines[wallet_number - 1] = access_token
-            _write_rollcall_token_lines(cfg.privy_access_tokens_file, token_lines)
+            _write_rollcall_token_lines(cfg.privy_access_tokens_file, token_lines, total_wallets)
             success += 1
             logger.info("[ROLLCALL_TOKEN] wallet=wallet#%s token saved | line=%s", wallet_number, wallet_number)
         except Exception as exc:
