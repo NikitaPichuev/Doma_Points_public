@@ -100,6 +100,7 @@ def setup_logger(log_path: Path) -> logging.Logger:
     logger = logging.getLogger("doma_swap_bot")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(fmt)
@@ -495,12 +496,14 @@ def _print_mode_summary(
 def ensure_csv(path: Path, header: List[str], delimiter: str = ",") -> None:
     if path.exists():
         return
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=delimiter)
         w.writerow(header)
 
 
 def append_csv(path: Path, row: List[object], delimiter: str = ",") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=delimiter)
         w.writerow(row)
