@@ -1996,6 +1996,19 @@ def _read_rollcall_access_tokens(path: Path) -> Tuple[Dict[str, str], List[str]]
     return wallet_tokens, unassigned_tokens
 
 
+def _read_rollcall_token_lines(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    return [
+        line.replace("\ufeff", "").strip()
+        for line in path.read_text(encoding="utf-8-sig").splitlines()
+    ]
+
+
+def _write_rollcall_token_lines(path: Path, token_lines: List[str]) -> None:
+    path.write_text("\n".join(token_lines).rstrip() + "\n", encoding="utf-8")
+
+
 def _pick_rollcall_browser_token(
     wallet: str,
     wallet_number: int,
@@ -2012,6 +2025,92 @@ def _pick_rollcall_browser_token(
             raise RuntimeError(f"browser token belongs to {payload_wallet}, not wallet#{wallet_number}")
         return token
     return ""
+
+
+def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    if (cfg.captcha_provider or "").strip().lower() not in {"2captcha", "twocaptcha"}:
+        raise RuntimeError(f"Unsupported CAPTCHA_PROVIDER={cfg.captcha_provider}; only 2captcha is supported")
+    twocaptcha_key = (cfg.twocaptcha_api_key or "").strip()
+    if not twocaptcha_key:
+        raise RuntimeError("TWOCAPTCHA_API_KEY is missing. Put it into .env or set CAPTCHA_API_KEY.")
+
+    wallet_key_records = _build_wallet_key_records(cfg, logger, "ROLLCALL_TOKEN")
+    if not wallet_key_records:
+        logger.warning("[ROLLCALL_TOKEN] skipped: no wallet/private-key pairs configured")
+        return
+
+    total_wallets = len(cfg.points_wallets or wallet_key_records)
+    start_number = _prompt_start_wallet_number(total_wallets)
+    end_number = _prompt_end_wallet_number(total_wallets, start_number)
+    wallet_records = [
+        record for record in wallet_key_records
+        if start_number <= record[0] + 1 <= end_number
+    ]
+    wallet_order = _prompt_wallet_order(default_random=False)
+    if wallet_order == "random":
+        random.shuffle(wallet_records)
+
+    import privy_auth
+
+    refresh_store = privy_auth.RefreshTokenStore(cfg.privy_refresh_tokens_file)
+    token_lines = _read_rollcall_token_lines(cfg.privy_access_tokens_file)
+    if len(token_lines) < total_wallets:
+        token_lines.extend([""] * (total_wallets - len(token_lines)))
+
+    success = 0
+    failed = 0
+    failed_wallets: List[str] = []
+    logger.info(
+        "[ROLLCALL_TOKEN] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | output=%s | refresh_store=%s",
+        len(wallet_records),
+        start_number,
+        end_number,
+        cfg.privy_access_tokens_file,
+        cfg.privy_refresh_tokens_file,
+    )
+
+    for process_idx, (line_idx, wallet, private_key) in enumerate(wallet_records):
+        wallet_number = line_idx + 1
+        logger.info(
+            "[ROLLCALL_TOKEN] wallet %s",
+            _wallet_record_progress_label(process_idx, len(wallet_records), line_idx, total_wallets, wallet),
+        )
+        bound_proxy = cfg.file_proxies[line_idx].strip() if line_idx < len(cfg.file_proxies) else ""
+        proxies = {"http": bound_proxy, "https": bound_proxy} if bound_proxy else None
+        try:
+            candidates = []
+            if proxies:
+                candidates.append((f"bound#{wallet_number}", proxies))
+            pool = [p.strip() for p in (cfg.file_proxies or []) if p.strip() and p.strip() != bound_proxy]
+            for purl in random.sample(pool, min(5, len(pool))):
+                candidates.append(("pool", {"http": purl, "https": purl}))
+            candidates.append(("direct", None))
+            _proxy_label, work_proxies = privy_auth.find_working_proxy(candidates, logger=logger)
+            access_token = privy_auth.mint_access_token(
+                wallet,
+                private_key,
+                twocaptcha_key=twocaptcha_key,
+                chain_id=cfg.chain_id,
+                proxies=work_proxies,
+                refresh_store=refresh_store,
+                logger=logger,
+            )
+            token_lines[wallet_number - 1] = access_token
+            _write_rollcall_token_lines(cfg.privy_access_tokens_file, token_lines)
+            success += 1
+            logger.info("[ROLLCALL_TOKEN] wallet=wallet#%s token saved | line=%s", wallet_number, wallet_number)
+        except Exception as exc:
+            failed += 1
+            failed_wallets.append(f"wallet#{wallet_number}")
+            logger.warning("[ROLLCALL_TOKEN] wallet=wallet#%s failed: %s", wallet_number, exc)
+
+        if process_idx < len(wallet_records) - 1:
+            delay_sec = random.uniform(2, 5)
+            logger.info("[ROLLCALL_TOKEN] delay before next wallet: %.2f sec", delay_sec)
+            time.sleep(delay_sec)
+
+    _print_mode_summary("ROLLCALL_TOKEN", len(wallet_records), success, failed, 0, failed_wallets)
 
 
 def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -11059,8 +11158,9 @@ def get_menu_choice() -> str:
     print("20) Deposit to exchange from L2")
     print("21) Buy cheapest listed domains")
     print("22) Daily rollcall claim")
-    print("23) Exit")
-    return input("Select [1-23]: ").strip()
+    print("23) Generate rollcall Privy tokens")
+    print("24) Exit")
+    return input("Select [1-24]: ").strip()
 
 
 def get_points_menu_choice() -> str:
@@ -11507,6 +11607,15 @@ def main() -> None:
                 save_state(cfg.state_file, state)
             except Exception as exc:
                 logger.exception("Daily rollcall mode failed: %s", exc)
+                if sys.stdin.isatty():
+                    input("\nPress Enter to return to menu...")
+            return
+        if choice == "23":
+            try:
+                run_rollcall_token_generation_once(cfg, logger, state)
+                save_state(cfg.state_file, state)
+            except Exception as exc:
+                logger.exception("Rollcall token generation failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

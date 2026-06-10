@@ -3,6 +3,8 @@ keys.txt
 api_keys.txt
 okx_api_keys.txt
 privy_access_tokens.txt
+privy_refresh_tokens.txt
+privy_refresh_tokens.json
 proxies.txt
 wallets.txt
 state.json
