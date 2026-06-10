@@ -8178,21 +8178,26 @@ def _is_currently_bonding_token(info: LaunchpadTokenInfo, quote_token: Token) ->
     )
 
 
-def _pick_currently_bonding_token(
-    doma_api: DomaApiClient,
-    candidates: List[LaunchpadTokenInfo],
-    quote_token: Token,
-) -> Optional[LaunchpadTokenInfo]:
-    shuffled = list(candidates)
-    random.shuffle(shuffled)
-    for candidate in shuffled:
+def _prompt_bonding_token_by_fdv(candidates: List[LaunchpadTokenInfo]) -> LaunchpadTokenInfo:
+    top_candidates = candidates[:5]
+    if not top_candidates:
+        raise RuntimeError("No active bonding tokens available for FDV selection")
+    print("\nActive bonding tokens by FDV:")
+    for idx, info in enumerate(top_candidates, start=1):
+        print(
+            f"{idx}) {info.name.lower()} | price=${_format_decimal_plain(info.price_usd)} "
+            f"| status={info.status}"
+        )
+    while True:
+        raw = input(f"Select token [1-{len(top_candidates)}, default 1]: ").strip() or "1"
         try:
-            current = doma_api.fetch_fractional_token_by_name(candidate.name)
-        except Exception:
+            selected = int(raw)
+        except ValueError:
+            print(f"Enter a number from 1 to {len(top_candidates)}.")
             continue
-        if current and _is_currently_bonding_token(current, quote_token):
-            return current
-    return None
+        if 1 <= selected <= len(top_candidates):
+            return top_candidates[selected - 1]
+        print(f"Enter a number from 1 to {len(top_candidates)}.")
 
 
 def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -8228,14 +8233,17 @@ def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: Bo
     candidates = [info for info in catalog if _is_currently_bonding_token(info, quote_token)]
     if not candidates:
         raise RuntimeError("No active bonding tokens found (status=FRACTIONALIZED, launchpad present, pool absent)")
+    selected_candidate = _prompt_bonding_token_by_fdv(candidates)
 
     logger.info(
-        "[BONDING_BUY] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | action=%s | amount=%s-%s USDC.E | active_tokens=%s | delay=%s-%s sec",
+        "[BONDING_BUY] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | action=%s | token=%s | fdv_rank=%s | amount=%s-%s USDC.E | active_tokens=%s | delay=%s-%s sec",
         len(wallet_records),
         start_number,
         end_number,
         order,
         "buy-only" if action == "buy" else "buy+sell",
+        selected_candidate.name.lower(),
+        candidates.index(selected_candidate) + 1,
         _format_decimal_plain(buy_amount_min),
         _format_decimal_plain(buy_amount_max),
         len(candidates),
@@ -8266,10 +8274,10 @@ def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: Bo
                 api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
                 proxies=proxies,
             )
-            current = _pick_currently_bonding_token(doma_api, candidates, quote_token)
-            if current is None:
+            current = doma_api.fetch_fractional_token_by_name(selected_candidate.name)
+            if current is None or not _is_currently_bonding_token(current, quote_token):
                 skipped_wallets += 1
-                reason = "no token still in active bonding state"
+                reason = f"selected token {selected_candidate.name.lower()} is no longer in active bonding state"
                 failed_entries.append(f"wallet#{wallet_number} | skipped: {reason}")
                 logger.warning("[BONDING_BUY] wallet=%s skipped | %s", wallet, reason)
                 continue
