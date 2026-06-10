@@ -1959,13 +1959,16 @@ def _extract_wallet_from_token_payload(payload: Dict[str, Any]) -> str:
     return match.group(0).lower() if match else ""
 
 
-def _read_rollcall_access_tokens(path: Path) -> Tuple[Dict[str, str], List[str]]:
+def _read_rollcall_access_tokens(path: Path) -> Tuple[Dict[str, str], Dict[int, str]]:
     wallet_tokens: Dict[str, str] = {}
-    unassigned_tokens: List[str] = []
+    positional_tokens: Dict[int, str] = {}
     if not path.exists():
-        return wallet_tokens, unassigned_tokens
+        return wallet_tokens, positional_tokens
 
-    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8-sig").splitlines(),
+        start=1,
+    ):
         line = raw_line.replace("\ufeff", "").strip()
         if not line or line.startswith("#"):
             continue
@@ -1995,8 +1998,8 @@ def _read_rollcall_access_tokens(path: Path) -> Tuple[Dict[str, str], List[str]]
         if payload_wallet and _is_valid_evm_address(payload_wallet):
             wallet_tokens[payload_wallet.lower()] = token
         else:
-            unassigned_tokens.append(token)
-    return wallet_tokens, unassigned_tokens
+            positional_tokens[line_number] = token
+    return wallet_tokens, positional_tokens
 
 
 def _read_rollcall_token_lines(path: Path) -> List[str]:
@@ -2012,7 +2015,9 @@ def _write_rollcall_token_lines(path: Path, token_lines: List[str], total_wallet
     normalized = list(token_lines[:total_wallets])
     if len(normalized) < total_wallets:
         normalized.extend([""] * (total_wallets - len(normalized)))
-    path.write_text("\n".join(normalized) + "\n", encoding="utf-8")
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text("\n".join(normalized) + "\n", encoding="utf-8")
+    temp_path.replace(path)
 
 
 def _save_env_value(env_path: Path, key: str, value: str) -> None:
@@ -2126,6 +2131,10 @@ def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, s
             )
             token_lines[wallet_number - 1] = access_token
             _write_rollcall_token_lines(cfg.privy_access_tokens_file, token_lines, total_wallets)
+            saved_lines = _read_rollcall_token_lines(cfg.privy_access_tokens_file)
+            saved_token = saved_lines[wallet_number - 1] if wallet_number <= len(saved_lines) else ""
+            if saved_token != access_token:
+                raise RuntimeError(f"token verification failed after saving line {wallet_number}")
             success += 1
             logger.info("[ROLLCALL_TOKEN] wallet=wallet#%s token saved | line=%s", wallet_number, wallet_number)
         except Exception as exc:
@@ -2165,11 +2174,7 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     failed_wallets: List[str] = []
     skipped_details: List[str] = []
     rollcall_csv = cfg.points_csv_file.parent / DOMA_DAILY_ROLLCALL_CSV.name
-    wallet_tokens, unassigned_tokens = _read_rollcall_access_tokens(cfg.privy_access_tokens_file)
-    positional_tokens = {
-        pos + 1: token
-        for pos, token in enumerate(unassigned_tokens)
-    }
+    wallet_tokens, positional_tokens = _read_rollcall_access_tokens(cfg.privy_access_tokens_file)
     fatal_auth_error = False
 
     logger.info(
