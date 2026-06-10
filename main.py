@@ -7805,6 +7805,29 @@ def _top_up_usdce_from_eth_for_cheap_buy(
     return False, "usdc_after_bootstrap_below_required", refreshed_usdc, required_usdc
 
 
+def _can_fully_fund_usdce_topup(
+    exec_client: EvmExecutionClient,
+    quote_token: Token,
+    eth_price: Decimal,
+    required_usdc: Decimal,
+    conversion_buffer: Decimal = Decimal("1.05"),
+) -> Tuple[bool, Decimal, Decimal, Decimal]:
+    current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+    if current_usdc >= required_usdc:
+        return True, current_usdc, Decimal("0"), current_usdc
+    if eth_price <= 0:
+        return False, current_usdc, Decimal("0"), current_usdc
+
+    reserve_eth = Decimal("0.05") / eth_price
+    native_eth = exec_client.get_native_balance()
+    spendable_eth = max(Decimal("0"), native_eth - reserve_eth)
+    spendable_eth_usd = spendable_eth * eth_price
+    missing_usdc = required_usdc - current_usdc
+    required_eth_usd = missing_usdc * conversion_buffer
+    total_spendable_usd = current_usdc + spendable_eth_usd
+    return spendable_eth_usd >= required_eth_usd, current_usdc, spendable_eth_usd, total_spendable_usd
+
+
 def _top_up_usdce_from_eth_for_offer(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -8260,6 +8283,32 @@ def run_bonding_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: Bo
                 log_prefix="[BONDING_BUY]",
             )
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
+            can_fund, current_usdc, spendable_eth_usd, total_spendable_usd = _can_fully_fund_usdce_topup(
+                exec_client,
+                quote_token,
+                eth_price,
+                amount,
+            )
+            if not can_fund:
+                skipped_wallets += 1
+                reason = (
+                    "insufficient combined balance before swaps: "
+                    f"USDC.E={_format_decimal_plain(current_usdc)}, "
+                    f"spendable_ETH=${_format_decimal_plain(spendable_eth_usd)}, "
+                    f"total=${_format_decimal_plain(total_spendable_usd)}, "
+                    f"required={_format_decimal_plain(amount)} USDC.E plus conversion buffer"
+                )
+                failed_entries.append(f"wallet#{wallet_number} | skipped: {reason}")
+                logger.warning("[BONDING_BUY] wallet=%s skipped before swaps | %s", wallet, reason)
+                continue
+            logger.info(
+                "[BONDING_BUY] wallet=%s preflight balance ok | USDC.E=%s | spendable_ETH=$%s | total_spendable=$%s | target=%s USDC.E",
+                wallet,
+                _format_decimal_plain(current_usdc),
+                _format_decimal_plain(spendable_eth_usd),
+                _format_decimal_plain(total_spendable_usd),
+                _format_decimal_plain(amount),
+            )
             topup_ok, topup_reason, available_usdc, _ = _top_up_usdce_from_eth_for_cheap_buy(
                 cfg,
                 logger,
