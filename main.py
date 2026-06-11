@@ -1683,6 +1683,42 @@ def _log_quests_column(logger: logging.Logger, wallet: str, line_no: int, quests
     logger.info("\n".join(lines))
 
 
+def _apply_local_rollcall_status(
+    cfg: BotConfig,
+    wallet: str,
+    quests: List[QuestStatus],
+) -> None:
+    rollcall_csv = cfg.points_csv_file.parent / DOMA_DAILY_ROLLCALL_CSV.name
+    if not rollcall_csv.exists():
+        return
+    wallet_lower = wallet.strip().lower()
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    completed_at = ""
+    try:
+        with rollcall_csv.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle, delimiter=cfg.csv_delimiter):
+                if str(row.get("status") or "").strip().lower() != "success":
+                    continue
+                if str(row.get("wallet") or "").strip().lower() != wallet_lower:
+                    continue
+                check_in_date = str(row.get("check_in_date") or "").strip()
+                timestamp_utc = str(row.get("timestamp_utc") or "").strip()
+                row_date = check_in_date[:10] or timestamp_utc[:10]
+                if row_date != today_utc:
+                    continue
+                completed_at = timestamp_utc or check_in_date
+    except (OSError, csv.Error):
+        return
+    if not completed_at:
+        return
+    for quest in quests:
+        if "daily rollcall" not in " ".join(quest.description.lower().split()):
+            continue
+        quest.completed = True
+        quest.completed_at = completed_at
+        return
+
+
 def _write_quest_statuses(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -1708,6 +1744,7 @@ def _write_quest_statuses(
         delimiter=cfg.csv_delimiter,
     )
     quests = api.fetch_quests(wallet, cfg.chain_id)
+    _apply_local_rollcall_status(cfg, wallet, quests)
     now_iso = datetime.now(timezone.utc).isoformat()
     for quest in sorted(quests, key=lambda q: (q.reset_period, q.priority, q.quest_id)):
         append_csv(
