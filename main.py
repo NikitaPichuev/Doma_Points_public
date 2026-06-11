@@ -3882,13 +3882,15 @@ def run_domain_quest_volume_once(
     success_wallets = 0
     failed_wallets = 0
     skipped_wallets = 0
-    failed_wallet_addresses: List[str] = []
+    failed_wallet_labels: List[str] = []
+    current_wallet_number = 0
 
     def _fail_wallet() -> None:
         nonlocal failed_wallets
         failed_wallets += 1
-        if wallet not in failed_wallet_addresses:
-            failed_wallet_addresses.append(wallet)
+        wallet_label = f"wallet#{current_wallet_number}" if current_wallet_number > 0 else "unknown wallet"
+        if wallet_label not in failed_wallet_labels:
+            failed_wallet_labels.append(wallet_label)
 
     picked = preset or get_domain_quest_menu_input(state)
     if not picked:
@@ -4117,6 +4119,7 @@ def run_domain_quest_volume_once(
         return launchpad_volume + pool_volume
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
+        current_wallet_number = line_idx + 1
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "QUEST")
         if skip_wallet:
             skipped_wallets += 1
@@ -4201,7 +4204,9 @@ def run_domain_quest_volume_once(
             wallet_failed = False
             min_single_swap_done = True if not require_min_single_swap else accumulated_volume >= quest_target_volume
 
-            while accumulated_volume < execution_target_volume:
+            # The buffer sizes the next trade, but it must not force extra swaps
+            # after the actual quest target has already been reached.
+            while accumulated_volume < quest_target_volume:
                 cycle += 1
                 logger.info(
                     _quest_log("wallet=%s cycle=%s | progress=%s/%s"),
@@ -4449,7 +4454,7 @@ def run_domain_quest_volume_once(
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(quest_target_volume),
                 )
-                if accumulated_volume >= execution_target_volume:
+                if accumulated_volume >= quest_target_volume:
                     break
                 if require_min_single_swap and min_single_swap_done and accumulated_volume >= quest_target_volume:
                     logger.info(
@@ -4575,15 +4580,14 @@ def run_domain_quest_volume_once(
                     _format_decimal_plain(accumulated_volume),
                     _format_decimal_plain(quest_target_volume),
                 )
-                if accumulated_volume < execution_target_volume:
+                if accumulated_volume < quest_target_volume:
                     _sleep_between_swaps()
 
-            if not wallet_failed and accumulated_volume < execution_target_volume:
+            if not wallet_failed and accumulated_volume < quest_target_volume:
                 logger.warning(
-                    _quest_log("wallet=%s execution target not reached | local_volume=%s/%s | required_quest_target=%s"),
+                    _quest_log("wallet=%s quest target not reached | local_volume=%s/%s"),
                     wallet,
                     _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(execution_target_volume),
                     _format_decimal_plain(quest_target_volume),
                 )
                 wallet_failed = True
@@ -4600,7 +4604,7 @@ def run_domain_quest_volume_once(
                     final_asset=final_asset,
                 )
                 _fail_wallet()
-            elif accumulated_volume >= execution_target_volume:
+            elif accumulated_volume >= quest_target_volume:
                 final_rides_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
                 if final_rides_balance > 0:
                     final_rides_usd = final_rides_balance * rides_price_usd
@@ -4743,7 +4747,7 @@ def run_domain_quest_volume_once(
         success_wallets,
         failed_wallets,
         skipped_wallets,
-        failed_wallet_addresses,
+        failed_wallet_labels,
     )
 
 
