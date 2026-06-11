@@ -2052,6 +2052,33 @@ def _pick_rollcall_browser_token(
     return ""
 
 
+def _save_rollcall_access_token(
+    path: Path,
+    wallet_number: int,
+    total_wallets: int,
+    access_token: str,
+) -> None:
+    token_lines = _read_rollcall_token_lines(path)
+    if len(token_lines) < total_wallets:
+        token_lines.extend([""] * (total_wallets - len(token_lines)))
+    token_lines[wallet_number - 1] = access_token
+    _write_rollcall_token_lines(path, token_lines, total_wallets)
+
+
+def _is_privy_auth_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "failed to verify privy token",
+            "access token is missing",
+            "unauthenticated",
+            "statuscode': 401",
+            "401 client error",
+        )
+    )
+
+
 def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
     _ = state
     if (cfg.captcha_provider or "").strip().lower() not in {"2captcha", "twocaptcha"}:
@@ -2180,6 +2207,10 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     skipped_details: List[str] = []
     rollcall_csv = cfg.points_csv_file.parent / DOMA_DAILY_ROLLCALL_CSV.name
     wallet_tokens, positional_tokens = _read_rollcall_access_tokens(cfg.privy_access_tokens_file)
+    import privy_auth
+
+    refresh_store = privy_auth.RefreshTokenStore(cfg.privy_refresh_tokens_file)
+    twocaptcha_key = (cfg.twocaptcha_api_key or "").strip()
     fatal_auth_error = False
 
     logger.info(
@@ -2219,18 +2250,64 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             proxies=proxies,
         )
         try:
-            access_token = _pick_rollcall_browser_token(
+            stored_access_token = _pick_rollcall_browser_token(
                 wallet,
                 wallet_number,
                 wallet_tokens,
                 positional_tokens,
             )
-            if access_token:
-                logger.info("[ROLLCALL] wallet=wallet#%s using browser Privy token", wallet_number)
+            has_refresh = bool(refresh_store.get_refresh(wallet) and refresh_store.get_access(wallet))
+            access_token = stored_access_token
+            if has_refresh or (not access_token and twocaptcha_key):
+                auth_method = "refresh" if has_refresh else "full login"
+                logger.info("[ROLLCALL] wallet=wallet#%s obtaining fresh Privy token via %s", wallet_number, auth_method)
+                access_token = privy_auth.mint_access_token(
+                    wallet,
+                    private_key,
+                    twocaptcha_key=twocaptcha_key,
+                    chain_id=cfg.chain_id,
+                    proxies=proxies,
+                    refresh_store=refresh_store,
+                    logger=logger,
+                )
+                _save_rollcall_access_token(
+                    cfg.privy_access_tokens_file,
+                    wallet_number,
+                    total_wallets,
+                    access_token,
+                )
+            elif access_token:
+                logger.info("[ROLLCALL] wallet=wallet#%s using saved Privy token (no refresh token available)", wallet_number)
             else:
-                logger.info("[ROLLCALL] wallet=wallet#%s browser token missing, trying SIWE fallback", wallet_number)
-                access_token = _get_privy_access_token_for_wallet(wallet, private_key, cfg.chain_id, proxies=proxies)
-            result = api.check_in(wallet, cfg.chain_id, access_token=access_token)
+                raise RuntimeError(
+                    "Privy access and refresh tokens are missing; run point 23 or configure TWOCAPTCHA_API_KEY"
+                )
+            try:
+                result = api.check_in(wallet, cfg.chain_id, access_token=access_token)
+            except Exception as first_exc:
+                if not _is_privy_auth_error(first_exc) or not twocaptcha_key:
+                    raise
+                logger.warning(
+                    "[ROLLCALL] wallet=wallet#%s Privy token rejected; re-authenticating once",
+                    wallet_number,
+                )
+                refresh_store.drop(wallet)
+                access_token = privy_auth.mint_access_token(
+                    wallet,
+                    private_key,
+                    twocaptcha_key=twocaptcha_key,
+                    chain_id=cfg.chain_id,
+                    proxies=proxies,
+                    refresh_store=refresh_store,
+                    logger=logger,
+                )
+                _save_rollcall_access_token(
+                    cfg.privy_access_tokens_file,
+                    wallet_number,
+                    total_wallets,
+                    access_token,
+                )
+                result = api.check_in(wallet, cfg.chain_id, access_token=access_token)
             points_awarded = result["points_awarded"]
             check_in_date = result["check_in_date"]
             ok = bool(result["success"])
