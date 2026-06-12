@@ -19,7 +19,7 @@ if not exist ".env" (
   exit /b 1
 )
 
-echo Запуск бота...
+echo Starting bot...
 python main.py
 set EXIT_CODE=%errorlevel%
 echo.
