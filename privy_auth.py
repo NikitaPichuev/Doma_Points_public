@@ -1,14 +1,14 @@
 """Privy SIWE auto-login for Doma daily rollcall.
 
-Mints a fresh Privy access token from a wallet PRIVATE KEY, solving the
-Cloudflare Turnstile captcha that Privy puts on /siwe/init (via 2captcha).
+Mints a fresh Privy access token from a wallet PRIVATE KEY. The current
+captcha provider and site key are read from Privy's public app config.
 
 Reverse-engineered from app.doma.xyz (2026-06-09):
   - Privy app id  : cm9jd3vun03ptju0knmkls1zp
   - Auth base     : https://auth.privy.io
   - Login         : POST /api/v1/siwe/init  -> POST /api/v1/siwe/authenticate
   - Refresh       : POST /api/v1/sessions   (NO captcha)
-  - Captcha       : Cloudflare Turnstile, sitekey 0x4AAAAAAAM8ceq5KhP1uJBt
+  - Captcha       : provider and site key are loaded dynamically
   - Access token  : ~60 min lifetime
 
 COST OPTIMISATION:
@@ -40,8 +40,12 @@ PRIVY_CLIENT_ID = "client-WY5iumRYaVR7RsCRhMD2ACF3MssqVB59ebRgJbpZwUxZd"
 PRIVY_API_BASE_URL = "https://auth.privy.io"
 PRIVY_CLIENT_VERSION = "react-auth:3.25.0"
 
-TURNSTILE_SITEKEY = "0x4AAAAAAAM8ceq5KhP1uJBt"
 DOMA_PAGE_URL = "https://app.doma.xyz"
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/137.0.0.0 Safari/537.36"
+)
 
 TWOCAPTCHA_IN = "https://2captcha.com/in.php"
 TWOCAPTCHA_RES = "https://2captcha.com/res.php"
@@ -85,19 +89,46 @@ def _privy_headers() -> Dict[str, str]:
         "privy-app-id": PRIVY_APP_ID,
         "privy-client-id": PRIVY_CLIENT_ID,
         "privy-client": PRIVY_CLIENT_VERSION,
+        "user-agent": BROWSER_USER_AGENT,
     }
 
 
 # ----------------------------------------------------------------------------
-# 2captcha — Cloudflare Turnstile solver
+# Live Privy captcha configuration and 2captcha solver
 # ----------------------------------------------------------------------------
-def solve_turnstile_2captcha(
+def fetch_privy_captcha_config(
+    proxies: Optional[Dict[str, str]] = None,
+) -> tuple[str, str]:
+    """Return the currently configured Privy captcha provider and site key."""
+    resp = requests.get(
+        f"{PRIVY_API_BASE_URL}/api/v1/apps/{PRIVY_APP_ID}",
+        headers=_privy_headers(),
+        timeout=20,
+        proxies=proxies,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    provider = str(data.get("enabled_captcha_provider") or "").strip().lower()
+    sitekey = str(data.get("captcha_site_key") or "").strip()
+    if ":" in sitekey and sitekey.split(":", 1)[0].lower() in {"h", "t"}:
+        sitekey = sitekey.split(":", 1)[1]
+    if provider not in {"hcaptcha", "turnstile"} or not sitekey:
+        raise RuntimeError(
+            "Unsupported or missing Privy captcha config: "
+            f"provider={provider!r}, sitekey_present={bool(sitekey)}"
+        )
+    return provider, sitekey
+
+
+def solve_captcha_2captcha(
     api_key: str,
     *,
-    sitekey: str = TURNSTILE_SITEKEY,
+    provider: str,
+    sitekey: str,
     pageurl: str = DOMA_PAGE_URL,
     action: Optional[str] = None,
     cdata: Optional[str] = None,
+    proxies: Optional[Dict[str, str]] = None,
     poll_interval: float = 5.0,
     timeout: float = 180.0,
     logger=None,
@@ -107,9 +138,20 @@ def solve_turnstile_2captcha(
     if not api_key:
         raise RuntimeError("2captcha API key is empty (set TWOCAPTCHA_API_KEY in .env)")
 
+    provider = (provider or "").strip().lower()
+    if provider == "hcaptcha":
+        raise RuntimeError(
+            "Doma/Privy currently requires hCaptcha, but 2captcha no longer "
+            "provides a working hCaptcha token for this flow. No captcha task "
+            "was submitted, so the 2captcha balance was not charged."
+        )
+    method = {"hcaptcha": "hcaptcha", "turnstile": "turnstile"}.get(provider)
+    if not method:
+        raise RuntimeError(f"Unsupported captcha provider: {provider!r}")
+
     payload = {
         "key": api_key,
-        "method": "turnstile",
+        "method": method,
         "sitekey": sitekey,
         "pageurl": pageurl,
         "json": 1,
@@ -124,7 +166,11 @@ def solve_turnstile_2captcha(
         raise RuntimeError(f"2captcha submit failed: {sub}")
     captcha_id = sub["request"]
     if logger:
-        logger.info("[ROLLCALL] 2captcha job submitted id=%s — waiting for solve", captcha_id)
+        logger.info(
+            "[ROLLCALL] 2captcha %s job submitted id=%s - waiting for solve",
+            provider,
+            captcha_id,
+        )
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -280,17 +326,41 @@ def _full_siwe_login(
     checksum_wallet = Web3.to_checksum_address(wallet)
     headers = _privy_headers()
 
-    # 1. Solve Turnstile (the only paid step)
-    captcha_token = solve_turnstile_2captcha(twocaptcha_key, logger=logger)
+    # Read the live provider/site key because Doma can change captcha providers
+    # without releasing a new client version.
+    captcha_provider, captcha_sitekey = fetch_privy_captcha_config(proxies=proxies)
 
-    # 2. init with captcha token
-    init_resp = requests.post(
-        f"{PRIVY_API_BASE_URL}/api/v1/siwe/init",
-        json={"address": checksum_wallet, "token": captcha_token},
-        headers=headers,
-        timeout=20,
-        proxies=proxies,
-    )
+    # A captcha service can occasionally return a token rejected by the target.
+    # Retry one fresh solution before failing the wallet.
+    init_resp = None
+    for attempt in range(1, 3):
+        captcha_token = solve_captcha_2captcha(
+            twocaptcha_key,
+            provider=captcha_provider,
+            sitekey=captcha_sitekey,
+            proxies=proxies,
+            logger=logger,
+        )
+        init_resp = requests.post(
+            f"{PRIVY_API_BASE_URL}/api/v1/siwe/init",
+            json={"address": checksum_wallet, "token": captcha_token},
+            headers=headers,
+            timeout=20,
+            proxies=proxies,
+        )
+        rejected_captcha = (
+            init_resp.status_code in (401, 403)
+            and "captcha" in init_resp.text.lower()
+        )
+        if not rejected_captcha:
+            break
+        if attempt == 1 and logger:
+            logger.warning(
+                "[ROLLCALL] Privy rejected %s token; solving once more",
+                captcha_provider,
+            )
+
+    assert init_resp is not None
     if init_resp.status_code in (401, 403) or '"code"' in init_resp.text and "captcha" in init_resp.text.lower():
         raise RuntimeError(f"Privy init rejected (captcha?): {init_resp.status_code} {init_resp.text[:200]}")
     init_resp.raise_for_status()
