@@ -174,6 +174,7 @@ DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.06")
 DOMAIN_LIQUIDITY_MIN_EXTRA_USD = Decimal("0.25")
 DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
+DOMAIN_LIQUIDITY_NATIVE_RESERVE_ETH = Decimal("0.00005")
 DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
 DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
 DOMAIN_PURCHASE_CLAIM_WAIT_TIMEOUT_SEC = 45 * 60
@@ -7048,6 +7049,32 @@ def _is_weth_usdce_pool(pool: Pool, quote_token: Token, weth_token: Token) -> bo
     return quote_token.address.lower() in addrs and weth_token.address.lower() in addrs
 
 
+def _liquidity_available_usd(
+    exec_client: EvmExecutionClient,
+    pool: Pool,
+    quote_token: Token,
+    weth_token: Token,
+    eth_price: Decimal,
+) -> Decimal:
+    native_spendable = max(
+        Decimal("0"),
+        exec_client.get_native_balance() - DOMAIN_LIQUIDITY_NATIVE_RESERVE_ETH,
+    )
+    total_usd = native_spendable * eth_price
+    tokens_by_address: Dict[str, Token] = {}
+    for token in (quote_token, weth_token, pool.token0, pool.token1):
+        address = token.address.strip().lower()
+        if address:
+            tokens_by_address[address] = token
+    for token in tokens_by_address.values():
+        token_price = pick_token_usd_price(token, eth_price)
+        if token_price <= 0:
+            continue
+        balance = exec_client.get_erc20_balance(token.address, token.decimals)
+        total_usd += balance * token_price
+    return total_usd
+
+
 def _top_up_liquidity_token(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -7081,7 +7108,10 @@ def _top_up_liquidity_token(
     if token.address.lower() == weth_token.address.lower():
         target_weth = target_usd / eth_price
         missing_weth = target_weth - balance
-        native_spendable = max(Decimal("0"), exec_client.get_native_balance() - Decimal("0.00001"))
+        native_spendable = max(
+            Decimal("0"),
+            exec_client.get_native_balance() - DOMAIN_LIQUIDITY_NATIVE_RESERVE_ETH,
+        )
         wrap_amount = min(missing_weth, native_spendable)
         if wrap_amount > Decimal("0"):
             required_after_wrap_raw = decimal_to_raw(balance + wrap_amount, weth_token.decimals)
@@ -7127,7 +7157,8 @@ def _top_up_liquidity_token(
         )
 
     native_balance = exec_client.get_native_balance()
-    if native_balance * eth_price < buy_usd + Decimal("0.10"):
+    native_spendable = max(Decimal("0"), native_balance - DOMAIN_LIQUIDITY_NATIVE_RESERVE_ETH)
+    if native_spendable * eth_price < buy_usd:
         logger.warning(
             "[%s] insufficient source balance for %s topup | missing=%s USD | native=%s ETH | USDC.E=%s",
             label,
@@ -7317,6 +7348,42 @@ def run_domain_liquidity_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 _format_decimal_plain(half_mint_usd),
                 _format_decimal_plain(pool.tvl_usd),
             )
+
+            available_usd = _liquidity_available_usd(
+                exec_client,
+                pool,
+                quote_token,
+                weth_token,
+                eth_price,
+            )
+            if available_usd < mint_target_usd:
+                reason = (
+                    "insufficient Doma balance before swaps "
+                    f"(available=${_format_decimal_plain(available_usd)}, "
+                    f"required=${_format_decimal_plain(mint_target_usd)})"
+                )
+                skipped_wallets += 1
+                skipped_wallet_details.append((wallet_number, wallet, reason))
+                logger.warning("[LIQUIDITY] wallet=%s skipped | %s", wallet, reason)
+                append_csv(
+                    liquidity_csv,
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        "skipped",
+                        wallet,
+                        pool.address,
+                        pool.token0.symbol,
+                        pool.token1.symbol,
+                        str(pool.fee_tier),
+                        _format_decimal_plain(target_usd),
+                        "",
+                        "",
+                        "",
+                        reason,
+                    ],
+                    delimiter=cfg.csv_delimiter,
+                )
+                continue
 
             quote_addr = quote_token.address.lower()
             token0_addr = pool.token0.address.lower()
