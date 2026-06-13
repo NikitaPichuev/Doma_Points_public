@@ -198,19 +198,22 @@ def solve_hcaptcha_captchasonic(
         raise RuntimeError("CaptchaSonic API key is empty (set CAPTCHASONIC_API_KEY in .env)")
 
     proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+    if not proxy:
+        raise RuntimeError("CaptchaSonic hCaptcha requires the wallet-bound proxy")
+
+    # CaptchaSonic's token API uses PopularTask for hCaptcha. The older
+    # hcaptchatask alias can be accepted by createTask but produces tokens that
+    # Privy rejects as invalid_captcha.
     task = {
-        "type": "hcaptchatask" if proxy else "hcaptchataskproxyless",
+        "type": "PopularTask",
         "websiteURL": pageurl,
         "websiteKey": sitekey,
-        "isInvisible": True,
-        "userAgent": BROWSER_USER_AGENT,
+        "proxy": proxy,
     }
-    if proxy:
-        task["proxy"] = proxy
 
     sub = requests.post(
         f"{CAPTCHASONIC_API_URL}/createTask",
-        json={"clientKey": api_key, "task": task},
+        json={"apiKey": api_key, "task": task},
         timeout=30,
     ).json()
     if sub.get("errorId") or not sub.get("taskId"):
@@ -224,7 +227,7 @@ def solve_hcaptcha_captchasonic(
         time.sleep(poll_interval)
         result = requests.post(
             f"{CAPTCHASONIC_API_URL}/getTaskResult",
-            json={"clientKey": api_key, "taskId": task_id},
+            json={"apiKey": api_key, "taskId": task_id},
             timeout=30,
         ).json()
         if result.get("errorId"):
