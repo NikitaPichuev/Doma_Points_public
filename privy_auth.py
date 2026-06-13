@@ -192,7 +192,7 @@ def solve_hcaptcha_captchasonic(
     poll_interval: float = 3.0,
     timeout: float = 180.0,
     logger=None,
-) -> str:
+) -> tuple[str, str]:
     """Solve Privy's hCaptcha through CaptchaSonic browser automation."""
     if not api_key:
         raise RuntimeError("CaptchaSonic API key is empty (set CAPTCHASONIC_API_KEY in .env)")
@@ -202,6 +202,8 @@ def solve_hcaptcha_captchasonic(
         "type": "hcaptchatask" if proxy else "hcaptchataskproxyless",
         "websiteURL": pageurl,
         "websiteKey": sitekey,
+        "isInvisible": True,
+        "userAgent": BROWSER_USER_AGENT,
     }
     if proxy:
         task["proxy"] = proxy
@@ -229,20 +231,31 @@ def solve_hcaptcha_captchasonic(
             raise RuntimeError(f"CaptchaSonic solve error: {result}")
         if result.get("status") != "ready":
             continue
-        solution = result.get("solution") or {}
+        raw_solution = result.get("solution") or {}
+        solution = raw_solution if isinstance(raw_solution, dict) else {}
         token = next(
             (
                 str(solution.get(key) or "").strip()
-                for key in ("token", "captchaToken", "gRecaptchaResponse", "response")
+                for key in ("gRecaptchaResponse", "captchaToken", "token", "response")
                 if str(solution.get(key) or "").strip()
             ),
             "",
         )
-        if not token and isinstance(solution, str):
-            token = solution.strip()
+        if not token and isinstance(raw_solution, str):
+            token = raw_solution.strip()
         if not token:
             raise RuntimeError(f"CaptchaSonic returned no token: {result}")
-        return token
+        solver_user_agent = str(
+            solution.get("userAgent")
+            or solution.get("user_agent")
+            or BROWSER_USER_AGENT
+        ).strip()
+        if logger:
+            logger.info(
+                "[ROLLCALL] CaptchaSonic hcaptcha solved | solution_fields=%s",
+                ",".join(sorted(str(key) for key in solution.keys())) if solution else "token",
+            )
+        return token, solver_user_agent
     raise RuntimeError(f"CaptchaSonic timeout after {timeout:.0f}s (id={task_id})")
 
 
@@ -392,12 +405,13 @@ def _full_siwe_login(
     # Use one paid solution per login attempt. Retrying rejected tokens here can
     # charge the user twice without changing the underlying request context.
     if captcha_provider == "hcaptcha":
-        captcha_token = solve_hcaptcha_captchasonic(
+        captcha_token, captcha_user_agent = solve_hcaptcha_captchasonic(
             captchasonic_key,
             sitekey=captcha_sitekey,
             proxies=proxies,
             logger=logger,
         )
+        headers["user-agent"] = captcha_user_agent
     else:
         captcha_token = solve_captcha_2captcha(
             twocaptcha_key,
