@@ -28,7 +28,6 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Optional
-from urllib.parse import unquote, urlparse
 
 import requests
 from eth_account import Account
@@ -200,25 +199,12 @@ def solve_hcaptcha_captchasonic(
 
     proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
     task = {
-        "type": "HCaptchaTask" if proxy else "HCaptchaTaskProxyless",
+        "type": "hcaptchatask" if proxy else "hcaptchataskproxyless",
         "websiteURL": pageurl,
         "websiteKey": sitekey,
     }
     if proxy:
-        parsed = urlparse(proxy)
-        if not parsed.hostname or not parsed.port:
-            raise RuntimeError(f"Invalid proxy URL for CaptchaSonic: {proxy!r}")
-        task.update(
-            {
-                "proxyType": "socks5" if parsed.scheme.lower() == "socks5" else "http",
-                "proxyAddress": parsed.hostname,
-                "proxyPort": parsed.port,
-            }
-        )
-        if parsed.username:
-            task["proxyLogin"] = unquote(parsed.username)
-        if parsed.password:
-            task["proxyPassword"] = unquote(parsed.password)
+        task["proxy"] = proxy
 
     sub = requests.post(
         f"{CAPTCHASONIC_API_URL}/createTask",
