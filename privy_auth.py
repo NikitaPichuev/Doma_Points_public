@@ -49,6 +49,7 @@ BROWSER_USER_AGENT = (
 
 TWOCAPTCHA_IN = "https://2captcha.com/in.php"
 TWOCAPTCHA_RES = "https://2captcha.com/res.php"
+CAPTCHASONIC_API_URL = "https://api.captchasonic.com"
 
 
 def check_proxy(proxies: Optional[Dict[str, str]], timeout: float = 10.0) -> bool:
@@ -139,13 +140,7 @@ def solve_captcha_2captcha(
         raise RuntimeError("2captcha API key is empty (set TWOCAPTCHA_API_KEY in .env)")
 
     provider = (provider or "").strip().lower()
-    if provider == "hcaptcha":
-        raise RuntimeError(
-            "Doma/Privy currently requires hCaptcha, but 2captcha no longer "
-            "provides a working hCaptcha token for this flow. No captcha task "
-            "was submitted, so the 2captcha balance was not charged."
-        )
-    method = {"hcaptcha": "hcaptcha", "turnstile": "turnstile"}.get(provider)
+    method = {"turnstile": "turnstile"}.get(provider)
     if not method:
         raise RuntimeError(f"Unsupported captcha provider: {provider!r}")
 
@@ -186,6 +181,69 @@ def solve_captcha_2captcha(
         if res.get("request") != "CAPCHA_NOT_READY":
             raise RuntimeError(f"2captcha solve error: {res}")
     raise RuntimeError(f"2captcha timeout after {timeout:.0f}s (id={captcha_id})")
+
+
+def solve_hcaptcha_captchasonic(
+    api_key: str,
+    *,
+    sitekey: str,
+    pageurl: str = DOMA_PAGE_URL,
+    proxies: Optional[Dict[str, str]] = None,
+    poll_interval: float = 3.0,
+    timeout: float = 180.0,
+    logger=None,
+) -> str:
+    """Solve Privy's hCaptcha through CaptchaSonic browser automation."""
+    if not api_key:
+        raise RuntimeError("CaptchaSonic API key is empty (set CAPTCHASONIC_API_KEY in .env)")
+
+    proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+    task = {
+        "type": "PopularTask" if proxy else "PopularTaskProxyless",
+        "websiteURL": pageurl,
+        "websiteKey": sitekey,
+    }
+    if proxy:
+        task["proxy"] = proxy
+
+    sub = requests.post(
+        f"{CAPTCHASONIC_API_URL}/createTask",
+        json={"apiKey": api_key, "task": task},
+        timeout=30,
+    ).json()
+    if sub.get("errorId") or not sub.get("taskId"):
+        raise RuntimeError(f"CaptchaSonic submit failed: {sub}")
+    task_id = sub["taskId"]
+    if logger:
+        logger.info("[ROLLCALL] CaptchaSonic hcaptcha job submitted id=%s - waiting for solve", task_id)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+        result = requests.post(
+            f"{CAPTCHASONIC_API_URL}/getTaskResult",
+            json={"apiKey": api_key, "taskId": task_id},
+            timeout=30,
+        ).json()
+        if result.get("errorId"):
+            raise RuntimeError(f"CaptchaSonic solve error: {result}")
+        if result.get("status") != "ready":
+            continue
+        solution = result.get("solution") or {}
+        token = next(
+            (
+                str(solution.get(key) or "").strip()
+                for key in ("token", "captchaToken", "gRecaptchaResponse", "response")
+                if str(solution.get(key) or "").strip()
+            ),
+            "",
+        )
+        if not token and isinstance(solution, str):
+            token = solution.strip()
+        if not token:
+            raise RuntimeError(f"CaptchaSonic returned no token: {result}")
+        return token
+    raise RuntimeError(f"CaptchaSonic timeout after {timeout:.0f}s (id={task_id})")
 
 
 # ----------------------------------------------------------------------------
@@ -317,7 +375,8 @@ def _full_siwe_login(
     wallet: str,
     private_key: str,
     chain_id: int,
-    twocaptcha_key: str,
+    twocaptcha_key: str = "",
+    captchasonic_key: str = "",
     proxies: Optional[Dict[str, str]] = None,
     logger=None,
 ) -> tuple[str, str]:
@@ -334,13 +393,21 @@ def _full_siwe_login(
     # Retry one fresh solution before failing the wallet.
     init_resp = None
     for attempt in range(1, 3):
-        captcha_token = solve_captcha_2captcha(
-            twocaptcha_key,
-            provider=captcha_provider,
-            sitekey=captcha_sitekey,
-            proxies=proxies,
-            logger=logger,
-        )
+        if captcha_provider == "hcaptcha":
+            captcha_token = solve_hcaptcha_captchasonic(
+                captchasonic_key,
+                sitekey=captcha_sitekey,
+                proxies=proxies,
+                logger=logger,
+            )
+        else:
+            captcha_token = solve_captcha_2captcha(
+                twocaptcha_key,
+                provider=captcha_provider,
+                sitekey=captcha_sitekey,
+                proxies=proxies,
+                logger=logger,
+            )
         init_resp = requests.post(
             f"{PRIVY_API_BASE_URL}/api/v1/siwe/init",
             json={"address": checksum_wallet, "token": captcha_token},
@@ -401,7 +468,8 @@ def mint_access_token(
     wallet: str,
     private_key: str,
     *,
-    twocaptcha_key: str,
+    twocaptcha_key: str = "",
+    captchasonic_key: str = "",
     chain_id: int = 97477,
     proxies: Optional[Dict[str, str]] = None,
     refresh_store: Optional[RefreshTokenStore] = None,
@@ -434,7 +502,13 @@ def mint_access_token(
 
     # 2. Full login (captcha)
     access, refresh = _full_siwe_login(
-        wallet, private_key, chain_id, twocaptcha_key, proxies=proxies, logger=logger
+        wallet,
+        private_key,
+        chain_id,
+        twocaptcha_key,
+        captchasonic_key,
+        proxies=proxies,
+        logger=logger,
     )
     if refresh_store is not None:
         refresh_store.set(wallet, refresh_token=refresh, access_token=access)

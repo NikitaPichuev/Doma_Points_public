@@ -2119,15 +2119,26 @@ def _is_privy_auth_error(exc: Exception) -> bool:
 
 def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
     _ = state
-    if (cfg.captcha_provider or "").strip().lower() not in {"2captcha", "twocaptcha"}:
-        raise RuntimeError(f"Unsupported CAPTCHA_PROVIDER={cfg.captcha_provider}; only 2captcha is supported")
+    import privy_auth
+
+    captcha_type, _captcha_sitekey = privy_auth.fetch_privy_captcha_config()
     twocaptcha_key = (cfg.twocaptcha_api_key or "").strip()
-    if not twocaptcha_key:
+    captchasonic_key = (cfg.captchasonic_api_key or "").strip()
+    if captcha_type == "hcaptcha" and not captchasonic_key:
         if not sys.stdin.isatty():
-            raise RuntimeError("TWOCAPTCHA_API_KEY is missing. Put it into .env or set CAPTCHA_API_KEY.")
+            raise RuntimeError("CAPTCHASONIC_API_KEY is missing. Put it into .env.")
+        captchasonic_key = input("CaptchaSonic API key [blank = cancel]: ").strip()
+        if not captchasonic_key:
+            raise RuntimeError("CAPTCHASONIC_API_KEY is missing. Put it into .env.")
+        _save_env_value(Path(".env"), "CAPTCHASONIC_API_KEY", captchasonic_key)
+        cfg.captchasonic_api_key = captchasonic_key
+        logger.info("[ROLLCALL_TOKEN] CAPTCHASONIC_API_KEY saved to .env")
+    elif captcha_type == "turnstile" and not twocaptcha_key:
+        if not sys.stdin.isatty():
+            raise RuntimeError("TWOCAPTCHA_API_KEY is missing. Put it into .env.")
         twocaptcha_key = input("2captcha API key [blank = cancel]: ").strip()
         if not twocaptcha_key:
-            raise RuntimeError("TWOCAPTCHA_API_KEY is missing. Put it into .env or set CAPTCHA_API_KEY.")
+            raise RuntimeError("TWOCAPTCHA_API_KEY is missing. Put it into .env.")
         _save_env_value(Path(".env"), "TWOCAPTCHA_API_KEY", twocaptcha_key)
         cfg.twocaptcha_api_key = twocaptcha_key
         logger.info("[ROLLCALL_TOKEN] TWOCAPTCHA_API_KEY saved to .env")
@@ -2147,8 +2158,6 @@ def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, s
     wallet_order = _prompt_wallet_order(default_random=False)
     if wallet_order == "random":
         random.shuffle(wallet_records)
-
-    import privy_auth
 
     refresh_store = privy_auth.RefreshTokenStore(cfg.privy_refresh_tokens_file)
     token_lines = _read_rollcall_token_lines(cfg.privy_access_tokens_file)
@@ -2190,6 +2199,7 @@ def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, s
                 wallet,
                 private_key,
                 twocaptcha_key=twocaptcha_key,
+                captchasonic_key=captchasonic_key,
                 chain_id=cfg.chain_id,
                 proxies=work_proxies,
                 refresh_store=refresh_store,
@@ -2249,6 +2259,8 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
 
     refresh_store = privy_auth.RefreshTokenStore(cfg.privy_refresh_tokens_file)
     twocaptcha_key = (cfg.twocaptcha_api_key or "").strip()
+    captchasonic_key = (cfg.captchasonic_api_key or "").strip()
+    has_captcha_solver = bool(twocaptcha_key or captchasonic_key)
     fatal_auth_error = False
 
     logger.info(
@@ -2296,13 +2308,14 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             )
             has_refresh = bool(refresh_store.get_refresh(wallet) and refresh_store.get_access(wallet))
             access_token = stored_access_token
-            if has_refresh or (not access_token and twocaptcha_key):
+            if has_refresh or (not access_token and has_captcha_solver):
                 auth_method = "refresh" if has_refresh else "full login"
                 logger.info("[ROLLCALL] wallet=wallet#%s obtaining fresh Privy token via %s", wallet_number, auth_method)
                 access_token = privy_auth.mint_access_token(
                     wallet,
                     private_key,
                     twocaptcha_key=twocaptcha_key,
+                    captchasonic_key=captchasonic_key,
                     chain_id=cfg.chain_id,
                     proxies=proxies,
                     refresh_store=refresh_store,
@@ -2318,12 +2331,12 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 logger.info("[ROLLCALL] wallet=wallet#%s using saved Privy token (no refresh token available)", wallet_number)
             else:
                 raise RuntimeError(
-                    "Privy access and refresh tokens are missing; run point 23 or configure TWOCAPTCHA_API_KEY"
+                    "Privy access and refresh tokens are missing; run point 23 or configure a CAPTCHA API key"
                 )
             try:
                 result = api.check_in(wallet, cfg.chain_id, access_token=access_token)
             except Exception as first_exc:
-                if not _is_privy_auth_error(first_exc) or not twocaptcha_key:
+                if not _is_privy_auth_error(first_exc) or not has_captcha_solver:
                     raise
                 logger.warning(
                     "[ROLLCALL] wallet=wallet#%s Privy token rejected; re-authenticating once",
@@ -2334,6 +2347,7 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     wallet,
                     private_key,
                     twocaptcha_key=twocaptcha_key,
+                    captchasonic_key=captchasonic_key,
                     chain_id=cfg.chain_id,
                     proxies=proxies,
                     refresh_store=refresh_store,
