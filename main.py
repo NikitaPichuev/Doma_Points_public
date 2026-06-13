@@ -2121,7 +2121,11 @@ def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, s
     _ = state
     import privy_auth
 
-    captcha_type, _captcha_sitekey = privy_auth.fetch_privy_captcha_config()
+    configured_proxies = [proxy.strip() for proxy in (cfg.file_proxies or []) if proxy.strip()]
+    if not configured_proxies:
+        raise RuntimeError("Point 23 requires proxies.txt: one proxy per wallet line; direct mode is disabled")
+    config_proxy = {"http": configured_proxies[0], "https": configured_proxies[0]}
+    captcha_type, _captcha_sitekey = privy_auth.fetch_privy_captcha_config(proxies=config_proxy)
     twocaptcha_key = (cfg.twocaptcha_api_key or "").strip()
     captchasonic_key = (cfg.captchasonic_api_key or "").strip()
     if captcha_type == "hcaptcha" and not captchasonic_key:
@@ -2183,18 +2187,18 @@ def run_rollcall_token_generation_once(cfg: BotConfig, logger: logging.Logger, s
             _wallet_record_progress_label(process_idx, len(wallet_records), line_idx, total_wallets, wallet),
         )
         bound_proxy = cfg.file_proxies[line_idx].strip() if line_idx < len(cfg.file_proxies) else ""
-        proxies = {"http": bound_proxy, "https": bound_proxy} if bound_proxy else None
         try:
+            if not bound_proxy:
+                raise RuntimeError(f"missing proxy on line {wallet_number}; direct mode is disabled")
+            proxies = {"http": bound_proxy, "https": bound_proxy}
             token_lines[wallet_number - 1] = ""
             _write_rollcall_token_lines(cfg.privy_access_tokens_file, token_lines, total_wallets)
-            candidates = []
-            if proxies:
-                candidates.append((f"bound#{wallet_number}", proxies))
-            pool = [p.strip() for p in (cfg.file_proxies or []) if p.strip() and p.strip() != bound_proxy]
-            for purl in random.sample(pool, min(5, len(pool))):
-                candidates.append(("pool", {"http": purl, "https": purl}))
-            candidates.append(("direct", None))
-            _proxy_label, work_proxies = privy_auth.find_working_proxy(candidates, logger=logger)
+            _proxy_label, work_proxies = privy_auth.find_working_proxy(
+                [(f"bound#{wallet_number}", proxies)],
+                logger=logger,
+            )
+            if work_proxies is None:
+                raise RuntimeError(f"proxy on line {wallet_number} is unavailable; direct mode is disabled")
             access_token = privy_auth.mint_access_token(
                 wallet,
                 private_key,
@@ -2282,9 +2286,9 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             _wallet_record_progress_label(process_idx, selected_total, line_idx, total_wallets, wallet),
         )
         proxy = cfg.file_proxies[line_idx].strip() if line_idx < len(cfg.file_proxies) else ""
-        if cfg.file_proxies and line_idx >= len(cfg.file_proxies):
+        if not proxy:
             skipped_count += 1
-            reason = "missing proxy on matching line"
+            reason = "missing proxy on matching line; direct mode is disabled"
             skipped_details.append(f"wallet#{wallet_number}: {reason}")
             append_csv(
                 rollcall_csv,
@@ -2292,7 +2296,7 @@ def run_daily_rollcall_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 delimiter=cfg.csv_delimiter,
             )
             continue
-        proxies = {"http": proxy, "https": proxy} if proxy else None
+        proxies = {"http": proxy, "https": proxy}
         api = DomaApiClient(
             cfg.doma_api_url,
             api_key="",
