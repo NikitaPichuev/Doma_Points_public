@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -81,8 +82,8 @@ def find_working_proxy(candidates, logger=None):
     return None, None
 
 
-def _privy_headers() -> Dict[str, str]:
-    return {
+def _privy_headers(client_analytics_id: str = "") -> Dict[str, str]:
+    headers = {
         "accept": "application/json",
         "content-type": "application/json",
         "origin": DOMA_PAGE_URL,
@@ -92,6 +93,9 @@ def _privy_headers() -> Dict[str, str]:
         "privy-client": PRIVY_CLIENT_VERSION,
         "user-agent": BROWSER_USER_AGENT,
     }
+    if client_analytics_id:
+        headers["privy-ca-id"] = client_analytics_id
+    return headers
 
 
 # ----------------------------------------------------------------------------
@@ -99,11 +103,15 @@ def _privy_headers() -> Dict[str, str]:
 # ----------------------------------------------------------------------------
 def fetch_privy_captcha_config(
     proxies: Optional[Dict[str, str]] = None,
+    *,
+    session: Optional[requests.Session] = None,
+    client_analytics_id: str = "",
 ) -> tuple[str, str]:
     """Return the currently configured Privy captcha provider and site key."""
-    resp = requests.get(
+    http = session or requests
+    resp = http.get(
         f"{PRIVY_API_BASE_URL}/api/v1/apps/{PRIVY_APP_ID}",
-        headers=_privy_headers(),
+        headers=_privy_headers(client_analytics_id),
         timeout=20,
         proxies=proxies,
     )
@@ -399,11 +407,19 @@ def _full_siwe_login(
     """Full login: captcha -> init -> sign -> authenticate.
     Returns (access_token, refresh_token). Raises on failure."""
     checksum_wallet = Web3.to_checksum_address(wallet)
-    headers = _privy_headers()
+    client_analytics_id = str(uuid.uuid4())
+    headers = _privy_headers(client_analytics_id)
+    http = requests.Session()
+    if proxies:
+        http.proxies.update(proxies)
 
     # Read the live provider/site key because Doma can change captcha providers
     # without releasing a new client version.
-    captcha_provider, captcha_sitekey = fetch_privy_captcha_config(proxies=proxies)
+    captcha_provider, captcha_sitekey = fetch_privy_captcha_config(
+        proxies=proxies,
+        session=http,
+        client_analytics_id=client_analytics_id,
+    )
 
     # Use one paid solution per login attempt. Retrying rejected tokens here can
     # charge the user twice without changing the underlying request context.
@@ -423,7 +439,7 @@ def _full_siwe_login(
             proxies=proxies,
             logger=logger,
         )
-    init_resp = requests.post(
+    init_resp = http.post(
         f"{PRIVY_API_BASE_URL}/api/v1/siwe/init",
         json={"address": checksum_wallet, "token": captcha_token},
         headers=headers,
@@ -443,7 +459,7 @@ def _full_siwe_login(
     signature = Web3.to_hex(signed.signature)
 
     # 4. authenticate
-    auth_resp = requests.post(
+    auth_resp = http.post(
         f"{PRIVY_API_BASE_URL}/api/v1/siwe/authenticate",
         json={
             "message": message,
