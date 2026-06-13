@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Optional
+from urllib.parse import unquote, urlparse
 
 import requests
 from eth_account import Account
@@ -199,16 +200,29 @@ def solve_hcaptcha_captchasonic(
 
     proxy = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
     task = {
-        "type": "PopularTask" if proxy else "PopularTaskProxyless",
+        "type": "HCaptchaTask" if proxy else "HCaptchaTaskProxyless",
         "websiteURL": pageurl,
         "websiteKey": sitekey,
     }
     if proxy:
-        task["proxy"] = proxy
+        parsed = urlparse(proxy)
+        if not parsed.hostname or not parsed.port:
+            raise RuntimeError(f"Invalid proxy URL for CaptchaSonic: {proxy!r}")
+        task.update(
+            {
+                "proxyType": "socks5" if parsed.scheme.lower() == "socks5" else "http",
+                "proxyAddress": parsed.hostname,
+                "proxyPort": parsed.port,
+            }
+        )
+        if parsed.username:
+            task["proxyLogin"] = unquote(parsed.username)
+        if parsed.password:
+            task["proxyPassword"] = unquote(parsed.password)
 
     sub = requests.post(
         f"{CAPTCHASONIC_API_URL}/createTask",
-        json={"apiKey": api_key, "task": task},
+        json={"clientKey": api_key, "task": task},
         timeout=30,
     ).json()
     if sub.get("errorId") or not sub.get("taskId"):
@@ -222,7 +236,7 @@ def solve_hcaptcha_captchasonic(
         time.sleep(poll_interval)
         result = requests.post(
             f"{CAPTCHASONIC_API_URL}/getTaskResult",
-            json={"apiKey": api_key, "taskId": task_id},
+            json={"clientKey": api_key, "taskId": task_id},
             timeout=30,
         ).json()
         if result.get("errorId"):
@@ -389,45 +403,30 @@ def _full_siwe_login(
     # without releasing a new client version.
     captcha_provider, captcha_sitekey = fetch_privy_captcha_config(proxies=proxies)
 
-    # A captcha service can occasionally return a token rejected by the target.
-    # Retry one fresh solution before failing the wallet.
-    init_resp = None
-    for attempt in range(1, 3):
-        if captcha_provider == "hcaptcha":
-            captcha_token = solve_hcaptcha_captchasonic(
-                captchasonic_key,
-                sitekey=captcha_sitekey,
-                proxies=proxies,
-                logger=logger,
-            )
-        else:
-            captcha_token = solve_captcha_2captcha(
-                twocaptcha_key,
-                provider=captcha_provider,
-                sitekey=captcha_sitekey,
-                proxies=proxies,
-                logger=logger,
-            )
-        init_resp = requests.post(
-            f"{PRIVY_API_BASE_URL}/api/v1/siwe/init",
-            json={"address": checksum_wallet, "token": captcha_token},
-            headers=headers,
-            timeout=20,
+    # Use one paid solution per login attempt. Retrying rejected tokens here can
+    # charge the user twice without changing the underlying request context.
+    if captcha_provider == "hcaptcha":
+        captcha_token = solve_hcaptcha_captchasonic(
+            captchasonic_key,
+            sitekey=captcha_sitekey,
             proxies=proxies,
+            logger=logger,
         )
-        rejected_captcha = (
-            init_resp.status_code in (401, 403)
-            and "captcha" in init_resp.text.lower()
+    else:
+        captcha_token = solve_captcha_2captcha(
+            twocaptcha_key,
+            provider=captcha_provider,
+            sitekey=captcha_sitekey,
+            proxies=proxies,
+            logger=logger,
         )
-        if not rejected_captcha:
-            break
-        if attempt == 1 and logger:
-            logger.warning(
-                "[ROLLCALL] Privy rejected %s token; solving once more",
-                captcha_provider,
-            )
-
-    assert init_resp is not None
+    init_resp = requests.post(
+        f"{PRIVY_API_BASE_URL}/api/v1/siwe/init",
+        json={"address": checksum_wallet, "token": captcha_token},
+        headers=headers,
+        timeout=20,
+        proxies=proxies,
+    )
     if init_resp.status_code in (401, 403) or '"code"' in init_resp.text and "captcha" in init_resp.text.lower():
         raise RuntimeError(f"Privy init rejected (captcha?): {init_resp.status_code} {init_resp.text[:200]}")
     init_resp.raise_for_status()
