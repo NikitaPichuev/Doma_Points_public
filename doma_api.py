@@ -23,6 +23,7 @@ PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 MAX_UINT256 = (1 << 256) - 1
 MAX_UINT160 = (1 << 160) - 1
 MAX_UINT48 = (1 << 48) - 1
+NATIVE_GAS_RESERVE_FALLBACK_ETH = Decimal("0.00002")
 DOMA_FRACTIONALIZATION_ADDRESS = "0xd00000000004f450f1438cfA436587d8f8A55A29"
 PROXY_DOMA_RECORD_ADDRESS = "0xd0000000000067CB44aE7b6aC3AB5764dE20A3E2"
 
@@ -2539,7 +2540,7 @@ class EvmExecutionClient:
         missing = required - current
         native = int(self.web3.eth.get_balance(self.account_address))
         # Keep a small gas reserve to avoid draining the account completely.
-        reserve = int(Decimal("0.00001") * (Decimal(10) ** 18))
+        reserve = int(NATIVE_GAS_RESERVE_FALLBACK_ETH * (Decimal(10) ** 18))
         if native < missing + reserve:
             raise RuntimeError(
                 f"Insufficient native ETH to wrap into WETH: need {missing}, have {native}"

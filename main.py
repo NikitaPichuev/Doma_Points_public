@@ -174,7 +174,8 @@ DOMAIN_LIQUIDITY_MINT_BUFFER = Decimal("1.06")
 DOMAIN_LIQUIDITY_MIN_EXTRA_USD = Decimal("0.25")
 DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
-DOMAIN_LIQUIDITY_NATIVE_RESERVE_ETH = Decimal("0.00005")
+NATIVE_GAS_RESERVE_USD = Decimal("0.03")
+NATIVE_GAS_RESERVE_FALLBACK_ETH = Decimal("0.00002")
 DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
 DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
 DOMAIN_PURCHASE_CLAIM_WAIT_TIMEOUT_SEC = 45 * 60
@@ -198,6 +199,19 @@ BASE_RPC_FALLBACK_URLS = [
     "https://base.llamarpc.com",
 ]
 DOMAIN_OFFER_MIN_ETH_EQUIVALENT = Decimal("0.0001")
+
+
+def _native_gas_reserve_eth(eth_price: Decimal) -> Decimal:
+    if eth_price > 0:
+        return NATIVE_GAS_RESERVE_USD / eth_price
+    return NATIVE_GAS_RESERVE_FALLBACK_ETH
+
+
+def _spendable_native_eth(exec_client: EvmExecutionClient, eth_price: Decimal) -> Decimal:
+    return max(
+        Decimal("0"),
+        exec_client.get_native_balance() - _native_gas_reserve_eth(eth_price),
+    )
 
 
 def _color(text: str, code: str) -> str:
@@ -907,7 +921,10 @@ def _execute_trade_for_pair(
 
     is_eth_source = symbol_in.strip().upper() == "ETH" and token_in.symbol == "WETH"
     if is_eth_source:
-        wallet_balance_in = exec_client.get_native_balance() + exec_client.get_erc20_balance(token_in.address, token_in.decimals)
+        wallet_balance_in = _spendable_native_eth(exec_client, eth_price) + exec_client.get_erc20_balance(
+            token_in.address,
+            token_in.decimals,
+        )
     else:
         wallet_balance_in = exec_client.get_erc20_balance(token_in.address, token_in.decimals)
     try:
@@ -1116,7 +1133,7 @@ def _execute_trade_via_doma_ui_route(
         return False
 
     wallet_balance_in = (
-        exec_client.get_native_balance()
+        _spendable_native_eth(exec_client, eth_price)
         if is_eth_source
         else exec_client.get_erc20_balance(token_in.address, token_in.decimals)
     )
@@ -4278,7 +4295,7 @@ def run_domain_quest_volume_once(
                 full_balance_rides_usd = full_balance_rides * rides_price_usd
                 has_usable_usdc = full_balance_usdc >= MIN_EXECUTABLE_TRADE_USD
                 has_usable_rides = full_balance_rides_usd >= MIN_EXECUTABLE_TRADE_USD
-                reserve_eth = Decimal("0.00001")
+                reserve_eth = _native_gas_reserve_eth(eth_price)
                 spendable_eth = exec_client.get_native_balance() - reserve_eth
                 spendable_eth = spendable_eth if spendable_eth > 0 else Decimal("0")
                 spendable_eth_usd = spendable_eth * eth_price
@@ -7074,10 +7091,7 @@ def _liquidity_available_usd(
     weth_token: Token,
     eth_price: Decimal,
 ) -> Decimal:
-    native_spendable = max(
-        Decimal("0"),
-        exec_client.get_native_balance() - DOMAIN_LIQUIDITY_NATIVE_RESERVE_ETH,
-    )
+    native_spendable = _spendable_native_eth(exec_client, eth_price)
     total_usd = native_spendable * eth_price
     tokens_by_address: Dict[str, Token] = {}
     for token in (quote_token, weth_token, pool.token0, pool.token1):
@@ -7126,10 +7140,7 @@ def _top_up_liquidity_token(
     if token.address.lower() == weth_token.address.lower():
         target_weth = target_usd / eth_price
         missing_weth = target_weth - balance
-        native_spendable = max(
-            Decimal("0"),
-            exec_client.get_native_balance() - DOMAIN_LIQUIDITY_NATIVE_RESERVE_ETH,
-        )
+        native_spendable = _spendable_native_eth(exec_client, eth_price)
         wrap_amount = min(missing_weth, native_spendable)
         if wrap_amount > Decimal("0"):
             required_after_wrap_raw = decimal_to_raw(balance + wrap_amount, weth_token.decimals)
@@ -7175,7 +7186,7 @@ def _top_up_liquidity_token(
         )
 
     native_balance = exec_client.get_native_balance()
-    native_spendable = max(Decimal("0"), native_balance - DOMAIN_LIQUIDITY_NATIVE_RESERVE_ETH)
+    native_spendable = _spendable_native_eth(exec_client, eth_price)
     if native_spendable * eth_price < buy_usd:
         logger.warning(
             "[%s] insufficient source balance for %s topup | missing=%s USD | native=%s ETH | USDC.E=%s",
@@ -7950,7 +7961,7 @@ def _top_up_usdce_from_eth_for_cheap_buy(
         logger.warning("[%s] wallet=%s cannot top up USDC.E from ETH: ETH price is unknown", log_prefix, wallet)
         return False, "eth_price_unknown", current_usdc, required_usdc
 
-    reserve_eth = Decimal("0.05") / eth_price
+    reserve_eth = _native_gas_reserve_eth(eth_price)
     native_eth = exec_client.get_native_balance()
     spendable_eth = native_eth - reserve_eth
     if spendable_eth <= 0:
@@ -8021,7 +8032,7 @@ def _can_fully_fund_usdce_topup(
     if eth_price <= 0:
         return False, current_usdc, Decimal("0"), current_usdc
 
-    reserve_eth = Decimal("0.05") / eth_price
+    reserve_eth = _native_gas_reserve_eth(eth_price)
     native_eth = exec_client.get_native_balance()
     spendable_eth = max(Decimal("0"), native_eth - reserve_eth)
     spendable_eth_usd = spendable_eth * eth_price
@@ -8050,7 +8061,7 @@ def _top_up_usdce_from_eth_for_offer(
         logger.warning("[OFFER] wallet=%s cannot top up USDC.E from ETH: ETH price is unknown", wallet)
         return False
 
-    reserve_eth = Decimal("0.05") / eth_price
+    reserve_eth = _native_gas_reserve_eth(eth_price)
     native_eth = exec_client.get_native_balance()
     spendable_eth = native_eth - reserve_eth
     if spendable_eth <= 0:
@@ -8104,7 +8115,7 @@ def _top_up_usdce_from_eth_for_offer(
 def _has_spendable_eth_for_cheap_buy(exec_client: EvmExecutionClient, eth_price: Decimal, required_usdc: Decimal = Decimal("0")) -> bool:
     if eth_price <= 0:
         return False
-    reserve_eth = Decimal("0.05") / eth_price
+    reserve_eth = _native_gas_reserve_eth(eth_price)
     spendable_eth = exec_client.get_native_balance() - reserve_eth
     required_usd = max(required_usdc, Decimal("0.000001"))
     return spendable_eth > 0 and (spendable_eth * eth_price) >= required_usd
@@ -8977,7 +8988,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         )
 
                 missing_usdc = required_usdc - current
-                reserve_eth = Decimal("0.05") / eth_price
+                reserve_eth = _native_gas_reserve_eth(eth_price)
                 native_eth = exec_client.get_native_balance()
                 spendable_eth = native_eth - reserve_eth
                 bootstrap_eth = min(max(missing_usdc, MIN_EXECUTABLE_TRADE_USD) / eth_price, spendable_eth)
@@ -8990,7 +9001,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         current,
                         "eth_bootstrap_below_min:"
                         f"native_eth={_format_decimal_plain(native_eth)}(~${_format_decimal_plain(native_eth_usd)}),"
-                        "reserve=$0.05,"
+                        f"reserve=${_format_decimal_plain(NATIVE_GAS_RESERVE_USD)},"
                         f"spendable=${_format_decimal_plain(spendable_eth_usd)},"
                         f"weth=${_format_decimal_plain(weth_balance_usd)},"
                         f"missing_usdc={_format_decimal_plain(missing_usdc)},"
@@ -10309,7 +10320,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
         except Exception:
             held_weth_balance = Decimal("0")
         native_eth_balance = exec_client.get_native_balance()
-        reserve_eth = Decimal("0.00001")
+        reserve_eth = _native_gas_reserve_eth(eth_price)
         spendable_eth = native_eth_balance - reserve_eth
         spendable_eth = spendable_eth if spendable_eth > 0 else Decimal("0")
 
@@ -11032,7 +11043,7 @@ def run_volume_farm_once(
                 )
 
                 full_balance_usdc = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                reserve_eth = Decimal("0.00001")
+                reserve_eth = _native_gas_reserve_eth(eth_price)
                 full_balance_eth = exec_client.get_native_balance() - reserve_eth
                 full_balance_eth = full_balance_eth if full_balance_eth > 0 else Decimal("0")
 
