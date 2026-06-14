@@ -492,7 +492,7 @@ def _print_mode_summary(
     parts.append(f"обработано: {processed}")
     print("\n" + " | ".join(parts))
     if failed_wallets:
-        print(_color(f"[{mode}] wallets with errors: {', '.join(failed_wallets)}", ANSI_RED))
+        print(_color(f"[{mode}] кошельки с ошибками: {'; '.join(failed_wallets)}", ANSI_RED))
 
 
 def ensure_csv(path: Path, header: List[str], delimiter: str = ",") -> None:
@@ -8827,13 +8827,13 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
 
     success_wallets = failed_wallets = skipped_wallets = 0
     total_success_swaps = total_failed_swaps = 0
-    failed_wallet_addresses: List[str] = []
+    failed_wallet_details: List[str] = []
     skipped_wallet_details: List[str] = []
 
-    def _mark_com_daily_skipped(wallet_label: str, reason: str) -> None:
+    def _mark_com_daily_skipped(wallet_number: int, reason: str) -> None:
         nonlocal skipped_wallets
         skipped_wallets += 1
-        skipped_wallet_details.append(_redact_wallet_addresses(f"{wallet_label}: {reason}"))
+        skipped_wallet_details.append(_redact_wallet_addresses(f"wallet#{wallet_number}: {reason}"))
 
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "COM_DAILY")
@@ -8841,10 +8841,11 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
         wallet_log_prefix = f"[COM_DAILY wallet {wallet_number}/{total_loaded_wallets}]"
         logger.info("%s wallet=%s", wallet_log_prefix, wallet)
         if skip_wallet:
-            _mark_com_daily_skipped(wallet, "proxy skipped/unavailable")
+            _mark_com_daily_skipped(wallet_number, "proxy skipped/unavailable")
             continue
 
         wallet_success = wallet_failed = 0
+        wallet_failure_reasons: List[str] = []
         try:
             doma_api = DomaApiClient(
                 cfg.doma_api_url,
@@ -8869,7 +8870,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 logger.warning("%s wallet=%s quest status fetch failed, using local CSV checker: %s", wallet_log_prefix, wallet, exc)
             if quest_completed is True:
                 reason = "daily .com quest already completed by Doma API"
-                _mark_com_daily_skipped(wallet, reason)
+                _mark_com_daily_skipped(wallet_number, reason)
                 logger.info("%s wallet=%s %s | skipping", wallet_log_prefix, wallet, reason)
                 continue
 
@@ -8881,7 +8882,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 missing_domains = 1 if quest_completed is False else 0
             if missing_domains <= 0:
                 reason = f"local checker shows complete | done={len(already_domains)}/{target_domains}"
-                _mark_com_daily_skipped(wallet, reason)
+                _mark_com_daily_skipped(wallet_number, reason)
                 logger.info(
                     "%s wallet=%s local checker shows complete | done=%s/%s | skipping",
                     wallet_log_prefix,
@@ -8904,7 +8905,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 ][: missing_domains - len(selected_tokens)]
             if not selected_tokens:
                 reason = f"no .com tokens left to complete quest | local_done={len(already_domains)} target={target_domains}"
-                _mark_com_daily_skipped(wallet, reason)
+                _mark_com_daily_skipped(wallet_number, reason)
                 logger.warning(
                     "%s wallet=%s no .com tokens left to complete quest | local_done=%s target=%s",
                     wallet_log_prefix,
@@ -9029,7 +9030,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             _, current_usdc, topup_reason = _topup_usdc_to(required_usdc, "initial")
             if current_usdc < swap_min_usdc:
                 reason = f"insufficient USDC.E after bootstrap ({_format_decimal_plain(current_usdc)}), reason={topup_reason}"
-                _mark_com_daily_skipped(wallet, reason)
+                _mark_com_daily_skipped(wallet_number, reason)
                 logger.warning(
                     "%s wallet=%s skipped | insufficient USDC.E after bootstrap (%s), reason=%s",
                     wallet_log_prefix,
@@ -9066,6 +9067,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                             reason = f"USDC.E balance below minimum swap amount after rounding ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_min_usdc)})"
                             logger.warning("%s wallet=%s domain=%s skipped | %s", wallet_log_prefix, wallet, info.name, reason)
                             wallet_failed += 1
+                            wallet_failure_reasons.append(f"{info.name}: {reason}")
                             total_failed_swaps += 1
                             append_csv(
                                 swap_csv,
@@ -9088,6 +9090,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         reason = f"USDC.E balance below minimum swap amount ({_format_decimal_plain(current_usdc)} < {_format_decimal_plain(swap_min_usdc)}), topup_reason={topup_reason}"
                         logger.warning("%s wallet=%s domain=%s skipped | %s", wallet_log_prefix, wallet, info.name, reason)
                         wallet_failed += 1
+                        wallet_failure_reasons.append(f"{info.name}: {reason}")
                         total_failed_swaps += 1
                         append_csv(
                             swap_csv,
@@ -9195,6 +9198,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         )
                 else:
                     wallet_failed += 1
+                    wallet_failure_reasons.append(f"{info.name}: {reason or 'forward swap failed'}")
                     total_failed_swaps += 1
                     logger.warning("%s wallet=%s domain=%s round trip failed | %s", wallet_log_prefix, wallet, info.name, reason)
                 append_csv(
@@ -9219,15 +9223,19 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     time.sleep(delay_sec)
             if wallet_success >= required_new_domains and wallet_failed == 0:
                 success_wallets += 1
-            elif wallet_success > 0:
-                failed_wallets += 1
-                failed_wallet_addresses.append(wallet)
             else:
                 failed_wallets += 1
-                failed_wallet_addresses.append(wallet)
+                detail = "; ".join(wallet_failure_reasons)
+                if not detail:
+                    detail = f"выполнено свапов {wallet_success}/{required_new_domains}"
+                failed_wallet_details.append(
+                    _redact_wallet_addresses(f"wallet#{wallet_number}: {detail}")
+                )
         except Exception as exc:
             failed_wallets += 1
-            failed_wallet_addresses.append(wallet)
+            failed_wallet_details.append(
+                _redact_wallet_addresses(f"wallet#{wallet_number}: {exc}")
+            )
             logger.warning("%s wallet=%s failed: %s", wallet_log_prefix, wallet, exc)
         if idx < len(wallet_key_records):
             delay_sec = random.uniform(float(delay_min), float(delay_max))
@@ -9241,10 +9249,10 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
         success=success_wallets,
         failed=failed_wallets,
         skipped=skipped_wallets,
-        failed_wallets=failed_wallet_addresses,
+        failed_wallets=failed_wallet_details,
     )
     if skipped_wallet_details:
-        print(_color(f"[COM_DAILY] wallets skipped: {'; '.join(skipped_wallet_details)}", ANSI_YELLOW))
+        print(_color(f"[COM_DAILY] пропущенные кошельки: {'; '.join(skipped_wallet_details)}", ANSI_YELLOW))
 
 
 def run_domain_bridge_to_base_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
