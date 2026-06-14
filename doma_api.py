@@ -892,7 +892,7 @@ class DomaApiClient:
             return []
         return [
             item for item in ((data.get("leaderboardActivities") or {}).get("items") or [])
-            if str(item.get("allocationType") or "").upper() == "QUEST"
+            if str(item.get("allocationType") or "").upper() in {"QUEST", "CHECK_IN"}
         ]
 
     def _quest_activity_matches_current_period(self, quest: QuestStatus, allocated_at: datetime) -> bool:
@@ -939,21 +939,38 @@ class DomaApiClient:
             quest.completed_at = allocated_at_raw
 
     def _append_daily_rollcall_quest(self, caip_wallet: str, quests: List[QuestStatus]) -> None:
-        if any("daily rollcall" in self._normalize_quest_text(q.description) for q in quests):
-            return
+        existing = next(
+            (
+                quest
+                for quest in quests
+                if "daily rollcall" in self._normalize_quest_text(quest.description)
+            ),
+            None,
+        )
         completed = False
         completed_at = ""
         points = Decimal("100")
         for item in self._fetch_leaderboard_quest_activities(caip_wallet):
+            allocation_type = str(item.get("allocationType") or "").upper()
+            allocated_at_raw = str(item.get("allocatedAt") or "")
+            allocated_at = self._parse_api_datetime(allocated_at_raw)
+            if not allocated_at or allocated_at.date() != datetime.now(timezone.utc).date():
+                continue
+            if allocation_type == "CHECK_IN":
+                completed = True
+                completed_at = allocated_at_raw
+                try:
+                    points = Decimal(str(item.get("points") or points))
+                except Exception:
+                    pass
+                break
+            if allocation_type != "QUEST":
+                continue
             data = item.get("activityData") or {}
             if str(data.get("__typename") or "") != "QuestActivityData":
                 continue
             desc = self._normalize_quest_text(str(data.get("questDescription") or ""))
             if "daily rollcall" not in desc:
-                continue
-            allocated_at_raw = str(item.get("allocatedAt") or "")
-            allocated_at = self._parse_api_datetime(allocated_at_raw)
-            if not allocated_at or allocated_at.date() != datetime.now(timezone.utc).date():
                 continue
             completed = True
             completed_at = allocated_at_raw
@@ -962,6 +979,12 @@ class DomaApiClient:
             except Exception:
                 pass
             break
+        if existing is not None:
+            if completed:
+                existing.completed = True
+                existing.completed_at = completed_at
+            existing.points_to_award = points
+            return
         quests.append(
             QuestStatus(
                 wallet_address=caip_wallet,
