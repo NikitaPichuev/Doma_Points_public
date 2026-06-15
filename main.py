@@ -176,6 +176,7 @@ DOMAIN_LIQUIDITY_SWAP_BUFFER = Decimal("1.03")
 DOMAIN_LIQUIDITY_MIN_BALANCE_RATIO = Decimal("0.97")
 NATIVE_GAS_RESERVE_USD = Decimal("0.03")
 NATIVE_GAS_RESERVE_FALLBACK_ETH = Decimal("0.00002")
+SWEEP_MIN_TOKEN_VALUE_USD = Decimal("0.01")
 DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
 DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
 DOMAIN_PURCHASE_CLAIM_WAIT_TIMEOUT_SEC = 45 * 60
@@ -10349,12 +10350,38 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     _format_decimal_plain(balance_dec),
                 )
                 continue
+            token_value_usd = balance_dec * info.price_usd if info.price_usd > 0 else Decimal("0")
+            if info.price_usd <= 0:
+                logger.info(
+                    "[SWEEP] wallet=%s token=%s skipped | token price unavailable",
+                    wallet,
+                    token_symbol,
+                )
+                continue
+            if token_value_usd < SWEEP_MIN_TOKEN_VALUE_USD:
+                logger.info(
+                    "[SWEEP] wallet=%s token=%s dust skipped | value=$%s < $%s",
+                    wallet,
+                    token_symbol,
+                    _format_decimal_plain(token_value_usd),
+                    _format_decimal_plain(SWEEP_MIN_TOKEN_VALUE_USD),
+                )
+                continue
             held_launchpad_tokens.append((info, balance_dec))
 
         held_weth_balance = Decimal("0")
         try:
             held_weth_balance = exec_client.get_erc20_balance(weth_token.address, weth_token.decimals)
         except Exception:
+            held_weth_balance = Decimal("0")
+        held_weth_value_usd = held_weth_balance * eth_price
+        if held_weth_balance > 0 and held_weth_value_usd < SWEEP_MIN_TOKEN_VALUE_USD:
+            logger.info(
+                "[SWEEP] wallet=%s token=WETH dust skipped | value=$%s < $%s",
+                wallet,
+                _format_decimal_plain(held_weth_value_usd),
+                _format_decimal_plain(SWEEP_MIN_TOKEN_VALUE_USD),
+            )
             held_weth_balance = Decimal("0")
         native_eth_balance = exec_client.get_native_balance()
         reserve_eth = _native_gas_reserve_eth(eth_price)
