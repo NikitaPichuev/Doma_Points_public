@@ -96,6 +96,9 @@ class BotConfig:
     exchange_deposit_addresses_file: Path = Path(os.getenv("EXCHANGE_DEPOSIT_ADDRESSES_FILE", "exchange_deposit_addresses.txt"))
     privy_access_tokens_file: Path = Path(os.getenv("PRIVY_ACCESS_TOKENS_FILE", "privy_access_tokens.txt"))
     privy_refresh_tokens_file: Path = Path(os.getenv("PRIVY_REFRESH_TOKENS_FILE", "privy_refresh_tokens.txt"))
+    sweep_token_exclusions_file: Path = Path(
+        os.getenv("SWEEP_TOKEN_EXCLUSIONS_FILE", "sweep_token_exclusions.txt")
+    )
     twocaptcha_api_key: str = os.getenv("TWOCAPTCHA_API_KEY", os.getenv("CAPTCHA_API_KEY", ""))
     captchasonic_api_key: str = os.getenv("CAPTCHASONIC_API_KEY", "")
     captcha_provider: str = os.getenv("CAPTCHA_PROVIDER", "2captcha")

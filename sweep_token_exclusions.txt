@@ -1,0 +1,3 @@
+# Point 6 token exclusions. One domain name, symbol, or contract address per line.
+# Matching is case-insensitive. Lines starting with # are ignored.
+gasfee.ai

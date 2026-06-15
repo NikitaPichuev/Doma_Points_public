@@ -181,6 +181,31 @@ DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
 DOMAIN_PURCHASE_CLAIM_WAIT_TIMEOUT_SEC = 45 * 60
 DOMAIN_PURCHASE_CLAIM_WAIT_INTERVAL_SEC = 30
 WEEKLY_VOLUME_TOPUP_BUFFER_USD = Decimal("1")
+
+
+def _load_sweep_token_exclusions(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    exclusions: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        value = raw_line.split("#", 1)[0].strip().lower()
+        if value:
+            exclusions.add(value)
+    return exclusions
+
+
+def _is_sweep_token_excluded(info: LaunchpadTokenInfo, exclusions: set[str]) -> bool:
+    if not exclusions:
+        return False
+    identifiers = {
+        str(info.name or "").strip().lower(),
+        str(info.symbol or "").strip().lower(),
+        str(info.address or "").strip().lower(),
+    }
+    identifiers.discard("")
+    return bool(identifiers & exclusions)
+
+
 KNOWN_ETH_USDCE_POOL_ADDRESSES = [
     "0xd604c96e51DF995bb46FAb0E3FC1b18d985AA8f5",
     "0xe8E9ca039B1a9467eD32E8B2337f657c8c794754",
@@ -10196,6 +10221,7 @@ def get_sweep_menu_input(state: BotState) -> Optional[Tuple[str, str]]:
     print("1) Collect to USDC.E")
     print("2) Collect to ETH")
     print("3) Back")
+    print("Token exceptions: sweep_token_exclusions.txt (one name, symbol, or address per line)")
     target_raw = input("Select [1-3]: ").strip()
     if target_raw == "3":
         return None
@@ -10229,6 +10255,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
         return
     target_asset, eth_percent_raw = picked
     eth_percent = _parse_decimal_input(eth_percent_raw)
+    sweep_exclusions = _load_sweep_token_exclusions(cfg.sweep_token_exclusions_file)
 
     wallet_key_records = _build_wallet_key_records(cfg, logger, "SWEEP")
     if not wallet_key_records:
@@ -10239,10 +10266,11 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
     wallet_key_records, wallet_start_offset, total_loaded_wallets = _apply_wallet_start_selection(wallet_key_records)
 
     logger.info(
-        "[SWEEP] mode started | target=%s | wallets=%s | start_wallet=%s%s",
+        "[SWEEP] mode started | target=%s | wallets=%s | start_wallet=%s | exclusions=%s%s",
         target_asset,
         len(wallet_key_records),
         wallet_start_offset + 1,
+        len(sweep_exclusions),
         f" | native_eth_to_usdc={_format_decimal_plain(eth_percent)}%" if target_asset == "USDC.E" else "",
     )
 
@@ -10303,7 +10331,8 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
             token_symbol = canonical_symbol(info.symbol or info.name)
             if token_symbol in {"ETH", "USDC", "USDC.E"}:
                 continue
-            if not info.address or info.address in seen_token_addresses:
+            token_address = (info.address or "").lower()
+            if not token_address or token_address in seen_token_addresses:
                 continue
             try:
                 balance_dec = exec_client.get_erc20_balance(info.address, info.decimals)
@@ -10311,7 +10340,15 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                 continue
             if balance_dec <= 0:
                 continue
-            seen_token_addresses.add(info.address)
+            seen_token_addresses.add(token_address)
+            if _is_sweep_token_excluded(info, sweep_exclusions):
+                logger.info(
+                    "[SWEEP] wallet=%s token=%s excluded | balance=%s",
+                    wallet,
+                    token_symbol,
+                    _format_decimal_plain(balance_dec),
+                )
+                continue
             held_launchpad_tokens.append((info, balance_dec))
 
         held_weth_balance = Decimal("0")
