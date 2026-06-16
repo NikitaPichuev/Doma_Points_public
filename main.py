@@ -67,6 +67,13 @@ class BotState:
 
 
 WALLET_LOG_NAMES: Dict[str, str] = {}
+ANSI_RESET = "\033[0m"
+ANSI_DIM = "\033[90m"
+ANSI_GREEN = "\033[92m"
+ANSI_RED = "\033[91m"
+ANSI_YELLOW = "\033[93m"
+ANSI_CYAN = "\033[96m"
+ANSI_WHITE = "\033[97m"
 
 
 def _redact_wallet_addresses(text: str) -> str:
@@ -85,6 +92,36 @@ class WalletAddressRedactionFilter(logging.Filter):
         return True
 
 
+class ColoredConsoleFormatter(logging.Formatter):
+    LEVEL_COLORS = {
+        logging.DEBUG: ANSI_DIM,
+        logging.INFO: ANSI_WHITE,
+        logging.WARNING: ANSI_YELLOW,
+        logging.ERROR: ANSI_RED,
+        logging.CRITICAL: ANSI_RED,
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        line = super().format(record)
+        color = self.LEVEL_COLORS.get(record.levelno, ANSI_WHITE)
+        return f"{color}{line}{ANSI_RESET}"
+
+
+def _enable_windows_ansi_colors() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
 def install_wallet_log_names(logger: logging.Logger, wallets: List[str]) -> None:
     WALLET_LOG_NAMES.clear()
     for idx, wallet in enumerate(wallets, start=1):
@@ -97,25 +134,22 @@ def install_wallet_log_names(logger: logging.Logger, wallets: List[str]) -> None
 
 
 def setup_logger(log_path: Path) -> logging.Logger:
+    _enable_windows_ansi_colors()
     logger = logging.getLogger("doma_swap_bot")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    console_fmt = ColoredConsoleFormatter("%(asctime)s | %(levelname)s | %(message)s")
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
+    sh.setFormatter(console_fmt)
     logger.addHandler(sh)
     return logger
 
 
-ANSI_RESET = "\033[0m"
-ANSI_GREEN = "\033[92m"
-ANSI_RED = "\033[91m"
-ANSI_YELLOW = "\033[93m"
-ANSI_CYAN = "\033[96m"
 MIN_EXECUTABLE_TRADE_USD = Decimal("0.10")
 DOMAIN_QUEST_COMPLETION_THRESHOLD_USD = Decimal("25")
 DOMAIN_QUEST_TOKENS = [
