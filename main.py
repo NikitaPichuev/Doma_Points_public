@@ -184,6 +184,9 @@ CHEAP_BUY_TOKEN_BLOCKLIST = {
     "ilovepunch.xyz",
     "onlineadvisor.ai",
     "overweights.xyz",
+    "stackfour.com",
+    "superbowl.world",
+    "tradetheinternet.com",
     "trenches.ai",
     "yearofthefirehorse.com",
 }
