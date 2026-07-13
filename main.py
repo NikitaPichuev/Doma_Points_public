@@ -151,6 +151,7 @@ def setup_logger(log_path: Path) -> logging.Logger:
 
 
 MIN_EXECUTABLE_TRADE_USD = Decimal("0.10")
+DOMA_QUOTE_RETRY_DELAYS_SEC = (0.0, 2.0, 5.0, 10.0)
 DOMAIN_QUEST_COMPLETION_THRESHOLD_USD = Decimal("25")
 DOMAIN_QUEST_TOKENS = [
     "agenticconsultant.ai",
@@ -179,6 +180,7 @@ DOMAIN_QUEST_TOKENS = [
 CHEAP_BUY_TOKEN_BLOCKLIST = {
     "barbeque.io",
     "discordwallets.com",
+    "digitalcreate.art",
     "escalations.com",
     "foundations.xyz",
     "ilovepunch.xyz",
@@ -745,6 +747,49 @@ def _proxy_for_line(
     return None, False
 
 
+def _doma_api_client_for_proxies(cfg: BotConfig, proxies: Optional[Dict[str, str]] = None) -> DomaApiClient:
+    return DomaApiClient(
+        cfg.doma_api_url,
+        api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+        proxies=proxies,
+    )
+
+
+def _fetch_fractional_tokens_with_wallet_proxy_fallback(
+    cfg: BotConfig,
+    logger: logging.Logger,
+    wallet_records: List[Tuple[int, str, str]],
+    mode_tag: str,
+    take: int = 100,
+    max_pages: int = 10,
+) -> Tuple[DomaApiClient, List[LaunchpadTokenInfo], Optional[Dict[str, str]]]:
+    last_error: Optional[Exception] = None
+    tried_proxy_keys: set[str] = set()
+    for line_idx, _, _ in wallet_records:
+        candidate_proxies, skip_proxy = _proxy_for_line(cfg, line_idx, None, f"{mode_tag}_METADATA")
+        if skip_proxy:
+            continue
+        proxy_key = json.dumps(candidate_proxies or {}, sort_keys=True)
+        if proxy_key in tried_proxy_keys:
+            continue
+        tried_proxy_keys.add(proxy_key)
+        api = _doma_api_client_for_proxies(cfg, candidate_proxies)
+        try:
+            return api, api.fetch_fractional_tokens(take=take, max_pages=max_pages), candidate_proxies
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "[%s] metadata catalog fetch failed via wallet#%s proxy, trying next | %s",
+                mode_tag,
+                line_idx + 1,
+                exc,
+            )
+    if last_error is not None:
+        raise last_error
+    api = _doma_api_client_for_proxies(cfg, None)
+    return api, api.fetch_fractional_tokens(take=take, max_pages=max_pages), None
+
+
 def _is_valid_evm_address(addr: str) -> bool:
     return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", (addr or "").strip()))
 
@@ -1225,9 +1270,10 @@ def _execute_trade_via_doma_ui_route(
     quote_token_in_address = DOMA_NATIVE_TOKEN_SENTINEL if is_eth_source else token_in.address
     quote_token_out_address = DOMA_NATIVE_TOKEN_SENTINEL if unwrap_to_native else token_out.address
 
-    try:
-        slippage_pct = Decimal("2.5")
-        quote = doma_api.fetch_universal_router_quote(
+    slippage_pct = Decimal("2.5")
+
+    def _fetch_doma_ui_quote() -> Any:
+        return doma_api.fetch_universal_router_quote(
             token_in_address=quote_token_in_address,
             token_out_address=quote_token_out_address,
             amount_raw=amount_in_raw,
@@ -1237,8 +1283,41 @@ def _execute_trade_via_doma_ui_route(
             portion_bips=DOMA_INTERFACE_PORTION_BIPS,
             portion_recipient=DOMA_INTERFACE_PORTION_RECIPIENT,
         )
-    except Exception as exc:
-        logger.warning("[%s] Doma UI quote failed: %s", label, exc)
+
+    def _fetch_doma_ui_quote_with_retries(context: str = "") -> Optional[Any]:
+        last_exc: Optional[Exception] = None
+        suffix = f" {context}" if context else ""
+        for attempt, delay_sec in enumerate(DOMA_QUOTE_RETRY_DELAYS_SEC, start=1):
+            if delay_sec > 0:
+                time.sleep(delay_sec)
+            try:
+                return _fetch_doma_ui_quote()
+            except Exception as exc:
+                last_exc = exc
+                if attempt < len(DOMA_QUOTE_RETRY_DELAYS_SEC):
+                    logger.warning(
+                        "[%s] Doma UI quote failed%s | attempt=%s/%s | retry_in=%.2f sec | %s",
+                        label,
+                        suffix,
+                        attempt,
+                        len(DOMA_QUOTE_RETRY_DELAYS_SEC),
+                        DOMA_QUOTE_RETRY_DELAYS_SEC[attempt],
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "[%s] Doma UI quote failed%s after %s attempts: %s",
+                        label,
+                        suffix,
+                        attempt,
+                        exc,
+                    )
+        if last_exc:
+            state.last_error = str(last_exc)
+        return None
+
+    quote = _fetch_doma_ui_quote_with_retries()
+    if quote is None:
         return False
 
     token_out_usd = pick_token_usd_price(token_out, eth_price)
@@ -1306,10 +1385,13 @@ def _execute_trade_via_doma_ui_route(
         )
     except Exception as exc:
         message = str(exc)
-        if "STF" in message or "AllowanceExpired" in message or "d81b2f2e" in message:
+        if "STF" in message or "AllowanceExpired" in message or "d81b2f2e" in message or "675cae38" in message:
             retry_delay = _random_swap_delay_sec()
-            logger.warning("[%s] Swap reverted with transferable allowance error, retrying after %.2f sec", label, retry_delay)
+            logger.warning("[%s] Swap reverted, refreshing quote and retrying after %.2f sec: %s", label, retry_delay, message)
             time.sleep(retry_delay)
+            retry_quote = _fetch_doma_ui_quote_with_retries("execution retry")
+            if retry_quote is None:
+                return False
             if not is_eth_source:
                 exec_client.ensure_allowance(
                     token_in.address,
@@ -1317,12 +1399,13 @@ def _execute_trade_via_doma_ui_route(
                     spender_address=exec_client.permit2_address,
                     approve_max=True,
                 )
-                exec_client.ensure_permit2_allowance(token_in.address, quote.to, amount_in_raw)
+                exec_client.ensure_permit2_allowance(token_in.address, retry_quote.to, amount_in_raw)
             tx_hash = exec_client.execute_prebuilt_transaction(
-                to_address=quote.to,
-                calldata=quote.calldata,
-                value_raw=quote.value_raw,
+                to_address=retry_quote.to,
+                calldata=retry_quote.calldata,
+                value_raw=retry_quote.value_raw,
             )
+            quote = retry_quote
         else:
             logger.warning("[%s] Doma UI route execution failed: %s", label, exc)
             if is_eth_source:
@@ -3643,18 +3726,28 @@ def _usdce_token_from_config(cfg: BotConfig) -> Token:
     )
 
 def _fetch_eth_price_via_doma_quote(cfg: BotConfig, doma_api: DomaApiClient, quote_token: Token) -> Decimal:
-    quote = doma_api.fetch_universal_router_quote(
-        token_in_address=DOMA_NATIVE_TOKEN_SENTINEL,
-        token_out_address=quote_token.address,
-        amount_raw=decimal_to_raw(Decimal("1"), 18),
-        chain_id=cfg.chain_id,
-        trade_type="exactIn",
-        portion_bips=0,
-        portion_recipient="",
-    )
-    if quote.quote_decimals <= 0:
-        raise RuntimeError("Doma ETH/USD quote returned zero output")
-    return quote.quote_decimals
+    last_exc: Optional[Exception] = None
+    for delay_sec in DOMA_QUOTE_RETRY_DELAYS_SEC:
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+        try:
+            quote = doma_api.fetch_universal_router_quote(
+                token_in_address=DOMA_NATIVE_TOKEN_SENTINEL,
+                token_out_address=quote_token.address,
+                amount_raw=decimal_to_raw(Decimal("1"), 18),
+                chain_id=cfg.chain_id,
+                trade_type="exactIn",
+                portion_bips=0,
+                portion_recipient="",
+            )
+            if quote.quote_decimals <= 0:
+                raise RuntimeError("Doma ETH/USD quote returned zero output")
+            return quote.quote_decimals
+        except Exception as exc:
+            last_exc = exc
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Doma ETH/USD quote failed")
 
 
 def _fallback_eth_usdce_pool_for_ui_route(cfg: BotConfig, doma_api: DomaApiClient) -> Tuple[Pool, Decimal]:
@@ -7879,12 +7972,39 @@ def _supports_20_40_subdomain_claim(exec_client: EvmExecutionClient, token_addre
     for length in lengths[:5]:
         label = _random_subdomain_label(length)
         if exec_client.is_subdomain_claim_available(token_address, label):
-            return True
+                return True
+    return False
+
+
+def _supports_subdomain_staking_api(
+    doma_api: DomaApiClient,
+    exec_client: EvmExecutionClient,
+    token_address: str,
+    owner_address: str,
+    chain_id: int,
+) -> bool:
+    prices_raw = exec_client.get_subdomain_staking_prices(token_address)
+    if not prices_raw:
+        return False
+    lengths = list(range(20, 41))
+    random.shuffle(lengths)
+    for length in lengths[:5]:
+        label = _random_subdomain_label(length)
+        if not exec_client.is_subdomain_claim_available(token_address, label):
+            continue
+        doma_api.sign_fractional_staking_subdomain_voucher(
+            fractional_token_address=token_address,
+            label=label,
+            owner_address=owner_address,
+            chain_id=chain_id,
+        )
+        return True
     return False
 
 
 def _select_cheap_tokens_with_subdomains(
     logger: logging.Logger,
+    doma_api: DomaApiClient,
     exec_client: EvmExecutionClient,
     wallet: str,
     catalog: List[LaunchpadTokenInfo],
@@ -7892,12 +8012,14 @@ def _select_cheap_tokens_with_subdomains(
     max_price_usd: Decimal,
     existing_token_addresses: set[str],
     count: int,
+    chain_id: int,
 ) -> List[LaunchpadTokenInfo]:
     if count <= 0:
         return []
     selected: List[LaunchpadTokenInfo] = []
     checked = 0
     skipped_no_subdomain = 0
+    skipped_api_inactive = 0
     skipped_blocklisted = 0
     for info in _eligible_cheap_tokens(catalog, quote_token, max_price_usd):
         address = (info.address or "").strip().lower()
@@ -7918,15 +8040,35 @@ def _select_cheap_tokens_with_subdomains(
         except Exception:
             skipped_no_subdomain += 1
             continue
+        try:
+            if not _supports_subdomain_staking_api(
+                doma_api=doma_api,
+                exec_client=exec_client,
+                token_address=info.address,
+                owner_address=wallet,
+                chain_id=chain_id,
+            ):
+                skipped_api_inactive += 1
+                continue
+        except Exception as exc:
+            skipped_api_inactive += 1
+            logger.info(
+                "[CHEAP_BUY] wallet=%s token=%s skipped before buy | staking API preflight failed: %s",
+                wallet,
+                info.symbol or info.name,
+                exc,
+            )
+            continue
         selected.append(info)
         if len(selected) >= count:
             break
     logger.info(
-        "[CHEAP_BUY] wallet=%s subdomain-capable token filter | selected=%s | checked=%s | skipped_no_subdomain=%s | skipped_blocklisted=%s",
+        "[CHEAP_BUY] wallet=%s subdomain-capable token filter | selected=%s | checked=%s | skipped_no_subdomain=%s | skipped_api_inactive=%s | skipped_blocklisted=%s",
         wallet,
         len(selected),
         checked,
         skipped_no_subdomain,
+        skipped_api_inactive,
         skipped_blocklisted,
     )
     return selected
@@ -8293,6 +8435,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             tokens_to_buy = max(0, tokens_per_wallet - existing_subdomains_claimed)
             selected_tokens = _select_cheap_tokens_with_subdomains(
                 logger,
+                doma_api,
                 exec_client,
                 wallet,
                 catalog,
@@ -8300,6 +8443,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 max_price_usd,
                 existing_token_addresses,
                 tokens_to_buy,
+                cfg.chain_id,
             )
             if tokens_to_buy <= 0:
                 success_wallets += 1
@@ -8852,18 +8996,14 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     quote_token = _usdce_token_from_config(cfg)
     weth_token = _token_from_config_override(cfg, "WETH", 18)
 
-    metadata_proxies: Optional[Dict[str, str]] = None
-    for metadata_line_idx, _, _ in wallet_key_records:
-        candidate_proxies, skip_metadata_proxy = _proxy_for_line(cfg, metadata_line_idx, None, "COM_DAILY_METADATA")
-        if not skip_metadata_proxy:
-            metadata_proxies = candidate_proxies
-            break
-    shared_doma_api = DomaApiClient(
-        cfg.doma_api_url,
-        api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
-        proxies=metadata_proxies,
+    shared_doma_api, catalog, metadata_proxies = _fetch_fractional_tokens_with_wallet_proxy_fallback(
+        cfg,
+        logger,
+        wallet_key_records,
+        "COM_DAILY",
+        take=100,
+        max_pages=10,
     )
-    catalog = shared_doma_api.fetch_fractional_tokens(take=100, max_pages=10)
     top_com_tokens = _top_tvl_com_tokens(catalog, quote_token, max(10, domains_max + 5))
     if len(top_com_tokens) < domains_min:
         raise RuntimeError(f"Not enough eligible .com tokens by TVL: found {len(top_com_tokens)}, need at least {domains_min}")
@@ -8970,13 +9110,13 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 token
                 for token in top_com_tokens
                 if str(token.name or token.symbol or "").strip().lower() not in already_domains
-            ][:missing_domains]
-            if len(selected_tokens) < missing_domains:
+            ]
+            if len(selected_tokens) < len(top_com_tokens):
                 selected_tokens = selected_tokens + [
                     token
                     for token in top_com_tokens
                     if token not in selected_tokens
-                ][: missing_domains - len(selected_tokens)]
+                ]
             if not selected_tokens:
                 reason = f"no .com tokens left to complete quest | local_done={len(already_domains)} target={target_domains}"
                 _mark_com_daily_skipped(wallet_number, reason)
@@ -8988,7 +9128,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     target_domains,
                 )
                 continue
-            required_new_domains = len(selected_tokens)
+            required_new_domains = min(missing_domains, len(selected_tokens))
             logger.info(
                 "%s wallet=%s checker | doma_completed=%s | local_done_today=%s/%s | will_do=%s | already=%s",
                 wallet_log_prefix,
@@ -9115,6 +9255,8 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 continue
 
             for token_idx, info in enumerate(selected_tokens, start=1):
+                if wallet_success >= required_new_domains:
+                    break
                 domain_token = _token_from_launchpad_price(info, eth_price)
                 swap_usdc = _random_decimal_between(swap_min_usdc, swap_max_usdc, swap_min_raw, swap_max_raw)
                 current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
@@ -9184,12 +9326,14 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         )
                         break
                 logger.info(
-                    "%s wallet=%s domain %s/%s %s | tvl=$%s | round_trip_swap=%s USDC.E",
+                    "%s wallet=%s domain candidate %s/%s %s | success=%s/%s | tvl=$%s | round_trip_swap=%s USDC.E",
                     wallet_log_prefix,
                     wallet,
                     token_idx,
                     len(selected_tokens),
                     info.name,
+                    wallet_success,
+                    required_new_domains,
                     _format_decimal_plain(info.tvl_usd),
                     _format_decimal_plain(swap_usdc),
                 )
@@ -9291,11 +9435,13 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     ],
                     delimiter=cfg.csv_delimiter,
                 )
+                if wallet_success >= required_new_domains:
+                    break
                 if token_idx < len(selected_tokens):
                     delay_sec = random.uniform(float(delay_min), float(delay_max))
                     logger.info("%s delay before next .com domain: %.2f sec", wallet_log_prefix, delay_sec)
                     time.sleep(delay_sec)
-            if wallet_success >= required_new_domains and wallet_failed == 0:
+            if wallet_success >= required_new_domains:
                 success_wallets += 1
             else:
                 failed_wallets += 1
