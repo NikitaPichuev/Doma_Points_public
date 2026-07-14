@@ -4241,6 +4241,7 @@ def run_domain_quest_volume_once(
         weth_token: Token,
         eth_price: Decimal,
         final_asset: str,
+        protected_rides_balance: Decimal = Decimal("0"),
     ) -> None:
         logger.info(
             _quest_log("wallet=%s failed before target reached | quest volume not finalized, running cleanup to %s"),
@@ -4249,16 +4250,19 @@ def run_domain_quest_volume_once(
         )
         try:
             rides_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
+            sellable_rides_balance = max(Decimal("0"), rides_balance - protected_rides_balance)
             rides_price_usd = pick_token_usd_price(rides_token, eth_price)
             if rides_price_usd <= 0:
                 rides_price_usd = Decimal("0")
-            rides_usd = rides_balance * rides_price_usd
-            if rides_balance > 0 and rides_usd >= MIN_EXECUTABLE_TRADE_USD:
+            rides_usd = sellable_rides_balance * rides_price_usd
+            if sellable_rides_balance > 0 and rides_usd >= MIN_EXECUTABLE_TRADE_USD:
                 logger.info(
-                    _quest_log("wallet=%s failed-run cleanup | %s->USDC.E amount=100%% of %s"),
+                    _quest_log("wallet=%s failed-run cleanup | %s->USDC.E amount=%s %s | protected_existing=%s"),
                     wallet,
                     rides_token.symbol,
+                    _format_decimal_plain(sellable_rides_balance),
                     rides_token.symbol,
+                    _format_decimal_plain(protected_rides_balance),
                 )
                 ok_sell = _execute_trade_via_doma_ui_route(
                     cfg=cfg,
@@ -4270,7 +4274,7 @@ def run_domain_quest_volume_once(
                         token_out=quote_token,
                         display_in_symbol=rides_token.symbol,
                         display_out_symbol="USDC.E",
-                        trade_amount_expr="100%",
+                        trade_amount_expr=_format_decimal_plain(sellable_rides_balance),
                         eth_price=eth_price,
                         label=f"{mode_label} {wallet} {rides_token.symbol}>USDC.E FAIL-CLEANUP",
                         wait_for_pre_tx=True,
@@ -4281,12 +4285,19 @@ def run_domain_quest_volume_once(
                     _sleep_between_swaps()
                 else:
                     logger.warning(_quest_log("wallet=%s failed-run cleanup sell did not confirm"), wallet)
-            elif rides_balance > 0:
+            elif sellable_rides_balance > 0:
                 logger.info(
                     _quest_log("wallet=%s failed-run cleanup skipped | %s dust below $0.10 (%s)"),
                     wallet,
                     rides_token.symbol,
                     _format_decimal_plain(rides_usd),
+                )
+            elif rides_balance > 0:
+                logger.info(
+                    _quest_log("wallet=%s failed-run cleanup skipped | existing %s balance protected=%s"),
+                    wallet,
+                    rides_token.symbol,
+                    _format_decimal_plain(protected_rides_balance),
                 )
 
             if final_asset == "ETH":
@@ -4377,6 +4388,14 @@ def run_domain_quest_volume_once(
                 proxies=proxies,
                 log_prefix=_quest_log(""),
             )
+            protected_rides_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
+            if protected_rides_balance > 0:
+                logger.info(
+                    _quest_log("wallet=%s existing %s balance protected from quest sells: %s"),
+                    wallet,
+                    rides_token.symbol,
+                    _format_decimal_plain(protected_rides_balance),
+                )
 
             if check_existing_volume:
                 try:
@@ -4447,19 +4466,20 @@ def run_domain_quest_volume_once(
                 )
 
                 full_balance_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-                full_balance_rides = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
                 rides_price_usd = pick_token_usd_price(rides_token, eth_price, launchpad_info.price_usd)
-                full_balance_rides_usd = full_balance_rides * rides_price_usd
                 has_usable_usdc = full_balance_usdc >= MIN_EXECUTABLE_TRADE_USD
-                has_usable_rides = full_balance_rides_usd >= MIN_EXECUTABLE_TRADE_USD
                 reserve_eth = _native_gas_reserve_eth(eth_price)
                 spendable_eth = exec_client.get_native_balance() - reserve_eth
                 spendable_eth = spendable_eth if spendable_eth > 0 else Decimal("0")
                 spendable_eth_usd = spendable_eth * eth_price
 
-                if not has_usable_usdc and not has_usable_rides:
+                if not has_usable_usdc:
                     if spendable_eth <= 0:
-                        logger.warning(_quest_log("wallet=%s no usable ETH/USDC.E/%s balance for quest cycle"), wallet, rides_token.symbol)
+                        logger.warning(
+                            _quest_log("wallet=%s no usable ETH/USDC.E for buy-first quest cycle | existing %s balance is protected"),
+                            wallet,
+                            rides_token.symbol,
+                        )
                         wallet_failed = True
                         break
                     bootstrap_eth = spendable_eth * Decimal("0.95")
@@ -4498,7 +4518,7 @@ def run_domain_quest_volume_once(
                         break
                     _sleep_between_swaps()
                     continue
-                elif not has_usable_rides and full_balance_usdc > 0 and spendable_eth_usd >= MIN_EXECUTABLE_TRADE_USD and spendable_eth_usd > full_balance_usdc:
+                elif full_balance_usdc > 0 and spendable_eth_usd >= MIN_EXECUTABLE_TRADE_USD and spendable_eth_usd > full_balance_usdc:
                     bootstrap_eth = spendable_eth * Decimal("0.95")
                     bootstrap_trade_usd = bootstrap_eth * eth_price
                     logger.info(
@@ -4533,22 +4553,14 @@ def run_domain_quest_volume_once(
                         break
                     _sleep_between_swaps()
                     continue
-                elif has_usable_usdc:
-                    full_in_symbol = "USDC.E"
-                    full_out_symbol = rides_token.symbol
-                    partial_in_symbol = rides_token.symbol
-                    partial_out_symbol = "USDC.E"
-                    full_balance = full_balance_usdc
-                    full_trade_usd = full_balance_usdc
-                    full_trade_expr = "100%"
-                else:
-                    full_in_symbol = rides_token.symbol
-                    full_out_symbol = "USDC.E"
-                    partial_in_symbol = "USDC.E"
-                    partial_out_symbol = rides_token.symbol
-                    full_balance = full_balance_rides
-                    full_trade_usd = full_balance * rides_price_usd
-                    full_trade_expr = "100%"
+
+                full_in_symbol = "USDC.E"
+                full_out_symbol = rides_token.symbol
+                partial_in_symbol = rides_token.symbol
+                partial_out_symbol = "USDC.E"
+                full_balance = full_balance_usdc
+                full_trade_usd = full_balance_usdc
+                full_trade_expr = "100%"
 
                 remaining_volume = execution_target_volume - accumulated_volume
                 if full_balance <= 0 or full_trade_usd <= 0:
@@ -4707,7 +4719,19 @@ def run_domain_quest_volume_once(
                     _, partial_trade_usd = resolve_trade_amount(partial_expr, partial_balance, Decimal("1"))
                 else:
                     partial_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
-                    _, partial_trade_usd = resolve_trade_amount(partial_expr, partial_balance, rides_price_usd)
+                    sellable_partial_balance = max(Decimal("0"), partial_balance - protected_rides_balance)
+                    if sellable_partial_balance <= 0:
+                        logger.warning(
+                            _quest_log("wallet=%s partial step skipped | no newly bought %s to sell; existing balance protected=%s"),
+                            wallet,
+                            rides_token.symbol,
+                            _format_decimal_plain(protected_rides_balance),
+                        )
+                        wallet_failed = True
+                        break
+                    partial_amount_dec, partial_trade_usd = resolve_trade_amount(partial_expr, sellable_partial_balance, rides_price_usd)
+                    partial_expr = _format_decimal_plain(partial_amount_dec)
+                    partial_balance = sellable_partial_balance
 
                 remaining_volume = execution_target_volume - accumulated_volume
                 if partial_balance <= 0 or partial_trade_usd <= 0:
@@ -4832,12 +4856,14 @@ def run_domain_quest_volume_once(
                     weth_token=weth_token,
                     eth_price=eth_price,
                     final_asset=final_asset,
+                    protected_rides_balance=protected_rides_balance,
                 )
                 _fail_wallet()
             elif accumulated_volume >= quest_target_volume:
                 final_rides_balance = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
-                if final_rides_balance > 0:
-                    final_rides_usd = final_rides_balance * rides_price_usd
+                sellable_final_rides_balance = max(Decimal("0"), final_rides_balance - protected_rides_balance)
+                if sellable_final_rides_balance > 0:
+                    final_rides_usd = sellable_final_rides_balance * rides_price_usd
                     if final_rides_usd < MIN_EXECUTABLE_TRADE_USD:
                         logger.info(
                             _quest_log("wallet=%s final settle skipped | %s dust below $0.10 (%s)"),
@@ -4847,10 +4873,12 @@ def run_domain_quest_volume_once(
                         )
                     else:
                         logger.info(
-                            _quest_log("wallet=%s final settle | %s->USDC.E amount=100%% of %s"),
+                            _quest_log("wallet=%s final settle | %s->USDC.E amount=%s %s | protected_existing=%s"),
                             wallet,
                             rides_token.symbol,
+                            _format_decimal_plain(sellable_final_rides_balance),
                             rides_token.symbol,
+                            _format_decimal_plain(protected_rides_balance),
                         )
                         final_before_usdc_balance = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                         ok_settle = _execute_trade_via_doma_ui_route(
@@ -4863,7 +4891,7 @@ def run_domain_quest_volume_once(
                             token_out=quote_token,
                             display_in_symbol=rides_token.symbol,
                             display_out_symbol="USDC.E",
-                            trade_amount_expr="100%",
+                            trade_amount_expr=_format_decimal_plain(sellable_final_rides_balance),
                             eth_price=eth_price,
                             label=f"{mode_label} {wallet} {rides_token.symbol}>USDC.E FINAL",
                             wait_for_pre_tx=True,
@@ -4904,6 +4932,7 @@ def run_domain_quest_volume_once(
                         weth_token=weth_token,
                         eth_price=eth_price,
                         final_asset=final_asset,
+                        protected_rides_balance=protected_rides_balance,
                     )
                     _fail_wallet()
                 else:
