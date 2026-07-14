@@ -172,6 +172,7 @@ DOMAIN_QUEST_TOKENS = [
     "onlineadvisor.ai",
     "playonline.ai",
     "rides.com",
+    "smoothie.com",
     "software.ai",
     "swimsuits.ai",
     "terabytes.ai",
