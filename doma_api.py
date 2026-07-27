@@ -2464,6 +2464,24 @@ class EvmExecutionClient:
             raise last_exc
         raise RuntimeError("Failed to send transaction")
 
+    def _wait_for_receipt_forgiving(self, tx_hash: str, timeout: int = 180, poll_latency: float = 2.0):
+        deadline = time.time() + float(timeout)
+        last_exc: Optional[Exception] = None
+        while time.time() < deadline:
+            try:
+                receipt = self.web3.eth.get_transaction_receipt(tx_hash)
+                if receipt is not None:
+                    return receipt
+            except Exception as exc:
+                message = str(exc).lower()
+                if "transaction not found" not in message and "not found" not in message:
+                    raise
+                last_exc = exc
+            time.sleep(float(poll_latency))
+        if last_exc:
+            raise RuntimeError(f"transaction receipt timeout after {timeout}s | tx={tx_hash}: {last_exc}") from last_exc
+        raise RuntimeError(f"transaction receipt timeout after {timeout}s | tx={tx_hash}")
+
     def _base_tx(self) -> dict:
         nonce = self.web3.eth.get_transaction_count(self.account_address, "pending")
         gas_price = self.web3.eth.gas_price
@@ -2776,7 +2794,7 @@ class EvmExecutionClient:
                 approve_max=False,
             )
             if approve_hash:
-                self.web3.eth.wait_for_transaction_receipt(approve_hash, timeout=180, poll_latency=2)
+                self._wait_for_receipt_forgiving(approve_hash, timeout=300, poll_latency=3)
         except Exception as exc:
             raise RuntimeError(f"subdomain approve failed: {exc}") from exc
 
@@ -2795,7 +2813,7 @@ class EvmExecutionClient:
             raise RuntimeError(f"subdomain stake estimate/send failed: {exc}") from exc
 
         try:
-            receipt = self.web3.eth.wait_for_transaction_receipt(stake_hash, timeout=180, poll_latency=2)
+            receipt = self._wait_for_receipt_forgiving(stake_hash, timeout=300, poll_latency=3)
         except Exception as exc:
             raise RuntimeError(f"subdomain stake receipt failed | tx={stake_hash}: {exc}") from exc
 
@@ -2829,7 +2847,7 @@ class EvmExecutionClient:
         except Exception as exc:
             raise RuntimeError(f"subdomain unstake estimate/send failed: {exc}") from exc
         try:
-            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=180, poll_latency=2)
+            receipt = self._wait_for_receipt_forgiving(tx_hash, timeout=300, poll_latency=3)
         except Exception as exc:
             raise RuntimeError(f"subdomain unstake receipt failed | tx={tx_hash}: {exc}") from exc
         if int(getattr(receipt, "status", 0)) != 1:

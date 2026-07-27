@@ -8176,6 +8176,34 @@ def _is_com_daily_quest_completed(api: DomaApiClient, wallet: str, chain_id: int
     return None
 
 
+def _is_daily_subdomain_stake_quest_completed(api: DomaApiClient, wallet: str, chain_id: int) -> Optional[bool]:
+    quests = api.fetch_quests(wallet, chain_id)
+    for quest in quests:
+        description = quest.description.lower()
+        reset_period = quest.reset_period.upper()
+        if reset_period == "DAILY" and "subdomain" in description and ("stake" in description or "staking" in description):
+            return bool(quest.completed)
+    return None
+
+
+def _wait_daily_subdomain_stake_quest_completed(
+    api: DomaApiClient,
+    wallet: str,
+    chain_id: int,
+    timeout_sec: int = 45,
+    poll_sec: int = 5,
+) -> Optional[bool]:
+    deadline = time.time() + max(0, timeout_sec)
+    last_status: Optional[bool] = None
+    while True:
+        last_status = _is_daily_subdomain_stake_quest_completed(api, wallet, chain_id)
+        if last_status is True:
+            return True
+        if time.time() >= deadline:
+            return last_status
+        time.sleep(max(1, poll_sec))
+
+
 def _top_up_usdce_from_eth_for_cheap_buy(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -8568,9 +8596,29 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                     subdomain_success_count += claimed_ok
                     subdomain_failed_count += claimed_failed
                     if claimed_ok > 0:
-                        wallet_success += 1
-                        logger.info("[CHEAP_BUY] wallet=%s daily subdomain staking quest satisfied | staked=%s", wallet, claimed_ok)
-                        break
+                        try:
+                            daily_done = _wait_daily_subdomain_stake_quest_completed(doma_api, wallet, cfg.chain_id)
+                        except Exception as exc:
+                            daily_done = None
+                            logger.warning("[CHEAP_BUY] wallet=%s daily subdomain staking quest verify failed: %s", wallet, exc)
+                        if daily_done is True:
+                            wallet_success += 1
+                            logger.info("[CHEAP_BUY] wallet=%s daily subdomain staking quest satisfied | staked=%s", wallet, claimed_ok)
+                            break
+                        if daily_done is False:
+                            wallet_failed += 1
+                            reason = f"daily subdomain quest still not completed after stake token={domain_token.symbol}"
+                            logger.warning("[CHEAP_BUY] wallet=%s %s", wallet, reason)
+                            _remember_subdomain_failed(wallet_number, wallet, reason)
+                            _remember_failed_wallet(wallet_number, wallet, reason)
+                        else:
+                            wallet_success += 1
+                            logger.info(
+                                "[CHEAP_BUY] wallet=%s subdomain stake sent but daily quest status is unknown | staked=%s",
+                                wallet,
+                                claimed_ok,
+                            )
+                            break
                     if claimed_failed > 0:
                         wallet_failed += 1
                         reason = f"subdomain creation failed={claimed_failed} token={domain_token.symbol}"
