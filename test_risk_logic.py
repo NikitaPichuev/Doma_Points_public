@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from unittest.mock import Mock, patch
 from decimal import Decimal
@@ -7,7 +8,9 @@ from decimal import Decimal
 import requests
 
 from main import (
+    _execute_launchpad_sell,
     _fetch_fractional_tokens_with_same_proxy_retry,
+    _prepare_all_usdce_for_bonding_daily,
     parse_trade_amount_expression,
     resolve_trade_amount,
 )
@@ -71,6 +74,50 @@ class RiskLogicTests(unittest.TestCase):
 
         self.assertEqual(api.fetch_fractional_tokens.call_count, 1)
         sleep.assert_not_called()
+
+    def test_launchpad_sell_accepts_configured_approve_delay(self) -> None:
+        parameters = inspect.signature(_execute_launchpad_sell).parameters
+
+        self.assertIn("post_approve_delay_range", parameters)
+        self.assertIn("failed_launch_min_out_retry", parameters)
+
+    @patch("main._wait_tx_receipt", return_value=True)
+    @patch("main._execute_trade_via_doma_ui_route")
+    def test_bonding_daily_bootstraps_eth_when_usdc_is_below_one_dollar(
+        self,
+        execute_trade: Mock,
+        wait_receipt: Mock,
+    ) -> None:
+        state = Mock(last_tx_hash="")
+
+        def mark_sent(**_kwargs: object) -> bool:
+            state.last_tx_hash = "0xbootstrap"
+            return True
+
+        execute_trade.side_effect = mark_sent
+        exec_client = Mock()
+        exec_client.get_erc20_balance.side_effect = [Decimal("0.000991"), Decimal("1.85")]
+        exec_client.get_native_balance.return_value = Decimal("0.001")
+        quote_token = Mock(address="0xusdc", decimals=6)
+        weth_token = Mock(address="0xweth", decimals=18)
+
+        ok, reason, available = _prepare_all_usdce_for_bonding_daily(
+            Mock(),
+            Mock(),
+            state,
+            Mock(),
+            exec_client,
+            quote_token,
+            weth_token,
+            "wallet#1",
+            Decimal("2000"),
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+        self.assertEqual(available, Decimal("1.85"))
+        execute_trade.assert_called_once()
+        wait_receipt.assert_called_once_with(exec_client, "0xbootstrap", timeout_sec=180)
 
 
 if __name__ == "__main__":

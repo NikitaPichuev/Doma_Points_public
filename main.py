@@ -250,6 +250,7 @@ NATIVE_GAS_RESERVE_USD = Decimal("0.03")
 NATIVE_GAS_RESERVE_FALLBACK_ETH = Decimal("0.00002")
 BONDING_DAILY_GAS_RESERVE_USD = Decimal("0.10")
 BONDING_DAILY_BOOTSTRAP_GAS_BUFFER_USD = Decimal("0.03")
+BONDING_DAILY_INITIAL_MIN_USDCE = Decimal("1")
 SWEEP_MIN_TOKEN_VALUE_USD = Decimal("0.01")
 DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
 DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
@@ -4467,129 +4468,15 @@ def _execute_bonding_sell_with_route_fallback(
     last_error = str(getattr(state, "last_error", "") or "")
     if "0xa1fa02b3" not in last_error:
         return False
-    amount_in_raw = decimal_to_raw(amount_in_dec, quote_token.decimals)
-    if amount_in_raw <= 0:
-        logger.warning("[%s] Amount too small after decimal conversion.", label)
+    if refresh_launchpad is None:
         return False
-    if cfg.paper_mode or cfg.dry_run or not cfg.enable_execution:
-        logger.info("[%s] PAPER/DRY mode active. No transaction sent.", label)
-        return True
-    expected_out_dec = Decimal("0")
-    if launchpad.price_usd > 0:
-        expected_out_dec = trade_usd / launchpad.price_usd
-    min_out_raw = max(1, decimal_to_raw(expected_out_dec * Decimal("0.7"), launchpad.decimals)) if expected_out_dec > 0 else 1
-    logger.info(
-        "[%s] %s -> %s | launchpad=%s | in=%.8f %s (~$%.2f) | out≈%.8f %s",
-        label,
-        quote_token.symbol,
-        canonical_symbol(launchpad.symbol or launchpad.name),
-        launchpad.launchpad_address,
-        float(amount_in_dec),
-        quote_token.symbol,
-        float(trade_usd),
-        float(expected_out_dec),
-        canonical_symbol(launchpad.symbol or launchpad.name),
-    )
-    approve_hash = exec_client.ensure_allowance(
-        quote_token.address,
-        amount_in_raw,
-        spender_address=launchpad.launchpad_address,
-    )
-    if approve_hash:
-        logger.info("[%s] Approve tx sent: %s", label, approve_hash)
-        if wait_for_pre_tx:
-            ok = _wait_tx_receipt(exec_client, approve_hash, timeout_sec=180)
-            if not ok:
-                raise RuntimeError("Launchpad approve tx failed or timed out")
-            delay_sec = _random_swap_delay_sec()
-            logger.info("[%s] delay after approve: %.2f sec", label, delay_sec)
-            time.sleep(delay_sec)
-    try:
-        tx_hash = exec_client.execute_launchpad_buy(
-            launchpad_address=launchpad.launchpad_address,
-            amount_in_raw=amount_in_raw,
-            min_amount_out_raw=min_out_raw,
-        )
-    except Exception as exc:
-        logger.warning("[%s] Launchpad buy failed: %s", label, exc)
+    refreshed = refresh_launchpad()
+    if refreshed is None:
         return False
-    state.daily_volume_usd += trade_usd
-    state.last_tx_hash = tx_hash
-    logger.info("[%s] Buy tx sent: %s", label, tx_hash)
-    return True
-
-
-def _execute_launchpad_sell(
-    cfg: BotConfig,
-    logger: logging.Logger,
-    state: BotState,
-    exec_client: EvmExecutionClient,
-    launchpad: LaunchpadTokenInfo,
-    quote_token: Token,
-    trade_amount_expr: str,
-    eth_price: Decimal,
-    label: str,
-    wait_for_pre_tx: bool = False,
-) -> bool:
-    launchpad_token = _token_from_launchpad(launchpad)
-    token_price_usd = launchpad.price_usd
-    try:
-        balance_dec = exec_client.get_erc20_balance(launchpad_token.address, launchpad_token.decimals)
-        amount_in_dec, trade_usd = resolve_trade_amount(trade_amount_expr, balance_dec, token_price_usd if token_price_usd > 0 else Decimal("1"))
-    except Exception as exc:
-        logger.warning("[%s] Invalid launchpad sell amount '%s': %s", label, trade_amount_expr, exc)
-        return False
-    amount_in_raw = decimal_to_raw(amount_in_dec, launchpad_token.decimals)
-    if amount_in_raw <= 0:
-        logger.warning("[%s] Amount too small after decimal conversion.", label)
-        return False
-    if cfg.paper_mode or cfg.dry_run or not cfg.enable_execution:
-        logger.info("[%s] PAPER/DRY mode active. No transaction sent.", label)
-        return True
-    quote_price_usd = pick_token_usd_price(quote_token, eth_price)
-    if quote_token.symbol == "USDC.E" and quote_price_usd <= 0:
-        quote_price_usd = Decimal("1")
-    expected_out_dec = (amount_in_dec * token_price_usd / quote_price_usd) if token_price_usd > 0 and quote_price_usd > 0 else Decimal("0")
-    min_out_raw = max(1, decimal_to_raw(expected_out_dec * Decimal("0.7"), quote_token.decimals)) if expected_out_dec > 0 else 1
-    logger.info(
-        "[%s] %s -> %s | launchpad=%s | in=%.8f %s (~$%.2f) | out≈%.8f %s",
-        label,
-        launchpad_token.symbol,
-        quote_token.symbol,
-        launchpad.launchpad_address,
-        float(amount_in_dec),
-        launchpad_token.symbol,
-        float(trade_usd),
-        float(expected_out_dec),
-        quote_token.symbol,
-    )
-    approve_hash = exec_client.ensure_allowance(
-        launchpad_token.address,
-        amount_in_raw,
-        spender_address=launchpad.launchpad_address,
-    )
-    if approve_hash:
-        logger.info("[%s] Approve tx sent: %s", label, approve_hash)
-        if wait_for_pre_tx:
-            ok = _wait_tx_receipt(exec_client, approve_hash, timeout_sec=180)
-            if not ok:
-                raise RuntimeError("Launchpad approve tx failed or timed out")
-            delay_sec = _random_swap_delay_sec()
-            logger.info("[%s] delay after approve: %.2f sec", label, delay_sec)
-            time.sleep(delay_sec)
-    try:
-        tx_hash = exec_client.execute_launchpad_sell(
-            launchpad_address=launchpad.launchpad_address,
-            amount_in_raw=amount_in_raw,
-            min_amount_out_raw=min_out_raw,
-        )
-    except Exception as exc:
-        logger.warning("[%s] Launchpad sell failed: %s", label, exc)
-        return False
-    state.daily_volume_usd += trade_usd
-    state.last_tx_hash = tx_hash
-    logger.info("[%s] Sell tx sent: %s", label, tx_hash)
-    return True
+    current = refreshed
+    if current.pool_address:
+        return _sell_via_doma_route(f"launchpad rejected sell and token now has pool={current.pool_address}")
+    return False
 
 
 def _execute_ui_route_with_fallback(
@@ -9510,7 +9397,7 @@ def _prepare_all_usdce_for_bonding_daily(
     eth_price: Decimal,
 ) -> Tuple[bool, str, Decimal]:
     current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-    if current_usdc > 0:
+    if current_usdc >= BONDING_DAILY_INITIAL_MIN_USDCE:
         logger.info(
             "[BONDING_DAILY] wallet=%s using all available USDC.E | amount=%s USDC.E | ETH not touched",
             wallet,
@@ -9534,8 +9421,10 @@ def _prepare_all_usdce_for_bonding_daily(
         )
 
     logger.info(
-        "[BONDING_DAILY] wallet=%s no USDC.E | converting spendable ETH=%s (~$%s) | protected_ETH=%s (~$%s: $%s minimum plus $%s bootstrap gas buffer)",
+        "[BONDING_DAILY] wallet=%s USDC.E below executable minimum (%s < %s) | converting spendable ETH=%s (~$%s) | protected_ETH=%s (~$%s: $%s minimum plus $%s bootstrap gas buffer)",
         wallet,
+        _format_decimal_plain(current_usdc),
+        _format_decimal_plain(BONDING_DAILY_INITIAL_MIN_USDCE),
         _format_decimal_plain(spendable_eth),
         _format_decimal_plain(spendable_eth * eth_price),
         _format_decimal_plain(reserve_eth),
@@ -9565,8 +9454,13 @@ def _prepare_all_usdce_for_bonding_daily(
         return False, "ETH->USDC.E bootstrap failed or timed out", Decimal("0")
 
     refreshed_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-    if refreshed_usdc <= 0:
-        return False, "USDC.E balance is zero after ETH bootstrap", Decimal("0")
+    if refreshed_usdc < BONDING_DAILY_INITIAL_MIN_USDCE:
+        return (
+            False,
+            "combined USDC.E and spendable ETH are below the $1 initial minimum "
+            f"(USDC.E={_format_decimal_plain(refreshed_usdc)})",
+            refreshed_usdc,
+        )
     logger.info(
         "[BONDING_DAILY] wallet=%s bootstrap complete | available=%s USDC.E | ETH gas reserve kept at about $%s",
         wallet,
@@ -10365,9 +10259,10 @@ def run_bonding_token_buy_once(
         )
     if selection == "daily_quest":
         logger.info(
-            "%s volume loop enabled | target=%s USDC.E | swap_amount=all available USDC.E | ETH bootstrap when USDC.E=0 | gas_reserve=$%s | swap_delay=%s-%s sec | return_asset=USDC.E",
+            "%s volume loop enabled | target=%s USDC.E | initial_min=%s USDC.E | swap_amount=all available USDC.E | ETH bootstrap below initial minimum | gas_reserve=$%s | swap_delay=%s-%s sec | return_asset=USDC.E",
             mode_prefix,
             _format_decimal_plain(daily_target_volume),
+            _format_decimal_plain(BONDING_DAILY_INITIAL_MIN_USDCE),
             _format_decimal_plain(BONDING_DAILY_GAS_RESERVE_USD),
             _format_decimal_plain(daily_swap_delay_min),
             _format_decimal_plain(daily_swap_delay_max),
@@ -10567,6 +10462,48 @@ def run_bonding_token_buy_once(
                     time.sleep(delay_sec)
                 continue
             if selection == "daily_quest":
+                daily_recovered_volume = Decimal("0")
+                daily_recovery_hash = ""
+                recovery_current = doma_api.fetch_fractional_token_by_name(selected_candidate.name)
+                if recovery_current is None:
+                    raise RuntimeError(f"{selected_candidate.name} launchpad token not found")
+                recovery_token = _token_from_launchpad(recovery_current)
+                recovery_balance = exec_client.get_erc20_balance(recovery_token.address, recovery_token.decimals)
+                if decimal_to_raw(recovery_balance, recovery_token.decimals) > 0:
+                    logger.warning(
+                        "%s wallet=%s found leftover %s=%s from an interrupted run | selling before new buys",
+                        mode_prefix,
+                        wallet,
+                        recovery_token.symbol,
+                        _format_decimal_plain(recovery_balance),
+                    )
+                    recovery_usdc_before = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                    recovery_ok = _execute_bonding_sell_with_route_fallback(
+                        cfg=cfg,
+                        logger=logger,
+                        state=state,
+                        doma_api=doma_api,
+                        exec_client=exec_client,
+                        launchpad=recovery_current,
+                        quote_token=quote_token,
+                        trade_amount_expr=_format_decimal_plain(recovery_balance),
+                        eth_price=eth_price,
+                        label=f"{mode_tag} {wallet} {recovery_token.symbol}>USDC.E RECOVERY",
+                        wait_for_pre_tx=True,
+                        post_approve_delay_range=(float(daily_swap_delay_min), float(daily_swap_delay_max)),
+                        refresh_launchpad=lambda: doma_api.fetch_fractional_token_by_name(selected_candidate.name),
+                    )
+                    daily_recovery_hash = state.last_tx_hash if recovery_ok else ""
+                    if not recovery_ok or not daily_recovery_hash or not _wait_tx_receipt(exec_client, daily_recovery_hash, timeout_sec=180):
+                        raise RuntimeError("daily bonding recovery sell failed or timed out; no new buy was made")
+                    recovery_usdc_after = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                    daily_recovered_volume = max(Decimal("0"), recovery_usdc_after - recovery_usdc_before)
+                    logger.info(
+                        "%s wallet=%s recovery complete | sell_volume=%s USDC.E",
+                        mode_prefix,
+                        wallet,
+                        _format_decimal_plain(daily_recovered_volume),
+                    )
                 prepared_ok, prepared_reason, amount = _prepare_all_usdce_for_bonding_daily(
                     cfg,
                     logger,
@@ -10653,9 +10590,11 @@ def run_bonding_token_buy_once(
                     continue
 
             if selection == "daily_quest":
-                accumulated_volume = Decimal("0")
+                accumulated_volume = daily_recovered_volume
                 cycle_number = 0
-                cycle_tx_hashes: List[str] = []
+                cycle_tx_hashes: List[str] = [daily_recovery_hash] if daily_recovery_hash else []
+                current = recovery_current
+                token_name = current.name.strip().lower()
 
                 while accumulated_volume < daily_target_volume:
                     cycle_number += 1
@@ -14363,10 +14302,11 @@ def run_bonding_daily_quest_once(cfg: BotConfig, logger: logging.Logger, state: 
         raise ValueError("Некорректный диапазон пауз между кошельками")
 
     print(
-        "Софт будет покупать bonding-токен на весь доступный USDC.E и продавать его обратно, "
-        f"пока фактический объем не достигнет {_format_decimal_plain(target)} USDC.E. "
-        f"Если USDC.E нет, доступный ETH будет обменян с сохранением минимум "
-        f"${_format_decimal_plain(BONDING_DAILY_GAS_RESERVE_USD)} в ETH на газ."
+        f"Софт начнет торговлю только с балансом от {_format_decimal_plain(BONDING_DAILY_INITIAL_MIN_USDCE)} USDC.E: "
+        "если USDC.E меньше, доступный ETH будет обменян с сохранением минимум "
+        f"${_format_decimal_plain(BONDING_DAILY_GAS_RESERVE_USD)} в ETH на газ. После первого свапа "
+        "уменьшившаяся из-за проскальзывания сумма продолжит участвовать в обороте, "
+        f"пока фактический объем не достигнет {_format_decimal_plain(target)} USDC.E."
     )
     run_bonding_token_buy_once(
         cfg,
