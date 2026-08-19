@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock, patch
 from decimal import Decimal
 
-from main import parse_trade_amount_expression, resolve_trade_amount
+import requests
+
+from main import (
+    _fetch_fractional_tokens_with_same_proxy_retry,
+    parse_trade_amount_expression,
+    resolve_trade_amount,
+)
 
 
 class RiskLogicTests(unittest.TestCase):
@@ -37,7 +44,34 @@ class RiskLogicTests(unittest.TestCase):
         self.assertEqual(amount, Decimal("0.3"))
         self.assertEqual(usd, Decimal("60"))
 
+    @patch("main.time.sleep")
+    def test_catalog_fetch_retries_timeout_on_same_client(self, sleep: Mock) -> None:
+        api = Mock()
+        expected = [Mock()]
+        api.fetch_fractional_tokens.side_effect = [requests.ReadTimeout("slow"), expected]
+
+        result = _fetch_fractional_tokens_with_same_proxy_retry(
+            api,
+            Mock(),
+            "BONDING_BUY",
+            retry_delay=0.01,
+        )
+
+        self.assertIs(result, expected)
+        self.assertEqual(api.fetch_fractional_tokens.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+    @patch("main.time.sleep")
+    def test_catalog_fetch_does_not_retry_permanent_error(self, sleep: Mock) -> None:
+        api = Mock()
+        api.fetch_fractional_tokens.side_effect = RuntimeError("bad response")
+
+        with self.assertRaisesRegex(RuntimeError, "bad response"):
+            _fetch_fractional_tokens_with_same_proxy_retry(api, Mock(), "BONDING_BUY")
+
+        self.assertEqual(api.fetch_fractional_tokens.call_count, 1)
+        sleep.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
-

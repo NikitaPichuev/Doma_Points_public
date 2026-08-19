@@ -831,6 +831,42 @@ def _fetch_fractional_tokens_with_wallet_proxy_fallback(
     raise RuntimeError(f"[{mode_tag}] no usable proxy for selected wallets")
 
 
+def _is_transient_catalog_fetch_error(exc: Exception) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        return response is not None and response.status_code in {408, 425, 429, 500, 502, 503, 504}
+    return False
+
+
+def _fetch_fractional_tokens_with_same_proxy_retry(
+    api: DomaApiClient,
+    logger: logging.Logger,
+    mode_tag: str,
+    take: int = 100,
+    max_pages: int = 10,
+    retry_delay: float = 2.0,
+) -> List[LaunchpadTokenInfo]:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return api.fetch_fractional_tokens(take=take, max_pages=max_pages)
+        except Exception as exc:
+            if not _is_transient_catalog_fetch_error(exc):
+                raise
+            logger.warning(
+                "[%s] metadata catalog request failed via bound proxy | attempt=%s | "
+                "retrying in %.2f sec | %s",
+                mode_tag,
+                attempt,
+                retry_delay,
+                exc,
+            )
+            time.sleep(retry_delay)
+
+
 def _is_valid_evm_address(addr: str) -> bool:
     return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", (addr or "").strip()))
 
@@ -10230,7 +10266,13 @@ def run_bonding_token_buy_once(
             raise RuntimeError(f"{specific_domain} is not sellable through launchpad")
         candidates = [selected_candidate]
     else:
-        catalog = shared_api.fetch_fractional_tokens(take=100, max_pages=10)
+        catalog = _fetch_fractional_tokens_with_same_proxy_retry(
+            shared_api,
+            logger,
+            mode_tag,
+            take=100,
+            max_pages=10,
+        )
         candidates = [info for info in catalog if _is_currently_bonding_token(info, quote_token)]
         if not candidates:
             raise RuntimeError("No active bonding tokens found (status=FRACTIONALIZED, launchpad present, pool absent)")
