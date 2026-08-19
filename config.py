@@ -99,6 +99,7 @@ class BotConfig:
     sweep_token_exclusions_file: Path = Path(
         os.getenv("SWEEP_TOKEN_EXCLUSIONS_FILE", "sweep_token_exclusions.txt")
     )
+    galxe_rpc_url: str = os.getenv("GALXE_RPC_URL", "https://ethereum-rpc.publicnode.com")
     twocaptcha_api_key: str = os.getenv("TWOCAPTCHA_API_KEY", os.getenv("CAPTCHA_API_KEY", ""))
     captchasonic_api_key: str = os.getenv("CAPTCHASONIC_API_KEY", "")
     captcha_provider: str = os.getenv("CAPTCHA_PROVIDER", "2captcha")

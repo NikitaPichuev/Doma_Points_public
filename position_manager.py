@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -13,6 +14,11 @@ MAX_TICK = 887272
 POSITION_TX_GAS_MULTIPLIER = 1.6
 POSITION_MINT_GAS_MULTIPLIER = 2.5
 POSITION_MINT_MIN_GAS = 700_000
+POSITION_DECREASE_GAS_MULTIPLIER = 2.5
+POSITION_DECREASE_MIN_GAS = 400_000
+POSITION_COLLECT_MIN_GAS = 300_000
+POSITION_BURN_MIN_GAS = 200_000
+WETH_UNWRAP_MIN_GAS = 120_000
 FEE_TICK_SPACING = {
     100: 1,
     500: 10,
@@ -39,6 +45,23 @@ ERC20_ABI = [
         ],
         "name": "approve",
         "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+WETH_ABI = [
+    {
+        "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "uint256", "name": "wad", "type": "uint256"}],
+        "name": "withdraw",
+        "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function",
     },
@@ -275,9 +298,90 @@ class PositionManagerClient:
         }
 
     def _send_tx(self, tx: dict) -> str:
-        signed = self.web3.eth.account.sign_transaction(tx, private_key=self.private_key)
-        tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
-        return tx_hash.hex()
+        for attempt in range(2):
+            signed = self.web3.eth.account.sign_transaction(tx, private_key=self.private_key)
+            try:
+                tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
+                return tx_hash.hex()
+            except Exception as exc:
+                message = str(exc).lower()
+                if attempt > 0 or "nonce too low" not in message:
+                    raise
+                refreshed_nonce = max(
+                    int(self.web3.eth.get_transaction_count(self.account_address, "pending")),
+                    int(self.web3.eth.get_transaction_count(self.account_address, "latest")),
+                )
+                match = re.search(r"next nonce\s+(\d+)", message)
+                if match:
+                    refreshed_nonce = max(refreshed_nonce, int(match.group(1)))
+                tx["nonce"] = refreshed_nonce
+        raise RuntimeError("transaction send retry exhausted")
+
+    def _set_estimated_gas(self, tx: dict, multiplier: float = POSITION_TX_GAS_MULTIPLIER, min_gas: int = 0) -> None:
+        try:
+            estimated = int(self.web3.eth.estimate_gas(tx))
+        except Exception as exc:
+            message = str(exc).lower()
+            if min_gas > 0 and ("out of gas" in message or "gas required exceeds" in message):
+                tx["gas"] = int(min_gas)
+                return
+            raise
+        tx["gas"] = max(int(estimated * multiplier), int(min_gas))
+
+    def ensure_allowance(self, token_address: str, required_amount_raw: int, approve_max: bool = True) -> Optional[str]:
+        token = self.web3.eth.contract(
+            address=Web3.to_checksum_address(token_address),
+            abi=ERC20_ABI,
+        )
+        current = int(token.functions.allowance(self.account_address, self.position_manager_address).call())
+        if current >= int(required_amount_raw):
+            return None
+        amount = MAX_UINT256 if approve_max else int(required_amount_raw)
+        tx = token.functions.approve(self.position_manager_address, amount).build_transaction(self._base_tx())
+        self._set_estimated_gas(tx)
+        if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
+            tx["gasPrice"] = int(self.web3.eth.gas_price)
+        return self._send_tx(tx)
+
+    def mint_full_range(
+        self,
+        token0: str,
+        token1: str,
+        fee_tier: int,
+        amount0_desired: int,
+        amount1_desired: int,
+        recipient: Optional[str] = None,
+        amount0_min: int = 0,
+        amount1_min: int = 0,
+        deadline_sec: int = 600,
+    ) -> str:
+        tick_lower, tick_upper = full_range_ticks(int(fee_tier))
+        params = (
+            Web3.to_checksum_address(token0),
+            Web3.to_checksum_address(token1),
+            int(fee_tier),
+            int(tick_lower),
+            int(tick_upper),
+            int(amount0_desired),
+            int(amount1_desired),
+            int(amount0_min),
+            int(amount1_min),
+            Web3.to_checksum_address(recipient or self.account_address),
+            int(time.time()) + int(deadline_sec),
+        )
+        # Supplying gas here prevents web3 from running an implicit estimate
+        # before our explicit mint gas fallback can be applied.
+        base_tx = self._base_tx()
+        base_tx["gas"] = POSITION_MINT_MIN_GAS
+        tx = self.contract.functions.mint(params).build_transaction(base_tx)
+        self._set_estimated_gas(
+            tx,
+            multiplier=POSITION_MINT_GAS_MULTIPLIER,
+            min_gas=POSITION_MINT_MIN_GAS,
+        )
+        if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
+            tx["gasPrice"] = int(self.web3.eth.gas_price)
+        return self._send_tx(tx)
 
     def _set_estimated_gas(self, tx: dict, multiplier: float = POSITION_TX_GAS_MULTIPLIER, min_gas: int = 0) -> None:
         estimated = int(self.web3.eth.estimate_gas(tx))
@@ -342,8 +446,14 @@ class PositionManagerClient:
             0,
             int(time.time()) + int(deadline_sec),
         )
-        tx = self.contract.functions.decreaseLiquidity(params).build_transaction(self._base_tx())
-        self._set_estimated_gas(tx)
+        base_tx = self._base_tx()
+        base_tx["gas"] = POSITION_DECREASE_MIN_GAS
+        tx = self.contract.functions.decreaseLiquidity(params).build_transaction(base_tx)
+        self._set_estimated_gas(
+            tx,
+            multiplier=POSITION_DECREASE_GAS_MULTIPLIER,
+            min_gas=POSITION_DECREASE_MIN_GAS,
+        )
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = int(self.web3.eth.gas_price)
         return self._send_tx(tx)
@@ -356,15 +466,42 @@ class PositionManagerClient:
             int(max_u128),
             int(max_u128),
         )
-        tx = self.contract.functions.collect(params).build_transaction(self._base_tx())
-        self._set_estimated_gas(tx)
+        base_tx = self._base_tx()
+        base_tx["gas"] = POSITION_COLLECT_MIN_GAS
+        tx = self.contract.functions.collect(params).build_transaction(base_tx)
+        self._set_estimated_gas(tx, min_gas=POSITION_COLLECT_MIN_GAS)
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = int(self.web3.eth.gas_price)
         return self._send_tx(tx)
 
     def burn(self, token_id: int) -> str:
-        tx = self.contract.functions.burn(int(token_id)).build_transaction(self._base_tx())
-        self._set_estimated_gas(tx)
+        base_tx = self._base_tx()
+        base_tx["gas"] = POSITION_BURN_MIN_GAS
+        tx = self.contract.functions.burn(int(token_id)).build_transaction(base_tx)
+        self._set_estimated_gas(tx, min_gas=POSITION_BURN_MIN_GAS)
+        if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
+            tx["gasPrice"] = int(self.web3.eth.gas_price)
+        return self._send_tx(tx)
+
+    def weth_balance_raw(self, weth_address: str) -> int:
+        weth = self.web3.eth.contract(
+            address=Web3.to_checksum_address(weth_address),
+            abi=WETH_ABI,
+        )
+        return int(weth.functions.balanceOf(self.account_address).call())
+
+    def unwrap_weth(self, weth_address: str, amount_raw: int) -> Optional[str]:
+        amount_raw = int(amount_raw)
+        if amount_raw <= 0:
+            return None
+        weth = self.web3.eth.contract(
+            address=Web3.to_checksum_address(weth_address),
+            abi=WETH_ABI,
+        )
+        base_tx = self._base_tx()
+        base_tx["gas"] = WETH_UNWRAP_MIN_GAS
+        tx = weth.functions.withdraw(amount_raw).build_transaction(base_tx)
+        self._set_estimated_gas(tx, min_gas=WETH_UNWRAP_MIN_GAS)
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = int(self.web3.eth.gas_price)
         return self._send_tx(tx)

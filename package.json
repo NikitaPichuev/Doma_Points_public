@@ -21,6 +21,7 @@
   "dependencies": {
     "@doma-protocol/orderbook-sdk": "^0.1.8",
     "ethers": "^6.16.0",
-    "https-proxy-agent": "^7.0.6"
+    "https-proxy-agent": "^7.0.6",
+    "playwright": "^1.61.0"
   }
 }

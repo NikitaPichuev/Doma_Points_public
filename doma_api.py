@@ -67,6 +67,27 @@ ERC20_ABI = [
 
 LAUNCHPAD_ABI = [
     {
+        "inputs": [],
+        "name": "quoteRaised",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "launchSupply",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "curveModel",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
         "inputs": [
             {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
             {"internalType": "uint256", "name": "minAmountOut", "type": "uint256"},
@@ -212,6 +233,28 @@ DOMA_FRACTIONALIZATION_SUBDOMAIN_ABI = [
         "name": "unstakeSubdomain",
         "outputs": [],
         "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+        ],
+        "name": "sellOnFail",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+BONDING_CURVE_ABI = [
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "fractionalAmount", "type": "uint256"},
+            {"internalType": "uint256", "name": "tokensSold", "type": "uint256"},
+        ],
+        "name": "calculateBuyExactFractional",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
         "type": "function",
     },
 ]
@@ -2693,6 +2736,98 @@ class EvmExecutionClient:
         tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
         return self._send_tx(tx)
 
+    def get_launchpad_bonding_progress(
+        self,
+        launchpad_address: str,
+    ) -> Tuple[int, int, Decimal]:
+        """Return quote raised, graduation quote target and Doma UI progress percent."""
+        launchpad = self.web3.eth.contract(
+            address=Web3.to_checksum_address(launchpad_address),
+            abi=LAUNCHPAD_ABI,
+        )
+        quote_raised = int(launchpad.functions.quoteRaised().call())
+        launch_supply = int(launchpad.functions.launchSupply().call())
+        if launch_supply <= 0:
+            raise RuntimeError("Launchpad launchSupply is zero")
+        curve_address = launchpad.functions.curveModel().call()
+        curve = self.web3.eth.contract(
+            address=Web3.to_checksum_address(curve_address),
+            abi=BONDING_CURVE_ABI,
+        )
+        graduation_quote_target = int(
+            curve.functions.calculateBuyExactFractional(launch_supply, 0).call()
+        )
+        if graduation_quote_target <= 0:
+            raise RuntimeError("Launchpad graduation quote target is zero")
+        progress_percent = (
+            Decimal(quote_raised) * Decimal("100") / Decimal(graduation_quote_target)
+        )
+        return quote_raised, graduation_quote_target, progress_percent
+
+    def prepare_launchpad_buy_transaction(
+        self,
+        launchpad_address: str,
+        amount_in_raw: int,
+        min_amount_out_raw: int,
+        gas_limit: int = 650_000,
+        gas_price_multiplier_bps: int = 12_500,
+    ) -> dict:
+        """Build a launch buy without simulation so it can be broadcast immediately later."""
+        launchpad = self.web3.eth.contract(
+            address=Web3.to_checksum_address(launchpad_address),
+            abi=LAUNCHPAD_ABI,
+        )
+        base_tx = self._base_tx()
+        base_tx["gasPrice"] = max(
+            1,
+            (int(base_tx["gasPrice"]) * int(gas_price_multiplier_bps) + 9_999) // 10_000,
+        )
+        base_tx["gas"] = int(gas_limit)
+        return launchpad.functions.buy(
+            int(amount_in_raw),
+            int(min_amount_out_raw),
+        ).build_transaction(base_tx)
+
+    def send_prepared_transaction(self, tx: dict) -> str:
+        return self._send_tx(tx)
+
+    def sign_prepared_transaction(self, tx: dict) -> bytes:
+        """Sign an already prepared transaction for repeated raw broadcasts."""
+        signed = self.web3.eth.account.sign_transaction(tx, private_key=self.private_key)
+        return bytes(signed.rawTransaction)
+
+    def broadcast_signed_transaction(self, raw_transaction: bytes) -> str:
+        """Broadcast identical signed bytes without changing their nonce."""
+        expected_hash = self.web3.keccak(raw_transaction).hex()
+        try:
+            return self.web3.eth.send_raw_transaction(raw_transaction).hex()
+        except ValueError as exc:
+            message = str(exc).lower()
+            known_markers = (
+                "already known",
+                "known transaction",
+                "nonce too low",
+                "already imported",
+            )
+            if any(marker in message for marker in known_markers):
+                return expected_hash
+            raise
+
+    def call_launchpad_buy(
+        self,
+        launchpad_address: str,
+        amount_in_raw: int,
+        min_amount_out_raw: int,
+    ) -> None:
+        launchpad = self.web3.eth.contract(
+            address=Web3.to_checksum_address(launchpad_address),
+            abi=LAUNCHPAD_ABI,
+        )
+        launchpad.functions.buy(
+            int(amount_in_raw),
+            int(min_amount_out_raw),
+        ).call({"from": self.account_address})
+
     def execute_launchpad_sell(
         self,
         launchpad_address: str,
@@ -2706,6 +2841,21 @@ class EvmExecutionClient:
         tx = launchpad.functions.sell(
             int(amount_in_raw),
             int(min_amount_out_raw),
+        ).build_transaction(self._base_tx())
+        tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
+        return self._send_tx(tx)
+
+    def execute_launchpad_sell_on_fail(
+        self,
+        launchpad_address: str,
+        amount_in_raw: int,
+    ) -> str:
+        launchpad = self.web3.eth.contract(
+            address=Web3.to_checksum_address(launchpad_address),
+            abi=LAUNCHPAD_ABI,
+        )
+        tx = launchpad.functions.sellOnFail(
+            int(amount_in_raw),
         ).build_transaction(self._base_tx())
         tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
         return self._send_tx(tx)
