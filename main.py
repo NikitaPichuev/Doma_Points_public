@@ -9893,6 +9893,15 @@ def _prompt_bonding_token_by_fdv(candidates: List[LaunchpadTokenInfo]) -> Launch
         print(f"Enter a number from 1 to {len(top_candidates)}.")
 
 
+def _select_bonding_token_by_tvl(candidates: List[LaunchpadTokenInfo]) -> LaunchpadTokenInfo:
+    if not candidates:
+        raise RuntimeError("No active bonding tokens available for TVL selection")
+    return max(
+        candidates,
+        key=lambda info: (info.tvl_usd, info.volume_usd, info.price_usd),
+    )
+
+
 def run_bonding_token_buy_once(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -10170,7 +10179,17 @@ def run_bonding_token_buy_once(
         candidates = [info for info in catalog if _is_currently_bonding_token(info, quote_token)]
         if not candidates:
             raise RuntimeError("No active bonding tokens found (status=FRACTIONALIZED, launchpad present, pool absent)")
-        selected_candidate = _prompt_bonding_token_by_fdv(candidates)
+        if selection == "daily_quest":
+            selected_candidate = _select_bonding_token_by_tvl(candidates)
+            logger.info(
+                "%s automatically selected highest-TVL active token | token=%s | tvl=$%s | volume=$%s",
+                mode_prefix,
+                selected_candidate.name.lower(),
+                _format_decimal_plain(selected_candidate.tvl_usd),
+                _format_decimal_plain(selected_candidate.volume_usd),
+            )
+        else:
+            selected_candidate = _prompt_bonding_token_by_fdv(candidates)
 
     if selection == "sell_at_curve":
         monitor_line_idx, monitor_wallet, monitor_private_key = wallet_records[0]
@@ -10222,7 +10241,7 @@ def run_bonding_token_buy_once(
             time.sleep(float(poll_interval))
 
     logger.info(
-        "%s mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | selection=%s | action=%s | token=%s | fdv_rank=%s | amount=%s | active_tokens=%s | delay=%s-%s sec | launch_detection=%s",
+        "%s mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | selection=%s | action=%s | token=%s | candidate_rank=%s | tvl=$%s | amount=%s | active_tokens=%s | delay=%s-%s sec | launch_detection=%s",
         mode_prefix,
         len(wallet_records),
         start_number,
@@ -10232,6 +10251,7 @@ def run_bonding_token_buy_once(
         "sell-only" if action == "sell" else ("buy-only" if action == "buy" else "buy+sell"),
         selected_candidate.name.lower(),
         candidates.index(selected_candidate) + 1 if candidates else "n/a",
+        _format_decimal_plain(selected_candidate.tvl_usd),
         (
             f"{_format_decimal_plain(buy_amount_min)}-{_format_decimal_plain(buy_amount_max)}%"
             if bonding_amount_mode == "sell_percent"

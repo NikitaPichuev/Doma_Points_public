@@ -11,6 +11,7 @@ from main import (
     _execute_launchpad_sell,
     _fetch_fractional_tokens_with_same_proxy_retry,
     _prepare_all_usdce_for_bonding_daily,
+    _select_bonding_token_by_tvl,
     parse_trade_amount_expression,
     resolve_trade_amount,
 )
@@ -80,6 +81,13 @@ class RiskLogicTests(unittest.TestCase):
 
         self.assertIn("post_approve_delay_range", parameters)
         self.assertIn("failed_launch_min_out_retry", parameters)
+
+    def test_bonding_daily_selects_active_token_with_highest_tvl(self) -> None:
+        low = Mock(tvl_usd=Decimal("100"), volume_usd=Decimal("1000"), price_usd=Decimal("1"))
+        high = Mock(tvl_usd=Decimal("500"), volume_usd=Decimal("10"), price_usd=Decimal("0.1"))
+        middle = Mock(tvl_usd=Decimal("300"), volume_usd=Decimal("5000"), price_usd=Decimal("2"))
+
+        self.assertIs(_select_bonding_token_by_tvl([low, high, middle]), high)
 
     @patch("main._wait_tx_receipt", return_value=True)
     @patch("main._execute_trade_via_doma_ui_route")
