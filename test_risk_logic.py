@@ -10,6 +10,7 @@ import requests
 from main import (
     _execute_launchpad_sell,
     _fetch_fractional_tokens_with_same_proxy_retry,
+    _launch_buy_min_out_raw,
     _prepare_all_usdce_for_bonding_daily,
     _select_bonding_token_by_tvl,
     _wallet_record_progress_label,
@@ -19,6 +20,18 @@ from main import (
 
 
 class RiskLogicTests(unittest.TestCase):
+    def test_fast_launch_does_not_reuse_prelaunch_price_floor(self) -> None:
+        self.assertEqual(
+            _launch_buy_min_out_raw(Decimal("100"), 18, fast_launch=True),
+            1,
+        )
+
+    def test_regular_launch_buy_keeps_slippage_floor(self) -> None:
+        self.assertEqual(
+            _launch_buy_min_out_raw(Decimal("100"), 6),
+            70_000_000,
+        )
+
     def test_wallet_progress_uses_run_position_and_source_line(self) -> None:
         label = _wallet_record_progress_label(0, 51, 23, 61, "0xignored")
 

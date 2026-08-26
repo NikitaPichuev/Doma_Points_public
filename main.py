@@ -4305,6 +4305,20 @@ def _execute_launchpad_buy(
     return True
 
 
+def _launch_buy_min_out_raw(
+    expected_out_dec: Decimal,
+    token_decimals: int,
+    *,
+    fast_launch: bool = False,
+) -> int:
+    """Use an open min-out only for the explicitly selected launch sniper."""
+    if fast_launch:
+        return 1
+    if expected_out_dec <= 0:
+        return 1
+    return max(1, decimal_to_raw(expected_out_dec * Decimal("0.7"), token_decimals))
+
+
 def _execute_launchpad_sell(
     cfg: BotConfig,
     logger: logging.Logger,
@@ -10130,10 +10144,13 @@ def run_bonding_token_buy_once(
                             if current.price_usd > 0
                             else Decimal("0")
                         )
-                        min_out_raw = (
-                            max(1, decimal_to_raw(expected_out * Decimal("0.7"), current.decimals))
-                            if expected_out > 0
-                            else 1
+                        # The token price can move before the very first launch block.
+                        # A quote-derived minOut prepared before launch would then make
+                        # every signed retry revert with permanently stale calldata.
+                        min_out_raw = _launch_buy_min_out_raw(
+                            expected_out,
+                            current.decimals,
+                            fast_launch=True,
                         )
                         prepared_tx = pre_exec.prepare_launchpad_buy_transaction(
                             launchpad_address=current.launchpad_address,
@@ -10355,7 +10372,7 @@ def run_bonding_token_buy_once(
 
     success_wallets = failed_wallets = skipped_wallets = 0
     failed_entries: List[str] = []
-    pending_fast_buys: List[Tuple[int, str, EvmExecutionClient, str, bytes, str, LaunchpadTokenInfo, Decimal]] = []
+    pending_fast_buys: List[Tuple[int, str, EvmExecutionClient, str, bytes, str, LaunchpadTokenInfo, Decimal, int]] = []
     fast_broadcasted_wallet_numbers: set[int] = set()
 
     if (
@@ -10418,6 +10435,7 @@ def run_bonding_token_buy_once(
                             selected_candidate.name.lower(),
                             selected_candidate,
                             amount,
+                            int(prepared_fast_wallets[wallet_number][2].get("nonce", 0)),
                         )
                     )
                     logger.info(
@@ -10964,9 +10982,9 @@ def run_bonding_token_buy_once(
     if pending_fast_buys:
         logger.info("%s waiting fast broadcast receipts | txs=%s", mode_prefix, len(pending_fast_buys))
         def _confirm_or_retry_fast_buy(
-            pending: Tuple[int, str, EvmExecutionClient, str, bytes, str, LaunchpadTokenInfo, Decimal],
+            pending: Tuple[int, str, EvmExecutionClient, str, bytes, str, LaunchpadTokenInfo, Decimal, int],
         ) -> Tuple[int, str, str, str, LaunchpadTokenInfo, Decimal, int]:
-            wallet_number, wallet, exec_client, buy_tx_hash, raw_transaction, token_name, current, amount = pending
+            wallet_number, wallet, exec_client, buy_tx_hash, raw_transaction, token_name, current, amount, last_nonce = pending
             retry_number = 0
             rebroadcast_number = 0
             while True:
@@ -11004,19 +11022,31 @@ def run_bonding_token_buy_once(
                 )
                 while True:
                     try:
-                        expected_out = amount / current.price_usd if current.price_usd > 0 else Decimal("0")
-                        min_out_raw = (
-                            max(1, decimal_to_raw(expected_out * Decimal("0.7"), current.decimals))
-                            if expected_out > 0
-                            else 1
-                        )
+                        # Refresh metadata periodically in case Doma replaced the
+                        # launchpad during activation. Do not block the first retry.
+                        if retry_number > 1 and retry_number % 10 == 0:
+                            refreshed = shared_api.fetch_fractional_token_by_name(token_name)
+                            if refreshed is not None and refreshed.launchpad_address:
+                                if refreshed.launchpad_address.lower() != current.launchpad_address.lower():
+                                    approve_hash = exec_client.ensure_allowance(
+                                        quote_token.address,
+                                        decimal_to_raw(amount, quote_token.decimals),
+                                        spender_address=refreshed.launchpad_address,
+                                    )
+                                    if approve_hash and not _wait_tx_receipt(exec_client, approve_hash, timeout_sec=180):
+                                        raise RuntimeError("refreshed launchpad approve failed or timed out")
+                                current = refreshed
                         retry_tx = exec_client.prepare_launchpad_buy_transaction(
                             launchpad_address=current.launchpad_address,
                             amount_in_raw=decimal_to_raw(amount, quote_token.decimals),
-                            min_amount_out_raw=min_out_raw,
+                            min_amount_out_raw=1,
                         )
+                        # Some RPC nodes lag by one block after a reverted receipt.
+                        # A confirmed revert consumes its nonce, so never reuse it.
+                        retry_tx["nonce"] = max(int(retry_tx.get("nonce", 0)), last_nonce + 1)
                         raw_transaction = exec_client.sign_prepared_transaction(retry_tx)
                         buy_tx_hash = exec_client.broadcast_signed_transaction(raw_transaction)
+                        last_nonce = int(retry_tx["nonce"])
                         logger.info(
                             "%s wallet=%s retry=%s broadcasted | amount=%s USDC.E | nonce=%s | tx=%s",
                             mode_prefix,
