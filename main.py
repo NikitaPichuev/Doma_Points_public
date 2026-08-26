@@ -9395,11 +9395,13 @@ def _prepare_all_usdce_for_bonding_daily(
     weth_token: Token,
     wallet: str,
     eth_price: Decimal,
+    log_prefix: str = "BONDING_DAILY",
 ) -> Tuple[bool, str, Decimal]:
     current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
     if current_usdc >= BONDING_DAILY_INITIAL_MIN_USDCE:
         logger.info(
-            "[BONDING_DAILY] wallet=%s using all available USDC.E | amount=%s USDC.E | ETH not touched",
+            "[%s] wallet=%s using all available USDC.E | amount=%s USDC.E | ETH not touched",
+            log_prefix,
             wallet,
             _format_decimal_plain(current_usdc),
         )
@@ -9421,7 +9423,8 @@ def _prepare_all_usdce_for_bonding_daily(
         )
 
     logger.info(
-        "[BONDING_DAILY] wallet=%s USDC.E below executable minimum (%s < %s) | converting spendable ETH=%s (~$%s) | protected_ETH=%s (~$%s: $%s minimum plus $%s bootstrap gas buffer)",
+        "[%s] wallet=%s USDC.E below executable minimum (%s < %s) | converting spendable ETH=%s (~$%s) | protected_ETH=%s (~$%s: $%s minimum plus $%s bootstrap gas buffer)",
+        log_prefix,
         wallet,
         _format_decimal_plain(current_usdc),
         _format_decimal_plain(BONDING_DAILY_INITIAL_MIN_USDCE),
@@ -9444,7 +9447,7 @@ def _prepare_all_usdce_for_bonding_daily(
         display_out_symbol="USDC.E",
         trade_amount_expr=_format_decimal_plain(spendable_eth),
         eth_price=eth_price,
-        label=f"BONDING_DAILY {wallet} ETH>USDC.E BOOTSTRAP",
+        label=f"{log_prefix} {wallet} ETH>USDC.E BOOTSTRAP",
         is_eth_source=True,
         unwrap_to_native=False,
         wait_for_pre_tx=True,
@@ -9462,7 +9465,8 @@ def _prepare_all_usdce_for_bonding_daily(
             refreshed_usdc,
         )
     logger.info(
-        "[BONDING_DAILY] wallet=%s bootstrap complete | available=%s USDC.E | ETH gas reserve kept at about $%s",
+        "[%s] wallet=%s bootstrap complete | available=%s USDC.E | ETH gas reserve kept at about $%s",
+        log_prefix,
         wallet,
         _format_decimal_plain(refreshed_usdc),
         _format_decimal_plain(BONDING_DAILY_GAS_RESERVE_USD),
@@ -10046,6 +10050,27 @@ def run_bonding_token_buy_once(
                     )
                     available_usdc = pre_exec.get_erc20_balance(quote_token.address, quote_token.decimals)
                     if bonding_amount_mode == "all_usdc":
+                        if available_usdc < BONDING_DAILY_INITIAL_MIN_USDCE:
+                            pre_api = DomaApiClient(
+                                cfg.doma_api_url,
+                                api_keys=[cfg.doma_api_key, *cfg.doma_api_keys, *cfg.file_api_keys],
+                                proxies=pre_proxies,
+                            )
+                            pre_eth_price = _fetch_eth_price_via_doma_quote(cfg, pre_api, quote_token)
+                            prepared_ok, prepared_reason, available_usdc = _prepare_all_usdce_for_bonding_daily(
+                                cfg,
+                                logger,
+                                BotState.create_default(),
+                                pre_api,
+                                pre_exec,
+                                quote_token,
+                                weth_token,
+                                f"wallet#{pre_wallet_number}",
+                                pre_eth_price,
+                                log_prefix="BONDING_BUY",
+                            )
+                            if not prepared_ok:
+                                raise RuntimeError(prepared_reason)
                         prepared_amount = available_usdc
                         approve_amount = available_usdc
                     else:
@@ -10541,20 +10566,24 @@ def run_bonding_token_buy_once(
                     logger.warning("%s wallet=%s skipped | %s", mode_prefix, wallet, prepared_reason)
                     continue
             elif bonding_amount_mode == "all_usdc":
-                amount = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-                current_usdc = amount
-                if amount <= 0:
+                prepared_ok, prepared_reason, amount = _prepare_all_usdce_for_bonding_daily(
+                    cfg,
+                    logger,
+                    state,
+                    doma_api,
+                    exec_client,
+                    quote_token,
+                    weth_token,
+                    wallet,
+                    eth_price,
+                    log_prefix=mode_tag,
+                )
+                if not prepared_ok:
                     skipped_wallets += 1
-                    reason = "no available USDC.E balance"
+                    reason = prepared_reason
                     failed_entries.append(f"wallet#{wallet_number} | skipped: {reason}")
                     logger.warning("%s wallet=%s skipped | %s", mode_prefix, wallet, reason)
                     continue
-                logger.info(
-                    "%s wallet=%s amount mode all USDC.E | available=%s USDC.E | ETH not touched",
-                    mode_prefix,
-                    wallet,
-                    _format_decimal_plain(amount),
-                )
             else:
                 prepared = prepared_fast_wallets.get(wallet_number)
                 amount = (

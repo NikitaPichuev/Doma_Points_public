@@ -127,6 +127,59 @@ class RiskLogicTests(unittest.TestCase):
         execute_trade.assert_called_once()
         wait_receipt.assert_called_once_with(exec_client, "0xbootstrap", timeout_sec=180)
 
+    @patch("main._execute_trade_via_doma_ui_route")
+    def test_bonding_all_usdc_does_not_trade_eth_when_usdc_is_at_least_one_dollar(
+        self,
+        execute_trade: Mock,
+    ) -> None:
+        exec_client = Mock()
+        exec_client.get_erc20_balance.return_value = Decimal("1.25")
+
+        ok, reason, available = _prepare_all_usdce_for_bonding_daily(
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            exec_client,
+            Mock(address="0xusdc", decimals=6),
+            Mock(address="0xweth", decimals=18),
+            "wallet#1",
+            Decimal("2000"),
+            log_prefix="BONDING_BUY",
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+        self.assertEqual(available, Decimal("1.25"))
+        execute_trade.assert_not_called()
+
+    @patch("main._execute_trade_via_doma_ui_route")
+    def test_bonding_all_usdc_rejects_dust_without_spendable_eth(
+        self,
+        execute_trade: Mock,
+    ) -> None:
+        exec_client = Mock()
+        exec_client.get_erc20_balance.return_value = Decimal("0.001551")
+        exec_client.get_native_balance.return_value = Decimal("0.00004")
+
+        ok, reason, available = _prepare_all_usdce_for_bonding_daily(
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            exec_client,
+            Mock(address="0xusdc", decimals=6),
+            Mock(address="0xweth", decimals=18),
+            "wallet#3",
+            Decimal("2000"),
+            log_prefix="BONDING_BUY",
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("no spendable ETH", reason)
+        self.assertEqual(available, Decimal("0"))
+        execute_trade.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
