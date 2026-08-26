@@ -251,6 +251,7 @@ NATIVE_GAS_RESERVE_FALLBACK_ETH = Decimal("0.00002")
 BONDING_DAILY_GAS_RESERVE_USD = Decimal("0.10")
 BONDING_DAILY_BOOTSTRAP_GAS_BUFFER_USD = Decimal("0.03")
 BONDING_DAILY_INITIAL_MIN_USDCE = Decimal("1")
+BONDING_DAILY_CONTINUATION_MIN_USDCE = Decimal("0.20")
 SWEEP_MIN_TOKEN_VALUE_USD = Decimal("0.01")
 DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
 DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
@@ -9405,9 +9406,10 @@ def _prepare_all_usdce_for_bonding_daily(
     wallet: str,
     eth_price: Decimal,
     log_prefix: str = "BONDING_DAILY",
+    consolidate_spendable_eth: bool = False,
 ) -> Tuple[bool, str, Decimal]:
     current_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-    if current_usdc >= BONDING_DAILY_INITIAL_MIN_USDCE:
+    if current_usdc >= BONDING_DAILY_INITIAL_MIN_USDCE and not consolidate_spendable_eth:
         logger.info(
             "[%s] wallet=%s using all available USDC.E | amount=%s USDC.E | ETH not touched",
             log_prefix,
@@ -9416,27 +9418,42 @@ def _prepare_all_usdce_for_bonding_daily(
         )
         return True, "", current_usdc
     if eth_price <= 0:
-        return False, "ETH price is unknown", Decimal("0")
+        if current_usdc >= BONDING_DAILY_INITIAL_MIN_USDCE:
+            logger.warning(
+                "[%s] wallet=%s ETH price is unknown; using existing USDC.E only | amount=%s USDC.E",
+                log_prefix,
+                wallet,
+                _format_decimal_plain(current_usdc),
+            )
+            return True, "", current_usdc
+        return False, "ETH price is unknown", current_usdc
 
     native_eth = exec_client.get_native_balance()
     protected_usd = BONDING_DAILY_GAS_RESERVE_USD + BONDING_DAILY_BOOTSTRAP_GAS_BUFFER_USD
     reserve_eth = protected_usd / eth_price
     spendable_eth = max(Decimal("0"), native_eth - reserve_eth)
     if spendable_eth <= 0:
+        if current_usdc >= BONDING_DAILY_INITIAL_MIN_USDCE:
+            logger.info(
+                "[%s] wallet=%s no spendable ETH after gas reserve | using existing=%s USDC.E",
+                log_prefix,
+                wallet,
+                _format_decimal_plain(current_usdc),
+            )
+            return True, "", current_usdc
         return (
             False,
             "no spendable ETH after "
             f"${_format_decimal_plain(BONDING_DAILY_GAS_RESERVE_USD)} minimum gas reserve "
             f"and ${_format_decimal_plain(BONDING_DAILY_BOOTSTRAP_GAS_BUFFER_USD)} bootstrap buffer",
-            Decimal("0"),
+            current_usdc,
         )
 
     logger.info(
-        "[%s] wallet=%s USDC.E below executable minimum (%s < %s) | converting spendable ETH=%s (~$%s) | protected_ETH=%s (~$%s: $%s minimum plus $%s bootstrap gas buffer)",
+        "[%s] wallet=%s consolidating funds before volume loop | current_USDC.E=%s | converting spendable ETH=%s (~$%s) | protected_ETH=%s (~$%s: $%s minimum plus $%s bootstrap gas buffer)",
         log_prefix,
         wallet,
         _format_decimal_plain(current_usdc),
-        _format_decimal_plain(BONDING_DAILY_INITIAL_MIN_USDCE),
         _format_decimal_plain(spendable_eth),
         _format_decimal_plain(spendable_eth * eth_price),
         _format_decimal_plain(reserve_eth),
@@ -10575,6 +10592,7 @@ def run_bonding_token_buy_once(
                     weth_token,
                     wallet,
                     eth_price,
+                    consolidate_spendable_eth=True,
                 )
                 if not prepared_ok:
                     skipped_wallets += 1
@@ -10665,9 +10683,11 @@ def run_bonding_token_buy_once(
                     cycle_number += 1
                     available_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
                     cycle_amount = available_usdc
-                    if decimal_to_raw(cycle_amount, quote_token.decimals) <= 0:
+                    if cycle_amount < BONDING_DAILY_CONTINUATION_MIN_USDCE:
                         raise RuntimeError(
-                            "daily bonding volume stopped: no USDC.E remains for the next swap "
+                            "daily bonding volume stopped: remaining USDC.E is below the anti-dust minimum "
+                            f"({_format_decimal_plain(cycle_amount)} < "
+                            f"{_format_decimal_plain(BONDING_DAILY_CONTINUATION_MIN_USDCE)}) "
                             f"(progress={_format_decimal_plain(accumulated_volume)}/"
                             f"{_format_decimal_plain(daily_target_volume)})"
                         )
@@ -14373,11 +14393,13 @@ def run_bonding_daily_quest_once(cfg: BotConfig, logger: logging.Logger, state: 
         raise ValueError("Некорректный диапазон пауз между кошельками")
 
     print(
-        f"Софт начнет торговлю только с балансом от {_format_decimal_plain(BONDING_DAILY_INITIAL_MIN_USDCE)} USDC.E: "
-        "если USDC.E меньше, доступный ETH будет обменян с сохранением минимум "
-        f"${_format_decimal_plain(BONDING_DAILY_GAS_RESERVE_USD)} в ETH на газ. После первого свапа "
+        f"Софт начнет торговлю только с рабочим балансом от {_format_decimal_plain(BONDING_DAILY_INITIAL_MIN_USDCE)} USDC.E. "
+        "Перед первым циклом доступный ETH будет добавлен к USDC.E с сохранением минимум "
+        f"${_format_decimal_plain(BONDING_DAILY_GAS_RESERVE_USD)} в ETH на газ. Если USDC.E уже есть, "
+        "расходуемый ETH все равно будет добавлен к нему перед первым циклом. После первого свапа "
         "уменьшившаяся из-за проскальзывания сумма продолжит участвовать в обороте, "
-        f"пока фактический объем не достигнет {_format_decimal_plain(target)} USDC.E."
+        f"пока фактический объем не достигнет {_format_decimal_plain(target)} USDC.E или рабочий остаток "
+        f"не станет меньше {_format_decimal_plain(BONDING_DAILY_CONTINUATION_MIN_USDCE)} USDC.E."
     )
     run_bonding_token_buy_once(
         cfg,

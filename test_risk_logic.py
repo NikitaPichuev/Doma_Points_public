@@ -133,8 +133,46 @@ class RiskLogicTests(unittest.TestCase):
         execute_trade.assert_called_once()
         wait_receipt.assert_called_once_with(exec_client, "0xbootstrap", timeout_sec=180)
 
+    @patch("main._wait_tx_receipt", return_value=True)
     @patch("main._execute_trade_via_doma_ui_route")
-    def test_bonding_all_usdc_does_not_trade_eth_when_usdc_is_at_least_one_dollar(
+    def test_bonding_all_usdc_consolidates_eth_when_usdc_is_at_least_one_dollar(
+        self,
+        execute_trade: Mock,
+        wait_receipt: Mock,
+    ) -> None:
+        state = Mock(last_tx_hash="")
+
+        def mark_sent(**_kwargs: object) -> bool:
+            state.last_tx_hash = "0xbootstrap"
+            return True
+
+        execute_trade.side_effect = mark_sent
+        exec_client = Mock()
+        exec_client.get_erc20_balance.side_effect = [Decimal("1.25"), Decimal("3.10")]
+        exec_client.get_native_balance.return_value = Decimal("0.001")
+
+        ok, reason, available = _prepare_all_usdce_for_bonding_daily(
+            Mock(),
+            Mock(),
+            state,
+            Mock(),
+            exec_client,
+            Mock(address="0xusdc", decimals=6),
+            Mock(address="0xweth", decimals=18),
+            "wallet#1",
+            Decimal("2000"),
+            log_prefix="BONDING_BUY",
+            consolidate_spendable_eth=True,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+        self.assertEqual(available, Decimal("3.10"))
+        execute_trade.assert_called_once()
+        wait_receipt.assert_called_once_with(exec_client, "0xbootstrap", timeout_sec=180)
+
+    @patch("main._execute_trade_via_doma_ui_route")
+    def test_bonding_all_usdc_keeps_eth_for_non_daily_mode(
         self,
         execute_trade: Mock,
     ) -> None:
@@ -183,7 +221,7 @@ class RiskLogicTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("no spendable ETH", reason)
-        self.assertEqual(available, Decimal("0"))
+        self.assertEqual(available, Decimal("0.001551"))
         execute_trade.assert_not_called()
 
 
