@@ -319,12 +319,9 @@ def _color(text: str, code: str) -> str:
     return f"{code}{text}{ANSI_RESET}"
 
 
-def _wallet_progress_label(idx: int, total: int, wallet: str) -> str:
-    return f"{idx + 1}/{total} - {wallet}"
-
-
 def _wallet_record_progress_label(process_idx: int, selected_total: int, line_idx: int, total_wallets: int, wallet: str) -> str:
-    return f"{process_idx + 1}/{selected_total} | wallet#{line_idx + 1}/{total_wallets} - {wallet}"
+    _ = total_wallets, wallet
+    return f"{process_idx + 1}/{selected_total} | wallet#{line_idx + 1}"
 
 
 def _current_week_start_utc() -> datetime:
@@ -3008,7 +3005,10 @@ def run_balances_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -
     balance_token_catalog: Optional[List[LaunchpadTokenInfo]] = None
     logger.info("[BALANCES] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | min_value=$0.01", len(wallets), start_number, end_number)
     for order_idx, (idx, wallet) in enumerate(wallet_records):
-        logger.info("[BALANCES] wallet %s/%s - %s", idx + 1, len(wallets), wallet)
+        logger.info(
+            "[BALANCES] wallet %s",
+            _wallet_record_progress_label(order_idx, len(wallet_records), idx, len(wallets), wallet),
+        )
         ctx = _wallet_api_context(cfg, idx, logger, "Balance check")
         if ctx is None:
             continue
@@ -3925,6 +3925,10 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     failed_wallets: List[str] = []
     for order_idx, (wallet_idx, wallet, private_key) in enumerate(selected):
         wallet_number = wallet_idx + 1
+        logger.info(
+            "[EXCHANGE_DEPOSIT] wallet %s",
+            _wallet_record_progress_label(order_idx, len(selected), wallet_idx, len(wallet_key_records), wallet),
+        )
         deposit_address = _deposit_address_for_wallet(deposit_addresses, wallet_idx)
         if not _is_valid_evm_address(deposit_address):
             failed += 1
@@ -3967,9 +3971,8 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 )
             amount_raw = decimal_to_raw(amount, 18)
             logger.info(
-                "[EXCHANGE_DEPOSIT] wallet %s/%s | to=%s | %s %s on %s",
+                "[EXCHANGE_DEPOSIT] wallet#%s | to=%s | %s %s on %s",
                 wallet_number,
-                len(wallet_key_records),
                 deposit_address,
                 _format_decimal_plain(amount),
                 symbol,
@@ -7349,7 +7352,7 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             if skip_wallet:
                 skipped_wallets += 1
                 skipped_wallet_details.append(
-                    f"wallet#{wallet_number}/{total_loaded_wallets} | wallet={wallet} | reason=no proxy on matching line"
+                    f"wallet#{wallet_number} | reason=no proxy on matching line"
                 )
                 continue
             logger.info(
@@ -7373,7 +7376,7 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             if not unlisted_domains:
                 skipped_wallets += 1
                 skipped_wallet_details.append(
-                    f"wallet {wallet_number}/{total_loaded_wallets} | wallet={wallet} | reason=no eligible unlisted domains | owned={len(all_domains)} listed={len(listed_domains)} | skipped={unlisted_skip_reasons}"
+                    f"wallet#{wallet_number} | reason=no eligible unlisted domains | owned={len(all_domains)} listed={len(listed_domains)} | skipped={unlisted_skip_reasons}"
                 )
                 logger.info(
                     "[LIST] wallet=%s no eligible unlisted domains | owned=%s listed=%s | skipped=%s",
@@ -7453,7 +7456,10 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
             logger.warning("[LIST] wallet=%s failed: %s", wallet, exc)
         except KeyboardInterrupt:
             interrupted = True
-            logger.warning("[LIST] interrupted by user at wallet %s/%s | wallet=%s", wallet_number, total_loaded_wallets, wallet)
+            logger.warning(
+                "[LIST] interrupted by user at wallet %s",
+                _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet),
+            )
             break
         if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
             delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
@@ -7462,7 +7468,10 @@ def run_domain_listing_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                 time.sleep(delay_sec)
             except KeyboardInterrupt:
                 interrupted = True
-                logger.warning("[LIST] interrupted by user during delay after wallet %s/%s | wallet=%s", wallet_number, total_loaded_wallets, wallet)
+                logger.warning(
+                    "[LIST] interrupted by user during delay after wallet %s",
+                    _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet),
+                )
                 break
 
     if interrupted:
@@ -9665,7 +9674,10 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "CHEAP_BUY")
         wallet_number = line_idx + 1
-        logger.info("[CHEAP_BUY] wallet %s/%s | wallet#%s - %s", idx, len(wallet_key_records), wallet_number, wallet)
+        logger.info(
+            "[CHEAP_BUY] wallet %s",
+            _wallet_record_progress_label(idx - 1, len(wallet_key_records), line_idx, total_loaded_wallets, wallet),
+        )
         if skip_wallet or not proxies:
             skipped_wallets += 1
             logger.warning("[CHEAP_BUY] wallet=%s skipped: proxy is required for cheap token buy", wallet)
@@ -10410,7 +10422,11 @@ def run_bonding_token_buy_once(
         wallet_number = line_idx + 1
         if wallet_number in fast_broadcasted_wallet_numbers:
             continue
-        logger.info("%s wallet %s/%s | wallet#%s - %s", mode_prefix, position, len(wallet_records), wallet_number, wallet)
+        logger.info(
+            "%s wallet %s",
+            mode_prefix,
+            _wallet_record_progress_label(position - 1, len(wallet_records), line_idx, total_loaded_wallets, wallet),
+        )
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, mode_tag)
         if skip_wallet or not proxies:
             skipped_wallets += 1
@@ -11234,8 +11250,11 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
     for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records, start=1):
         proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "COM_DAILY")
         wallet_number = line_idx + 1
-        wallet_log_prefix = f"[COM_DAILY wallet {wallet_number}/{total_loaded_wallets}]"
-        logger.info("%s wallet=%s", wallet_log_prefix, wallet)
+        wallet_log_prefix = f"[COM_DAILY wallet#{wallet_number}]"
+        logger.info(
+            "[COM_DAILY] wallet %s",
+            _wallet_record_progress_label(idx - 1, len(wallet_key_records), line_idx, total_loaded_wallets, wallet),
+        )
         if skip_wallet:
             _mark_com_daily_skipped(wallet_number, "proxy skipped/unavailable")
             continue
@@ -11376,7 +11395,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                         display_out_symbol="USDC.E",
                         trade_amount_expr=f"${_format_decimal_plain(weth_topup_usd)}",
                         eth_price=eth_price,
-                        label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} WETH>USDC.E TOPUP",
+                        label=f"COM_DAILY wallet#{wallet_number} WETH>USDC.E TOPUP",
                         is_eth_source=False,
                         unwrap_to_native=False,
                         wait_for_pre_tx=True,
@@ -11432,7 +11451,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     display_out_symbol="USDC.E",
                     trade_amount_expr=_format_decimal_plain(bootstrap_eth),
                     eth_price=eth_price,
-                    label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} ETH>USDC.E TOPUP",
+                    label=f"COM_DAILY wallet#{wallet_number} ETH>USDC.E TOPUP",
                     is_eth_source=True,
                     unwrap_to_native=False,
                     wait_for_pre_tx=True,
@@ -11560,7 +11579,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                     display_out_symbol=domain_token.symbol,
                     trade_amount_expr=f"${_format_decimal_plain(swap_usdc)}",
                     eth_price=eth_price,
-                    label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} USDC.E>{domain_token.symbol}",
+                    label=f"COM_DAILY wallet#{wallet_number} USDC.E>{domain_token.symbol}",
                     wait_for_pre_tx=True,
                 )
                 forward_tx_hash = state.last_tx_hash if ok_forward else ""
@@ -11592,7 +11611,7 @@ def run_com_daily_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotSt
                             display_out_symbol="USDC.E",
                             trade_amount_expr=_format_decimal_plain(received_domain),
                             eth_price=eth_price,
-                            label=f"COM_DAILY wallet {wallet_number}/{total_loaded_wallets} {wallet} {domain_token.symbol}>USDC.E",
+                            label=f"COM_DAILY wallet#{wallet_number} {domain_token.symbol}>USDC.E",
                             wait_for_pre_tx=True,
                         )
                         reverse_tx_hash = state.last_tx_hash if ok_reverse else ""
@@ -14106,11 +14125,14 @@ def run_doma_cost_report_once(
         wallet_order = _prompt_wallet_order(default_random=True)
     if wallet_order == "random":
         random.shuffle(wallet_records)
-    for idx, wallet in wallet_records:
+    for process_idx, (idx, wallet) in enumerate(wallet_records):
         proxies, skip_wallet = _proxy_for_line(cfg, idx, logger, "COST")
         if skip_wallet:
             continue
-        logger.info("[COST] wallet %s", _wallet_progress_label(idx, len(wallets), wallet))
+        logger.info(
+            "[COST] wallet %s",
+            _wallet_record_progress_label(process_idx, len(wallet_records), idx, len(wallets), wallet),
+        )
         try:
             api = DomaApiClient(
                 cfg.doma_api_url,

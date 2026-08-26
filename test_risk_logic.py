@@ -12,12 +12,18 @@ from main import (
     _fetch_fractional_tokens_with_same_proxy_retry,
     _prepare_all_usdce_for_bonding_daily,
     _select_bonding_token_by_tvl,
+    _wallet_record_progress_label,
     parse_trade_amount_expression,
     resolve_trade_amount,
 )
 
 
 class RiskLogicTests(unittest.TestCase):
+    def test_wallet_progress_uses_run_position_and_source_line(self) -> None:
+        label = _wallet_record_progress_label(0, 51, 23, 61, "0xignored")
+
+        self.assertEqual(label, "1/51 | wallet#24")
+
     def test_parse_percent(self) -> None:
         mode, value = parse_trade_amount_expression("25%")
         self.assertEqual(mode, "percent")
