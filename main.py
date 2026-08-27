@@ -83,6 +83,7 @@ ANSI_RED = "\033[91m"
 ANSI_YELLOW = "\033[93m"
 ANSI_CYAN = "\033[96m"
 ANSI_WHITE = "\033[97m"
+WALLET_START_LOG_RE = re.compile(r"\bwallet\s+\d+/\d+\s+\|\s+wallet#\d+\b", re.IGNORECASE)
 
 
 def _redact_wallet_addresses(text: str) -> str:
@@ -112,8 +113,15 @@ class ColoredConsoleFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         line = super().format(record)
-        color = self.LEVEL_COLORS.get(record.levelno, ANSI_WHITE)
+        if record.levelno == logging.INFO and _is_wallet_start_log(record.getMessage()):
+            color = ANSI_GREEN
+        else:
+            color = self.LEVEL_COLORS.get(record.levelno, ANSI_WHITE)
         return f"{color}{line}{ANSI_RESET}"
+
+
+def _is_wallet_start_log(message: str) -> bool:
+    return bool(WALLET_START_LOG_RE.search(str(message)))
 
 
 def _enable_windows_ansi_colors() -> None:

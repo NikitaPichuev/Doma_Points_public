@@ -11,6 +11,7 @@ from main import (
     _execute_launchpad_sell,
     _fetch_fractional_tokens_with_same_proxy_retry,
     _launch_buy_min_out_raw,
+    _is_wallet_start_log,
     _prepare_all_usdce_for_bonding_daily,
     _select_bonding_token_by_tvl,
     _wallet_record_progress_label,
@@ -36,6 +37,14 @@ class RiskLogicTests(unittest.TestCase):
         label = _wallet_record_progress_label(0, 51, 23, 61, "0xignored")
 
         self.assertEqual(label, "1/51 | wallet#24")
+
+    def test_wallet_start_log_is_detected_for_console_highlight(self) -> None:
+        self.assertTrue(_is_wallet_start_log("[QUEST brag.com] wallet 13/61 | wallet#3"))
+        self.assertTrue(_is_wallet_start_log("[BRIDGE] wallet 1/1 | wallet#42"))
+
+    def test_regular_wallet_log_is_not_detected_as_wallet_start(self) -> None:
+        self.assertFalse(_is_wallet_start_log("[QUEST brag.com] wallet=wallet#3 cycle=1"))
+        self.assertFalse(_is_wallet_start_log("[QUEST brag.com] delay before next wallet: 4.28 sec"))
 
     def test_parse_percent(self) -> None:
         mode, value = parse_trade_amount_expression("25%")
