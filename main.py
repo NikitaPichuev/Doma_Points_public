@@ -10054,6 +10054,7 @@ def run_bonding_token_buy_once(
     if not all_records:
         raise RuntimeError("No wallet/private-key pairs available for bonding token mode")
     total_wallets = len(all_records)
+    total_loaded_wallets = total_wallets
     start_number = _prompt_start_wallet_number(total_wallets)
     end_number = _prompt_end_wallet_number(total_wallets, start_number)
     order = _prompt_wallet_order(default_random=True)
