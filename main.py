@@ -170,6 +170,7 @@ def setup_logger(log_path: Path) -> logging.Logger:
 MIN_EXECUTABLE_TRADE_USD = Decimal("0.10")
 DOMA_QUOTE_RETRY_DELAYS_SEC = (0.0, 2.0, 5.0, 10.0)
 DOMAIN_QUEST_COMPLETION_THRESHOLD_USD = Decimal("25")
+DOMAIN_QUEST_GAS_RESERVE_USD = Decimal("0.20")
 DOMAIN_QUEST_TOKENS = [
     "agenticconsultant.ai",
     "alert.ai",
@@ -315,6 +316,16 @@ def _native_gas_reserve_eth(eth_price: Decimal) -> Decimal:
     if eth_price > 0:
         return NATIVE_GAS_RESERVE_USD / eth_price
     return NATIVE_GAS_RESERVE_FALLBACK_ETH
+
+
+def _domain_quest_gas_reserve_eth(eth_price: Decimal) -> Decimal:
+    if eth_price > 0:
+        return DOMAIN_QUEST_GAS_RESERVE_USD / eth_price
+    return NATIVE_GAS_RESERVE_FALLBACK_ETH
+
+
+def _domain_quest_spendable_native_eth(native_balance: Decimal, eth_price: Decimal) -> Decimal:
+    return max(Decimal("0"), native_balance - _domain_quest_gas_reserve_eth(eth_price))
 
 
 def _spendable_native_eth(exec_client: EvmExecutionClient, eth_price: Decimal) -> Decimal:
@@ -5389,6 +5400,7 @@ def run_domain_quest_volume_once(
             wallet_failed = False
             wallet_trades_started = False
             min_single_swap_done = True if not require_min_single_swap else accumulated_volume >= quest_target_volume
+            eth_consolidation_attempted = False
 
             # The buffer sizes the next trade, but it must not force extra swaps
             # after the actual quest target has already been reached.
@@ -5406,10 +5418,47 @@ def run_domain_quest_volume_once(
                 full_balance_rides = exec_client.get_erc20_balance(rides_token.address, rides_token.decimals)
                 rides_price_usd = pick_token_usd_price(rides_token, eth_price, launchpad_info.price_usd)
                 has_usable_usdc = full_balance_usdc >= MIN_EXECUTABLE_TRADE_USD
-                reserve_eth = _native_gas_reserve_eth(eth_price)
-                spendable_eth = exec_client.get_native_balance() - reserve_eth
-                spendable_eth = spendable_eth if spendable_eth > 0 else Decimal("0")
+                spendable_eth = _domain_quest_spendable_native_eth(exec_client.get_native_balance(), eth_price)
                 spendable_eth_usd = spendable_eth * eth_price
+
+                if not eth_consolidation_attempted:
+                    eth_consolidation_attempted = True
+                    if spendable_eth_usd >= MIN_EXECUTABLE_TRADE_USD:
+                        logger.info(
+                            _quest_log(
+                                "wallet=%s consolidating ETH into USDC.E before quest loop | "
+                                "current_USDC.E=%s | ETH->USDC.E=%s ETH (~$%s) | gas_reserve=$%s"
+                            ),
+                            wallet,
+                            _format_decimal_plain(full_balance_usdc),
+                            _format_decimal_plain(spendable_eth),
+                            _format_decimal_plain(spendable_eth_usd),
+                            _format_decimal_plain(DOMAIN_QUEST_GAS_RESERVE_USD),
+                        )
+                        ok_bootstrap = _execute_trade_via_doma_ui_route(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            doma_api=doma_api,
+                            exec_client=exec_client,
+                            token_in=weth_token,
+                            token_out=quote_token,
+                            display_in_symbol="ETH",
+                            display_out_symbol="USDC.E",
+                            trade_amount_expr=_format_decimal_plain(spendable_eth),
+                            eth_price=eth_price,
+                            label=f"{mode_label} {wallet} ETH>USDC.E CONSOLIDATE",
+                            is_eth_source=True,
+                            unwrap_to_native=False,
+                            wait_for_pre_tx=True,
+                        )
+                        if not ok_bootstrap or not state.last_tx_hash or not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                            logger.warning(_quest_log("wallet=%s ETH consolidation failed"), wallet)
+                            wallet_failed = True
+                            break
+                        wallet_trades_started = True
+                        _sleep_between_swaps()
+                        continue
 
                 if require_min_single_swap and not min_single_swap_done:
                     required_usdc = max(

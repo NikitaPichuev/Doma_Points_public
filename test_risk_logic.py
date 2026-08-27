@@ -9,6 +9,8 @@ import requests
 
 from main import (
     _execute_launchpad_sell,
+    _domain_quest_gas_reserve_eth,
+    _domain_quest_spendable_native_eth,
     _fetch_fractional_tokens_with_same_proxy_retry,
     _launch_buy_min_out_raw,
     _is_wallet_start_log,
@@ -37,6 +39,17 @@ class RiskLogicTests(unittest.TestCase):
         label = _wallet_record_progress_label(0, 51, 23, 61, "0xignored")
 
         self.assertEqual(label, "1/51 | wallet#24")
+
+    def test_domain_quest_keeps_twenty_cents_of_eth_for_gas(self) -> None:
+        self.assertEqual(_domain_quest_gas_reserve_eth(Decimal("2000")), Decimal("0.0001"))
+        self.assertEqual(
+            _domain_quest_spendable_native_eth(Decimal("0.001"), Decimal("2000")),
+            Decimal("0.0009"),
+        )
+        self.assertEqual(
+            _domain_quest_spendable_native_eth(Decimal("0.00005"), Decimal("2000")),
+            Decimal("0"),
+        )
 
     def test_wallet_start_log_is_detected_for_console_highlight(self) -> None:
         self.assertTrue(_is_wallet_start_log("[QUEST brag.com] wallet 13/61 | wallet#3"))
