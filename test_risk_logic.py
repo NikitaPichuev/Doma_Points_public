@@ -7,11 +7,14 @@ from decimal import Decimal
 
 import requests
 
+from relay_bridge import _native_spendable_raw_with_usd_reserve, parse_amount_expr
+
 from main import (
     _execute_launchpad_sell,
     _domain_quest_gas_reserve_eth,
     _domain_quest_spendable_native_eth,
     _fetch_fractional_tokens_with_same_proxy_retry,
+    get_bridge_tasks_from_menu,
     _launch_buy_min_out_raw,
     _is_wallet_start_log,
     _prepare_all_usdce_for_bonding_daily,
@@ -23,6 +26,37 @@ from main import (
 
 
 class RiskLogicTests(unittest.TestCase):
+    @patch("builtins.input", side_effect=["1", "3", "3", "2"])
+    def test_doma_to_base_menu_builds_usd_reserve_task(self, _input: Mock) -> None:
+        tasks = get_bridge_tasks_from_menu(Mock())
+
+        self.assertEqual(tasks, ["doma>base:ETH>ETH:reserve_usd(2)"])
+
+    def test_bridge_parses_native_usd_reserve_mode(self) -> None:
+        mode, value = parse_amount_expr("reserve_usd(2.5)")
+
+        self.assertEqual(mode, "reserve_usd")
+        self.assertEqual(value, Decimal("2.5"))
+
+    def test_bridge_keeps_requested_usd_reserve_and_gas(self) -> None:
+        amount_raw = _native_spendable_raw_with_usd_reserve(
+            balance_raw=10**16,
+            decimals=18,
+            eth_price_usd=Decimal("2000"),
+            reserve_usd=Decimal("2"),
+        )
+
+        self.assertEqual(amount_raw, 8_975_000_000_000_000)
+
+    def test_bridge_rejects_balance_below_requested_reserve(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Insufficient ETH balance"):
+            _native_spendable_raw_with_usd_reserve(
+                balance_raw=10**15,
+                decimals=18,
+                eth_price_usd=Decimal("2000"),
+                reserve_usd=Decimal("2"),
+            )
+
     def test_fast_launch_does_not_reuse_prelaunch_price_floor(self) -> None:
         self.assertEqual(
             _launch_buy_min_out_raw(Decimal("100"), 18, fast_launch=True),

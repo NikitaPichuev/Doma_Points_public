@@ -100,6 +100,8 @@ def parse_amount_expr(expr: str) -> Tuple[str, Decimal]:
     s = (expr or "").strip().lower()
     if not s:
         raise ValueError("Empty amount expression")
+    if s.startswith("reserve_usd(") and s.endswith(")"):
+        return "reserve_usd", Decimal(s[len("reserve_usd(") : -1].strip())
     if s.endswith("%"):
         return "percent", Decimal(s[:-1].strip())
     if s.startswith("$"):
@@ -107,6 +109,27 @@ def parse_amount_expr(expr: str) -> Tuple[str, Decimal]:
     if s.endswith("usd"):
         return "usd", Decimal(s[:-3].strip())
     return "token", Decimal(s)
+
+
+def _native_spendable_raw_with_usd_reserve(
+    balance_raw: int,
+    decimals: int,
+    eth_price_usd: Decimal,
+    reserve_usd: Decimal,
+    gas_reserve_usd: Decimal = Decimal("0.05"),
+) -> int:
+    if eth_price_usd <= 0:
+        raise ValueError("ETH/USD price is required for USD reserve mode")
+    if reserve_usd < 0:
+        raise ValueError("ETH reserve in USD cannot be negative")
+    total_reserve_eth = (reserve_usd + gas_reserve_usd) / eth_price_usd
+    reserve_raw = int((total_reserve_eth * (Decimal(10) ** decimals)).to_integral_value())
+    spendable_raw = balance_raw - reserve_raw
+    if spendable_raw <= 0:
+        raise ValueError(
+            f"Insufficient ETH balance to keep ${reserve_usd} reserve plus gas"
+        )
+    return spendable_raw
 
 
 def parse_bridge_task(raw: str) -> BridgeTask:
@@ -249,6 +272,16 @@ def _resolve_amount_raw_via_config(
         if bal_raw <= 0:
             raise ValueError("Zero balance for selected bridge source token")
     balance_dec = Decimal(bal_raw) / (Decimal(10) ** token.decimals)
+
+    if mode == "reserve_usd":
+        if token.address != NATIVE_ETH:
+            raise ValueError("USD reserve mode is supported only for native ETH")
+        return _native_spendable_raw_with_usd_reserve(
+            balance_raw=bal_raw,
+            decimals=token.decimals,
+            eth_price_usd=eth_price_usd,
+            reserve_usd=value,
+        )
 
     if mode == "percent":
         if value > 100:

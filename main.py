@@ -3165,6 +3165,9 @@ def run_bridge_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
         try:
             _left, _pair, amount_expr = [x.strip() for x in raw.split(":", 2)]
             amount_expr_lc = amount_expr.strip().lower()
+            if amount_expr_lc.startswith("reserve_usd("):
+                need_eth_price = True
+                break
             if amount_expr_lc.startswith(("rand_percent(", "rand_token(")):
                 continue
             mode, _ = parse_trade_amount_expression(amount_expr)
@@ -14400,12 +14403,30 @@ def get_bridge_tasks_from_menu(state: BotState) -> Optional[List[str]]:
         raise ValueError("Invalid bridge sub-route selection")
 
     _label, src_chain, dst_chain, src_symbol, dst_symbol = group_routes[route_idx - 1]
+    supports_usd_reserve = (
+        src_chain == "doma"
+        and dst_chain == "base"
+        and src_symbol == "ETH"
+        and dst_symbol == "ETH"
+    )
     print("\nAmount mode:")
     print(f"1) Number ({src_symbol})")
     print("2) Percent (%)")
-    amount_mode_raw = input("Select [1-2]: ").strip()
-    if amount_mode_raw not in {"1", "2"}:
+    if supports_usd_reserve:
+        print("3) All available ETH except a USD reserve on Doma")
+    max_amount_mode = 3 if supports_usd_reserve else 2
+    amount_mode_raw = input(f"Select [1-{max_amount_mode}]: ").strip()
+    if amount_mode_raw not in {str(i) for i in range(1, max_amount_mode + 1)}:
         raise ValueError("Invalid amount mode selection")
+    if amount_mode_raw == "3":
+        reserve_raw = input("ETH reserve to keep on Doma, USD: ").strip()
+        reserve_usd = _parse_decimal_input(reserve_raw)
+        if reserve_usd <= 0:
+            raise ValueError("ETH reserve in USD must be greater than zero")
+        return [
+            f"{src_chain}>{dst_chain}:{src_symbol}>{dst_symbol}:"
+            f"reserve_usd({_format_decimal_plain(reserve_usd)})"
+        ]
     amount_mode = "number" if amount_mode_raw == "1" else "percent"
 
     min_raw = input("Minimum: ").strip()
