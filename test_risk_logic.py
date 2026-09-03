@@ -15,6 +15,7 @@ from main import (
     _domain_quest_spendable_native_eth,
     _fetch_fractional_tokens_with_same_proxy_retry,
     get_bridge_tasks_from_menu,
+    get_domain_quest_menu_input,
     _launch_buy_min_out_raw,
     _is_wallet_start_log,
     _prepare_all_usdce_for_bonding_daily,
@@ -26,6 +27,15 @@ from main import (
 
 
 class RiskLogicTests(unittest.TestCase):
+    @patch("builtins.input", side_effect=["29", "", "", "", "", "", ""])
+    def test_smoothie_quest_uses_regular_buy_sell_volume_cycle(self, _input: Mock) -> None:
+        picked = get_domain_quest_menu_input(Mock())
+
+        self.assertEqual(
+            picked,
+            ("smoothie.com", "95", "99", "25", "USDC.E", "volume_only", "check_skip"),
+        )
+
     @patch("builtins.input", side_effect=["1", "3", "3", "2"])
     def test_doma_to_base_menu_builds_usd_reserve_task(self, _input: Mock) -> None:
         tasks = get_bridge_tasks_from_menu(Mock())

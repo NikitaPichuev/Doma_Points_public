@@ -210,7 +210,6 @@ DOMAIN_QUEST_TOKENS = [
 ]
 DOMAIN_QUEST_MIN_BUY_USD = {
     "fyi.xyz": Decimal("5"),
-    "smoothie.com": Decimal("5"),
     "wines.xyz": Decimal("5"),
 }
 CHEAP_BUY_TOKEN_BLOCKLIST = {
