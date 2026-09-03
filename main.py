@@ -5610,7 +5610,6 @@ def run_domain_quest_volume_once(
                 full_trade_usd = full_balance_usdc
                 full_trade_expr = "100%"
 
-                remaining_volume = execution_target_volume - accumulated_volume
                 if full_balance <= 0 or full_trade_usd <= 0:
                     logger.warning(_quest_log("wallet=%s no usable USDC.E/%s balance for quest cycle"), wallet, rides_token.symbol)
                     wallet_failed = True
@@ -5634,26 +5633,6 @@ def run_domain_quest_volume_once(
                     )
                     wallet_failed = True
                     break
-                if remaining_volume > 0 and remaining_volume < (full_trade_usd * Decimal("2")):
-                    if require_min_single_swap and not min_single_swap_done:
-                        min_full_step_usd = min_single_swap_usd
-                        target_full_step_usd = max(min_full_step_usd, execution_target_volume - accumulated_volume)
-                    else:
-                        min_full_step_usd = MIN_EXECUTABLE_TRADE_USD
-                        target_full_step_usd = remaining_volume / Decimal("2")
-                    capped_full_usd = min(
-                        full_trade_usd,
-                        max(min_full_step_usd, target_full_step_usd),
-                    )
-                    if capped_full_usd >= MIN_EXECUTABLE_TRADE_USD:
-                        full_trade_usd = capped_full_usd
-                        full_trade_expr = f"${_format_decimal_plain(capped_full_usd)}"
-                        logger.info(
-                            _quest_log("wallet=%s near target | capping full step to %s"),
-                            wallet,
-                            full_trade_expr,
-                        )
-
                 logger.info(
                     _quest_log("wallet=%s full step | %s->%s amount=%s"),
                     wallet,
@@ -5782,7 +5761,6 @@ def run_domain_quest_volume_once(
                     partial_expr = _format_decimal_plain(partial_amount_dec)
                     partial_balance = sellable_partial_balance
 
-                remaining_volume = execution_target_volume - accumulated_volume
                 if partial_balance <= 0 or partial_trade_usd <= 0:
                     logger.warning(_quest_log("wallet=%s no balance for partial %s step"), wallet, partial_in_symbol)
                     wallet_failed = True
@@ -5796,20 +5774,6 @@ def run_domain_quest_volume_once(
                     )
                     wallet_failed = True
                     break
-                if remaining_volume > 0 and partial_trade_usd > remaining_volume:
-                    capped_partial_usd = min(
-                        partial_trade_usd,
-                        max(MIN_EXECUTABLE_TRADE_USD, remaining_volume),
-                    )
-                    if capped_partial_usd >= MIN_EXECUTABLE_TRADE_USD:
-                        partial_trade_usd = capped_partial_usd
-                        partial_expr = f"${_format_decimal_plain(capped_partial_usd)}"
-                        logger.info(
-                            _quest_log("wallet=%s near target | capping partial step to %s"),
-                            wallet,
-                            partial_expr,
-                        )
-
                 logger.info(
                     _quest_log("wallet=%s partial step | %s->%s amount=%s"),
                     wallet,
