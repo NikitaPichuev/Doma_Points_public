@@ -187,6 +187,7 @@ DOMAIN_QUEST_TOKENS = [
     "fyi.xyz",
     "get.cash",
     "gobitcoin.xyz",
+    "gochujang.com",
     "hightech.xyz",
     "investors.xyz",
     "itprojects.ai",

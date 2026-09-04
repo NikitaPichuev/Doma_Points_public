@@ -27,13 +27,22 @@ from main import (
 
 
 class RiskLogicTests(unittest.TestCase):
-    @patch("builtins.input", side_effect=["29", "", "", "", "", "", ""])
+    @patch("builtins.input", side_effect=["30", "", "", "", "", "", ""])
     def test_smoothie_quest_uses_regular_buy_sell_volume_cycle(self, _input: Mock) -> None:
         picked = get_domain_quest_menu_input(Mock())
 
         self.assertEqual(
             picked,
             ("smoothie.com", "95", "99", "25", "USDC.E", "volume_only", "check_skip"),
+        )
+
+    @patch("builtins.input", side_effect=["16", "", "", "", "", "", ""])
+    def test_gochujang_quest_uses_regular_buy_sell_volume_cycle(self, _input: Mock) -> None:
+        picked = get_domain_quest_menu_input(Mock())
+
+        self.assertEqual(
+            picked,
+            ("gochujang.com", "95", "99", "25", "USDC.E", "volume_only", "check_skip"),
         )
 
     @patch("builtins.input", side_effect=["1", "3", "3", "2"])
