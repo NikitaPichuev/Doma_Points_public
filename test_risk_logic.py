@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import requests
 
+from doma_api import RetryingHTTPProvider
 from relay_bridge import _native_spendable_raw_with_usd_reserve, parse_amount_expr
 
 from main import (
@@ -27,6 +28,30 @@ from main import (
 
 
 class RiskLogicTests(unittest.TestCase):
+    @patch("doma_api.time.sleep")
+    def test_rpc_provider_retries_safe_read_on_timeout(self, sleep: Mock) -> None:
+        provider = RetryingHTTPProvider.__new__(RetryingHTTPProvider)
+        provider._make_request_once = Mock(
+            side_effect=[requests.ReadTimeout("slow"), {"jsonrpc": "2.0", "id": 1, "result": "0x1"}]
+        )
+
+        result = provider.make_request("eth_getBalance", ["0x0", "latest"])
+
+        self.assertEqual(result["result"], "0x1")
+        self.assertEqual(provider._make_request_once.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    @patch("doma_api.time.sleep")
+    def test_rpc_provider_does_not_retry_transaction_broadcast(self, sleep: Mock) -> None:
+        provider = RetryingHTTPProvider.__new__(RetryingHTTPProvider)
+        provider._make_request_once = Mock(side_effect=requests.ReadTimeout("uncertain broadcast"))
+
+        with self.assertRaises(requests.ReadTimeout):
+            provider.make_request("eth_sendRawTransaction", ["0xsigned"])
+
+        self.assertEqual(provider._make_request_once.call_count, 1)
+        sleep.assert_not_called()
+
     @patch("builtins.input", side_effect=["30", "", "", "", "", "", ""])
     def test_smoothie_quest_uses_regular_buy_sell_volume_cycle(self, _input: Mock) -> None:
         picked = get_domain_quest_menu_input(Mock())

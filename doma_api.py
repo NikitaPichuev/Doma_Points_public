@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from web3 import Web3
+from web3 import HTTPProvider, Web3
 
 
 getcontext().prec = 50
@@ -26,6 +26,40 @@ MAX_UINT48 = (1 << 48) - 1
 NATIVE_GAS_RESERVE_FALLBACK_ETH = Decimal("0.00002")
 DOMA_FRACTIONALIZATION_ADDRESS = "0xd00000000004f450f1438cfA436587d8f8A55A29"
 PROXY_DOMA_RECORD_ADDRESS = "0xd0000000000067CB44aE7b6aC3AB5764dE20A3E2"
+
+
+class RetryingHTTPProvider(HTTPProvider):
+    SAFE_RETRY_METHODS = {
+        "eth_blockNumber",
+        "eth_call",
+        "eth_chainId",
+        "eth_estimateGas",
+        "eth_gasPrice",
+        "eth_getBalance",
+        "eth_getCode",
+        "eth_getTransactionCount",
+        "eth_getTransactionReceipt",
+        "net_version",
+        "web3_clientVersion",
+    }
+
+    def _make_request_once(self, method: str, params: object):
+        return super().make_request(method, params)
+
+    def make_request(self, method: str, params: object):
+        attempts = 3 if method in self.SAFE_RETRY_METHODS else 1
+        last_exc: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                return self._make_request_once(method, params)
+            except Exception as exc:
+                last_exc = exc
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(1 + attempt)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"RPC request failed without an exception: {method}")
 
 
 ERC20_ABI = [
@@ -2404,7 +2438,7 @@ class EvmExecutionClient:
         request_kwargs: Dict[str, object] = {"timeout": 20}
         if request_proxies:
             request_kwargs["proxies"] = request_proxies
-        self.web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs=request_kwargs))
+        self.web3 = Web3(RetryingHTTPProvider(rpc_url, request_kwargs=request_kwargs))
         if not self.web3.is_connected():
             raise RuntimeError(f"RPC connection failed: {rpc_url}")
         self.chain_id = chain_id
