@@ -9919,17 +9919,67 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     )
 
 
+def _bonding_token_rejection_reason(info: Optional[LaunchpadTokenInfo], quote_token: Token) -> str:
+    if info is None:
+        return "exact-name metadata not found"
+    if not info.name.strip() or not info.address:
+        return "missing name/address"
+    if not info.launchpad_address:
+        return "launchpad missing"
+    if info.pool_address:
+        return f"already has pool={info.pool_address}"
+    if info.status.strip().upper() != "FRACTIONALIZED":
+        return f"status={info.status}"
+    if info.launch_start_time > time.time():
+        return f"launch not started: {info.launch_start_time}"
+    if not info.price_usd.is_finite() or info.price_usd <= 0:
+        return f"invalid price={info.price_usd}"
+    if info.quote_token_address.strip().lower() != quote_token.address.strip().lower():
+        return f"quote token mismatch: {info.quote_token_address}"
+    if info.name.strip().lower() in CHEAP_BUY_TOKEN_BLOCKLIST:
+        return "token is blocklisted"
+    return ""
+
+
 def _is_currently_bonding_token(info: LaunchpadTokenInfo, quote_token: Token) -> bool:
-    return bool(
-        info.name.strip()
-        and info.address
-        and info.launchpad_address
-        and not info.pool_address
-        and info.status.strip().upper() == "FRACTIONALIZED"
-        and info.price_usd > 0
-        and info.quote_token_address == quote_token.address.lower()
-        and info.name.strip().lower() not in CHEAP_BUY_TOKEN_BLOCKLIST
-    )
+    return not _bonding_token_rejection_reason(info, quote_token)
+
+
+def _analyze_active_bonding_tokens(api: DomaApiClient, quote_token: Token,
+                                   logger: logging.Logger) -> List[LaunchpadTokenInfo]:
+    # Never reuse the previous run's selection or trust catalog metadata alone.
+    catalog = api.fetch_fractional_tokens(take=100, max_pages=100, bonding_only=True)
+    active: List[LaunchpadTokenInfo] = []
+    seen: set[str] = set()
+    for candidate in catalog:
+        name = candidate.name.strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        reason = _bonding_token_rejection_reason(candidate, quote_token)
+        if reason:
+            logger.info("[BONDING_DAILY] analysis rejected %s | %s", name, reason)
+            continue
+        try:
+            current = api.fetch_fractional_token_by_name(name)
+        except Exception as exc:
+            logger.warning("[BONDING_DAILY] analysis could not verify %s | %s", name, exc)
+            continue
+        reason = _bonding_token_rejection_reason(current, quote_token)
+        if not reason and (current.name.strip().lower() != name or
+                           current.address.lower() != candidate.address.lower()):
+            reason = "token identity changed between catalog and detail lookup"
+        if reason:
+            logger.warning("[BONDING_DAILY] analysis rejected %s after refresh | %s", name, reason)
+            continue
+        if not current.tvl_usd.is_finite() or not current.volume_usd.is_finite():
+            logger.warning("[BONDING_DAILY] analysis rejected %s | invalid TVL/volume", name)
+            continue
+        active.append(current)
+    active.sort(key=lambda info: (info.tvl_usd, info.volume_usd, info.price_usd), reverse=True)
+    logger.info("[BONDING_DAILY] fresh analysis complete | catalog=%s | verified_active=%s",
+                len(catalog), len(active))
+    return active
 
 
 def _is_launchpad_sellable_token(info: LaunchpadTokenInfo, quote_token: Token) -> bool:
@@ -10265,14 +10315,17 @@ def run_bonding_token_buy_once(
             raise RuntimeError(f"{specific_domain} is not sellable through launchpad")
         candidates = [selected_candidate]
     else:
-        catalog = _fetch_fractional_tokens_with_same_proxy_retry(
-            shared_api,
-            logger,
-            mode_tag,
-            take=100,
-            max_pages=10,
-        )
-        candidates = [info for info in catalog if _is_currently_bonding_token(info, quote_token)]
+        if selection == "daily_quest":
+            candidates = _analyze_active_bonding_tokens(shared_api, quote_token, logger)
+        else:
+            catalog = _fetch_fractional_tokens_with_same_proxy_retry(
+                shared_api,
+                logger,
+                mode_tag,
+                take=100,
+                max_pages=10,
+            )
+            candidates = [info for info in catalog if _is_currently_bonding_token(info, quote_token)]
         if not candidates:
             raise RuntimeError("No active bonding tokens found (status=FRACTIONALIZED, launchpad present, pool absent)")
         if selection == "daily_quest":
@@ -10506,6 +10559,20 @@ def run_bonding_token_buy_once(
                 proxies=proxies,
             )
             current = doma_api.fetch_fractional_token_by_name(selected_candidate.name)
+            if selection == "daily_quest" and not _is_currently_bonding_token(current, quote_token):
+                logger.warning("[BONDING_DAILY] selected token %s rejected | %s | refreshing catalog",
+                               selected_candidate.name, _bonding_token_rejection_reason(current, quote_token))
+                candidates = _analyze_active_bonding_tokens(doma_api, quote_token, logger)
+                if not candidates:
+                    remaining = len(wallet_records) - position + 1
+                    skipped_wallets += remaining
+                    failed_entries.append(f"stopped batch: no verified active bonding tokens; skipped={remaining}")
+                    logger.warning("[BONDING_DAILY] no verified active tokens; stopping before funding or buying")
+                    break
+                selected_candidate = _select_bonding_token_by_tvl(candidates)
+                current = selected_candidate
+                logger.info("[BONDING_DAILY] replacement selected | token=%s | tvl=$%s",
+                            current.name, current.tvl_usd)
             token_ok = _is_launchpad_sellable_token(current, quote_token) if (current and action == "sell") else (current is not None and _is_currently_bonding_token(current, quote_token))
             if current is None or not token_ok:
                 skipped_wallets += 1

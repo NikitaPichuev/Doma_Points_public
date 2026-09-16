@@ -514,6 +514,7 @@ class LaunchpadTokenInfo:
     bonding_curve_model_impl: str
     initial_price: Decimal
     final_price: Decimal
+    launch_start_time: int = 0
 
 
 @dataclass
@@ -1141,21 +1142,23 @@ class DomaApiClient:
                 bondingCurveModelImpl
                 initialPrice
                 finalPrice
+                launchStartTime
               }
             }
           }
         }
         """
-        data = self._post(
-            query,
-            {
-                "name": name.strip().lower(),
-                "take": 5,
-                "sortBy": "FDV",
-                "sortOrder": "DESC",
-            },
-        )
-        items = data.get("fractionalTokens", {}).get("items", [])
+        items = []
+        for page in range(100):
+            data = self._post(query, {"name": name.strip().lower(), "skip": page * 100,
+                                     "take": 100, "sortBy": "FDV", "sortOrder": "DESC"})
+            items = data.get("fractionalTokens", {}).get("items", [])
+            if any(str(item.get("name") or "").strip().lower() == name.strip().lower() for item in items):
+                break
+            if len(items) < 100:
+                return None
+        else:
+            raise RuntimeError(f"Exact-name lookup pagination limit reached for {name}")
         exact_name = name.strip().lower()
         for item in items:
             if str(item.get("name") or "").strip().lower() != exact_name:
@@ -1181,6 +1184,7 @@ class DomaApiClient:
                 bonding_curve_model_impl=str(params.get("bondingCurveModelImpl") or "").lower(),
                 initial_price=Decimal(str(params.get("initialPrice") or "0")),
                 final_price=Decimal(str(params.get("finalPrice") or "0")),
+                launch_start_time=int(params.get("launchStartTime") or 0),
             )
         return None
 
@@ -2275,7 +2279,7 @@ class DomaApiClient:
                 break
         return out
 
-    def fetch_fractional_tokens(self, take: int = 250, max_pages: int = 10) -> List[LaunchpadTokenInfo]:
+    def fetch_fractional_tokens(self, take: int = 250, max_pages: int = 10, bonding_only: bool = False) -> List[LaunchpadTokenInfo]:
         query = """
         query FractionalTokens(
           $status: FractionalTokenStatus
@@ -2314,6 +2318,7 @@ class DomaApiClient:
                 bondingCurveModelImpl
                 initialPrice
                 finalPrice
+                launchStartTime
               }
             }
           }
@@ -2329,6 +2334,7 @@ class DomaApiClient:
                     "take": take,
                     "sortBy": "FDV",
                     "sortOrder": "DESC",
+                    **({"status": "FRACTIONALIZED"} if bonding_only else {}),
                 },
             )
             items = data.get("fractionalTokens", {}).get("items", [])
@@ -2358,10 +2364,14 @@ class DomaApiClient:
                         bonding_curve_model_impl=str(params.get("bondingCurveModelImpl") or "").strip().lower(),
                         initial_price=Decimal(str(params.get("initialPrice") or "0")),
                         final_price=Decimal(str(params.get("finalPrice") or "0")),
+                        launch_start_time=int(params.get("launchStartTime") or 0),
                     )
                 )
             if len(items) < take:
                 break
+        else:
+            if bonding_only:
+                raise RuntimeError("Bonding catalog pagination limit reached; refusing partial analysis")
         return out
 
     def fetch_universal_router_quote(

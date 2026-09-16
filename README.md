@@ -580,6 +580,14 @@ git status --short
 git diff --cached
 ```
 
+## Bonding: Fresh Selection (Menu 26)
+
+- Every launch downloads the active bonding catalog again and verifies candidates by exact domain name.
+- Selection uses refreshed TVL; missing, not-yet-started, migrated, or invalid candidates are excluded with a logged reason.
+- If the selected token becomes inactive before a wallet starts, the bot repeats the analysis and selects a verified replacement.
+- If none remain, the batch stops before funding or buying. A token is not replaced midway through a wallet's volume loop.
+- Offline regression tests: `python -m unittest test_bonding_refresh -v` (no wallet access or transactions).
+
 ## Disclaimer
 
 Проект предоставляется как есть. Вы сами отвечаете за приватные ключи, транзакции, комиссии, выставленные цены, offers, торговые решения и последствия использования бота.
