@@ -44,6 +44,7 @@ class DepositTests(unittest.TestCase):
             _wallet_record_progress_label=Mock(return_value="test"), _append_exchange_deposit_csv=Mock(),
             _format_decimal_plain=str, decimal_to_raw=lambda amount, decimals: int(amount * 10 ** decimals),
             _print_mode_summary=Mock(), input=Mock(side_effect=["1", "1", "BASE"]))
+        self.ns["_fetch_deposit_native_price_usd"] = Mock(return_value=Decimal("2000"))
 
     def run_deposit(self):
         self.ns["run_exchange_deposit_once"](self.cfg, Mock(), NS(), okx_deposit_file=self.path)
@@ -106,6 +107,59 @@ class DepositTests(unittest.TestCase):
         self.client.get_native_balance.return_value = Decimal("0.00001")
         self.run_deposit()
         self.client.send_native.assert_not_called()
+
+    def test_deposit_usd_boundary(self):
+        for amount, sent in (("0.0000000000000000001", False), ("0.00049999999", False), ("0.0005", True), ("0.00050001", True)):
+            self.client.send_native.reset_mock()
+            self.setUpInputs(amount=amount)
+            self.run_deposit()
+            self.assertEqual(self.client.send_native.called, sent)
+            if not sent:
+                self.assertEqual(self.ns["_append_exchange_deposit_csv"].call_args.args[1], "skipped")
+                self.assertEqual(self.ns["_print_mode_summary"].call_args.args[4], 2)
+
+    def test_gas_reserve_reduces_balance_below_dollar(self):
+        self.client.get_native_balance.return_value = Decimal("0.00051")
+        self.setUpInputs(mode="3", amount="100")
+        self.run_deposit()
+        self.client.send_native.assert_not_called()
+        self.assertEqual(self.ns["_append_exchange_deposit_csv"].call_args.args[1], "skipped")
+
+    def test_price_failure_skips_without_guessing(self):
+        self.ns["_fetch_deposit_native_price_usd"].side_effect = RuntimeError("price unavailable")
+        self.run_deposit()
+        self.client.send_native.assert_not_called()
+        self.assertEqual(self.ns["_print_mode_summary"].call_args.args[4], 2)
+
+    def test_price_is_refreshed_for_each_wallet(self):
+        self.ns["_fetch_deposit_native_price_usd"].side_effect = [Decimal("2000"), Decimal("1900")]
+        self.setUpInputs(amount="0.0005")
+        self.run_deposit()
+        self.client.send_native.assert_called_once_with(B, 500000000000000)
+
+    def test_mantle_uses_mnt_price(self):
+        self.ns["input"] = Mock(side_effect=["5", "1", "MANTLE"])
+        self.ns["_fetch_deposit_native_price_usd"].return_value = Decimal("0.5")
+        self.run_deposit()
+        self.ns["_fetch_deposit_native_price_usd"].assert_called_with("MNT", None)
+        self.client.send_native.assert_not_called()
+
+    def test_price_response_validation(self):
+        tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_fetch_deposit_native_price_usd")
+        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), node], type_ignores=[])
+        requests = Mock()
+        ns = dict(Decimal=Decimal, requests=requests)
+        exec(compile(ast.fix_missing_locations(module), "main.py", "exec"), ns)
+        fetch = ns["_fetch_deposit_native_price_usd"]
+        for price in ("0", "-1", "NaN", "Infinity", "bad"):
+            requests.get.return_value.json.return_value = {"data": {"currency": "ETH", "rates": {"USD": price}}}
+            with self.assertRaises(Exception):
+                fetch("ETH")
+        requests.get.return_value.json.return_value = {"data": {"currency": "MNT", "rates": {"USD": "0.5"}}}
+        self.assertEqual(fetch("MNT"), Decimal("0.5"))
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            fetch("ETH")
 
     def test_source_file_line_mismatch_blocks_batch(self):
         self.cfg.wallets_file.write_text("\n" + W1 + "\n" + W2)

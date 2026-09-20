@@ -3910,6 +3910,23 @@ def _append_exchange_deposit_csv(
     )
 
 
+def _fetch_deposit_native_price_usd(symbol: str, proxies: Optional[Dict[str, str]] = None) -> Decimal:
+    if symbol not in {"ETH", "MNT"}:
+        raise ValueError(f"Unsupported deposit asset: {symbol}")
+    response = requests.get(
+        "https://api.coinbase.com/v2/exchange-rates",
+        params={"currency": symbol}, timeout=15, proxies=proxies,
+    )
+    response.raise_for_status()
+    data = response.json().get("data") or {}
+    if str(data.get("currency") or "").upper() != symbol:
+        raise ValueError("Deposit price response currency mismatch")
+    price = Decimal(str((data.get("rates") or {}).get("USD") or "0"))
+    if not price.is_finite() or price <= 0:
+        raise ValueError(f"Invalid {symbol}/USD price")
+    return price
+
+
 def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: BotState,
                               okx_deposit_file: Optional[Path] = None) -> None:
     _ = state
@@ -4002,6 +4019,7 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     success = 0
     failed = 0
     planned = 0
+    skipped = 0
     failed_wallets: List[str] = []
     for order_idx, (wallet_idx, wallet, private_key) in enumerate(selected):
         wallet_number = wallet_idx + 1
@@ -4039,20 +4057,41 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             )
             balance = exec_client.get_native_balance()
             spendable = max(Decimal("0"), balance - native_reserve)
+            try:
+                price_usd = _fetch_deposit_native_price_usd(symbol, proxies)
+            except Exception as exc:
+                skipped += 1
+                reason = f"cannot verify $1 deposit minimum: {exc}"
+                logger.warning("[EXCHANGE_DEPOSIT] wallet#%s skipped | %s", wallet_number, reason)
+                _append_exchange_deposit_csv(cfg, "skipped", wallet_idx, deposit_address, chain_label, symbol, Decimal("0"), "", reason)
+                continue
+            if spendable * price_usd < Decimal("1"):
+                skipped += 1
+                reason = f"spendable balance after gas reserve ${spendable * price_usd:.6f} < $1"
+                logger.info("[EXCHANGE_DEPOSIT] wallet#%s skipped | %s", wallet_number, reason)
+                _append_exchange_deposit_csv(cfg, "skipped", wallet_idx, deposit_address, chain_label, symbol, Decimal("0"), "", reason)
+                continue
             if amount_mode == "2":
                 amount = _random_okx_decimal_between(min_amount, max_amount)
             elif amount_mode == "3":
                 amount = (spendable * percent_amount / Decimal("100")).quantize(Decimal("0.00000001"))
             else:
                 amount = fixed_amount
-            if not amount.is_finite() or amount <= 0 or amount > spendable:
+            if not amount.is_finite() or amount < 0 or amount > spendable:
                 raise RuntimeError(
                     f"insufficient spendable balance: amount={_format_decimal_plain(amount)} {symbol}, "
                     f"spendable={_format_decimal_plain(spendable)} {symbol}, reserve={_format_decimal_plain(native_reserve)} {symbol}"
                 )
             amount_raw = decimal_to_raw(amount, 18)
-            if amount_raw <= 0:
-                raise ValueError("Deposit amount rounds to zero")
+            # Check the actual transfer value after conversion to integer base units.
+            amount = Decimal(amount_raw) / Decimal(10**18)
+            deposit_usd = amount * price_usd
+            if deposit_usd < Decimal("1"):
+                skipped += 1
+                reason = f"deposit amount ${deposit_usd:.6f} < $1"
+                logger.info("[EXCHANGE_DEPOSIT] wallet#%s skipped | %s", wallet_number, reason)
+                _append_exchange_deposit_csv(cfg, "skipped", wallet_idx, deposit_address, chain_label, symbol, amount, "", reason)
+                continue
             logger.info(
                 "[EXCHANGE_DEPOSIT] wallet#%s | to=%s | %s %s on %s",
                 wallet_number,
@@ -4080,7 +4119,7 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             logger.info("[EXCHANGE_DEPOSIT] delay before next wallet: %.2f sec", delay_sec)
             time.sleep(delay_sec)
 
-    _print_mode_summary("EXCHANGE_DEPOSIT", len(selected), success, failed, planned, failed_wallets)
+    _print_mode_summary("EXCHANGE_DEPOSIT", len(selected), success, failed, skipped + planned, failed_wallets)
 
 
 def _volume_added_from_usdc_balance_change(before_usdc: Decimal, after_usdc: Decimal, input_symbol: str) -> Decimal:
