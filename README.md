@@ -609,8 +609,8 @@ balance after the gas reserve or its actual transfer amount is below $1.
 Exactly $1 is allowed at the fetched price. ETH/MNT prices are refreshed for
 each wallet; unavailable or invalid prices cause a skip, never an assumed price.
 This local floor does not replace OKX's asset/network-specific minimum.
-The bot displays destination mappings and requires confirmation of
-the deposit network. Check deposit availability, minimum amount and addresses
+The bot displays destination mappings and proceeds without an additional
+deposit-network confirmation. Check deposit availability, minimum amount and addresses
 in OKX yourself; an EVM address alone cannot prove the intended network or
 exchange ownership. Only the network's native asset is supported (ETH on Base,
 not USDC or WETH). OKX API credentials are not needed for deposits.

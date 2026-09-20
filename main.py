@@ -4000,10 +4000,6 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         print("Поддерживаются только нативные монеты сети (в Base: ETH, не USDC/WETH).")
         for line_idx, _, _ in selected:
             print(f"wallet#{line_idx + 1} -> {deposit_addresses[line_idx]}")
-        confirmation = input(f"Для подтверждения сети депозита введите {network_name.upper()} (Enter = отмена): ").strip()
-        if confirmation.upper() != network_name.upper():
-            logger.info("[EXCHANGE_DEPOSIT] OKX deposit canceled; no transfers sent")
-            return
 
     logger.info(
         "[EXCHANGE_DEPOSIT] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | network=%s | symbol=%s | deposit_addresses=%s",

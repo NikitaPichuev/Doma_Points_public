@@ -43,7 +43,7 @@ class DepositTests(unittest.TestCase):
             _proxy_for_line=Mock(return_value=(None, False)), _build_exec_client_for_chain_rpcs=Mock(return_value=self.client),
             _wallet_record_progress_label=Mock(return_value="test"), _append_exchange_deposit_csv=Mock(),
             _format_decimal_plain=str, decimal_to_raw=lambda amount, decimals: int(amount * 10 ** decimals),
-            _print_mode_summary=Mock(), input=Mock(side_effect=["1", "1", "BASE"]))
+            _print_mode_summary=Mock(), input=Mock(side_effect=["1", "1"]))
         self.ns["_fetch_deposit_native_price_usd"] = Mock(return_value=Decimal("2000"))
 
     def run_deposit(self):
@@ -79,14 +79,13 @@ class DepositTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.ns["_validate_okx_deposit_mapping"]([address], self.records[:1])
 
-    def test_cancel_or_wrong_network_sends_nothing(self):
-        for answer in ("", "ARBITRUM"):
-            self.setUpInputs(answer)
-            self.run_deposit()
-        self.ns["_build_exec_client_for_chain_rpcs"].assert_not_called()
+    def test_deposit_needs_no_extra_network_confirmation(self):
+        self.run_deposit()
+        self.assertEqual(self.ns["input"].call_count, 2)
+        self.assertEqual(self.client.send_native.call_count, 2)
 
-    def setUpInputs(self, answer="BASE", mode="1", amount="0.1"):
-        self.ns["input"] = Mock(side_effect=["1", mode, answer])
+    def setUpInputs(self, mode="1", amount="0.1"):
+        self.ns["input"] = Mock(side_effect=["1", mode])
         self.ns["_prompt_positive_decimal"] = Mock(side_effect=[Decimal(amount), Decimal("1"), Decimal("1")])
 
     def test_execution_switches_never_broadcast(self):
@@ -138,7 +137,7 @@ class DepositTests(unittest.TestCase):
         self.client.send_native.assert_called_once_with(B, 500000000000000)
 
     def test_mantle_uses_mnt_price(self):
-        self.ns["input"] = Mock(side_effect=["5", "1", "MANTLE"])
+        self.ns["input"] = Mock(side_effect=["5", "1"])
         self.ns["_fetch_deposit_native_price_usd"].return_value = Decimal("0.5")
         self.run_deposit()
         self.ns["_fetch_deposit_native_price_usd"].assert_called_with("MNT", None)
