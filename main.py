@@ -3836,6 +3836,38 @@ def run_okx_withdrawals_once(cfg: BotConfig, logger: logging.Logger, state: BotS
     _print_mode_summary("OKX_WITHDRAW", len(selected), success, failed, 0, failed_addresses)
 
 
+def run_okx_transfers_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    print("\nOKX: вывод и депозит")
+    print("1) Вывести с OKX на кошельки")
+    print("2) Отправить с кошельков на OKX (в той же сети)")
+    print("3) Назад")
+    choice = input("Выберите [1-3]: ").strip()
+    if choice == "1":
+        run_okx_withdrawals_once(cfg, logger, state)
+    elif choice == "2":
+        run_exchange_deposit_once(cfg, logger, state, okx_deposit_file=cfg.okx_deposit_addresses_file)
+    elif choice != "3":
+        raise ValueError("Invalid OKX action")
+
+
+def _load_okx_deposit_addresses(path: Path) -> List[str]:
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=False)
+    # Physical line numbers match wallets.txt, including empty/comment-only slots.
+    return [line.split("#", 1)[0].strip().lower()
+            for line in path.read_text(encoding="utf-8-sig").splitlines()]
+
+
+def _validate_okx_deposit_mapping(addresses: List[str], records: List[Tuple[int, str, str]]) -> None:
+    for line_idx, wallet, _ in records:
+        address = addresses[line_idx] if 0 <= line_idx < len(addresses) else ""
+        if not _is_valid_evm_address(address) or int(address, 16) == 0:
+            raise ValueError(f"Missing/invalid OKX deposit address on line {line_idx + 1}; no transfers sent")
+        if address.lower() == wallet.lower():
+            raise ValueError(f"OKX deposit address equals source wallet on line {line_idx + 1}; no transfers sent")
+
+
 def _load_exchange_deposit_addresses(cfg: BotConfig) -> List[str]:
     return [line.split(";", 1)[0].split(",", 1)[0].strip().lower() for line in _read_nonempty_lines(cfg.exchange_deposit_addresses_file)]
 
@@ -3878,14 +3910,16 @@ def _append_exchange_deposit_csv(
     )
 
 
-def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: BotState,
+                              okx_deposit_file: Optional[Path] = None) -> None:
     _ = state
     wallet_key_records = _build_wallet_key_records(cfg, logger, "EXCHANGE_DEPOSIT")
     if not wallet_key_records:
         raise RuntimeError("No wallets with private keys found")
-    deposit_addresses = _load_exchange_deposit_addresses(cfg)
+    deposit_addresses = (_load_okx_deposit_addresses(okx_deposit_file) if okx_deposit_file is not None
+                         else _load_exchange_deposit_addresses(cfg))
     if not any(_is_valid_evm_address(address) for address in deposit_addresses):
-        raise RuntimeError(f"No valid EVM deposit addresses found in {cfg.exchange_deposit_addresses_file}")
+        raise RuntimeError(f"No valid EVM deposit addresses found in {okx_deposit_file or cfg.exchange_deposit_addresses_file}")
 
     networks = _l2_deposit_networks()
     print("\nDeposit to exchange from L2:")
@@ -3902,6 +3936,8 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     print("2) Random amount from min/max")
     print("3) Percent of spendable balance")
     amount_mode = input("Select [1-3, default 1]: ").strip() or "1"
+    if amount_mode not in {"1", "2", "3"}:
+        raise ValueError("Invalid amount mode")
     if amount_mode == "2":
         min_amount = _prompt_positive_decimal(f"Minimum amount per wallet {symbol}")
         max_amount = _prompt_positive_decimal(f"Maximum amount per wallet {symbol}")
@@ -3932,6 +3968,26 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     order = _prompt_wallet_order(default_random=True)
     selected = _apply_wallet_order(wallet_key_records[start_number - 1 : end_number], order)
 
+    if okx_deposit_file is not None:
+        _validate_okx_deposit_mapping(deposit_addresses, selected)
+        if cfg.wallets_file.exists():
+            source_lines = cfg.wallets_file.read_text(encoding="utf-8-sig").splitlines()
+            for line_idx, wallet, _ in selected:
+                source = source_lines[line_idx].strip().lower() if line_idx < len(source_lines) else ""
+                if source != wallet.lower():
+                    raise ValueError(f"wallets.txt line {line_idx + 1} does not match wallet numbering; remove blank/comment/invalid lines before depositing")
+        network_name = chain_label.split("|", 1)[0].strip()
+        print(f"\nOKX: {symbol}, {network_name} -> {network_name}; chain_id={chain_id}. Без бриджа.")
+        print(f"Адреса: {okx_deposit_file.resolve()}")
+        print("Проверьте в OKX: депозит этого актива в выбранной сети доступен, адреса верны, сумма не ниже минимума.")
+        print("Поддерживаются только нативные монеты сети (в Base: ETH, не USDC/WETH).")
+        for line_idx, _, _ in selected:
+            print(f"wallet#{line_idx + 1} -> {deposit_addresses[line_idx]}")
+        confirmation = input(f"Для подтверждения сети депозита введите {network_name.upper()} (Enter = отмена): ").strip()
+        if confirmation.upper() != network_name.upper():
+            logger.info("[EXCHANGE_DEPOSIT] OKX deposit canceled; no transfers sent")
+            return
+
     logger.info(
         "[EXCHANGE_DEPOSIT] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | order=%s | network=%s | symbol=%s | deposit_addresses=%s",
         len(wallet_key_records),
@@ -3945,6 +4001,7 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
 
     success = 0
     failed = 0
+    planned = 0
     failed_wallets: List[str] = []
     for order_idx, (wallet_idx, wallet, private_key) in enumerate(selected):
         wallet_number = wallet_idx + 1
@@ -3952,7 +4009,8 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             "[EXCHANGE_DEPOSIT] wallet %s",
             _wallet_record_progress_label(order_idx, len(selected), wallet_idx, len(wallet_key_records), wallet),
         )
-        deposit_address = _deposit_address_for_wallet(deposit_addresses, wallet_idx)
+        deposit_address = (deposit_addresses[wallet_idx] if okx_deposit_file is not None
+                           else _deposit_address_for_wallet(deposit_addresses, wallet_idx))
         if not _is_valid_evm_address(deposit_address):
             failed += 1
             failed_wallets.append(wallet)
@@ -3987,12 +4045,14 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 amount = (spendable * percent_amount / Decimal("100")).quantize(Decimal("0.00000001"))
             else:
                 amount = fixed_amount
-            if amount <= 0 or amount > spendable:
+            if not amount.is_finite() or amount <= 0 or amount > spendable:
                 raise RuntimeError(
                     f"insufficient spendable balance: amount={_format_decimal_plain(amount)} {symbol}, "
                     f"spendable={_format_decimal_plain(spendable)} {symbol}, reserve={_format_decimal_plain(native_reserve)} {symbol}"
                 )
             amount_raw = decimal_to_raw(amount, 18)
+            if amount_raw <= 0:
+                raise ValueError("Deposit amount rounds to zero")
             logger.info(
                 "[EXCHANGE_DEPOSIT] wallet#%s | to=%s | %s %s on %s",
                 wallet_number,
@@ -4001,6 +4061,11 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 symbol,
                 chain_label,
             )
+            if cfg.dry_run or cfg.paper_mode or not cfg.enable_execution:
+                logger.info("[EXCHANGE_DEPOSIT] DRY/PAPER: planned only, no transfer sent")
+                _append_exchange_deposit_csv(cfg, "planned", wallet_idx, deposit_address, chain_label, symbol, amount, "", "execution disabled")
+                planned += 1
+                continue
             tx_hash = exec_client.send_native(deposit_address, amount_raw)
             logger.info("[EXCHANGE_DEPOSIT] wallet %s tx sent: %s", wallet_number, tx_hash)
             _append_exchange_deposit_csv(cfg, "sent", wallet_idx, deposit_address, chain_label, symbol, amount, tx_hash, "")
@@ -4015,7 +4080,7 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             logger.info("[EXCHANGE_DEPOSIT] delay before next wallet: %.2f sec", delay_sec)
             time.sleep(delay_sec)
 
-    _print_mode_summary("EXCHANGE_DEPOSIT", len(selected), success, failed, 0, failed_wallets)
+    _print_mode_summary("EXCHANGE_DEPOSIT", len(selected), success, failed, planned, failed_wallets)
 
 
 def _volume_added_from_usdc_balance_change(before_usdc: Decimal, after_usdc: Decimal, input_symbol: str) -> Decimal:
@@ -14584,7 +14649,7 @@ def get_menu_choice() -> str:
     print("16) Набить недельный объем ETH / USDC.E")
     print("17) Дейлик - свапнуть токены доменов на $1+")
     print("18) Закрыть стейкинг субдоменов")
-    print("19) Вывести средства с OKX на кошельки")
+    print("19) OKX: вывод на кошельки / депозит с кошельков")
     print("20) Отправить средства на биржу из L2 сетей")
     print("21) Купить самые дешевые домены")
     print("22) Забрать ежедневные 100 поинтов")
@@ -15045,9 +15110,9 @@ def main() -> None:
             return
         if choice == "19":
             try:
-                run_okx_withdrawals_once(cfg, logger, state)
+                run_okx_transfers_once(cfg, logger, state)
             except Exception as exc:
-                logger.exception("OKX withdrawal mode failed: %s", exc)
+                logger.exception("OKX transfer mode failed: %s", exc)
                 if sys.stdin.isatty():
                     input("\nPress Enter to return to menu...")
             return

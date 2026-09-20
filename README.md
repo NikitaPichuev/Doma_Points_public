@@ -588,6 +588,32 @@ git diff --cached
 - If none remain, the batch stops before funding or buying. A token is not replaced midway through a wallet's volume loop.
 - Offline regression tests: `python -m unittest test_bonding_refresh -v` (no wallet access or transactions).
 
+## OKX: Menu 19
+
+Menu 19 offers both OKX withdrawals and wallet-to-OKX deposits. Select `19 -> 2`
+for deposits, then choose the source network (`1` for Base / native ETH).
+This is a same-chain transfer, not a bridge or token swap: Base ETH goes to
+an OKX ETH deposit address configured for Base.
+
+Fill `okx_deposit_addresses.txt` with one address per wallet in the same order
+as `wallets.txt`. The file is created empty if missing and is excluded from Git.
+Override its location with `OKX_DEPOSIT_ADDRESSES_FILE` if needed.
+Do not add a header. Empty/comment-only lines occupy a slot and selected empty
+slots block the entire batch before sending. One address is not automatically
+shared by all wallets; repeat a shared address on each corresponding line.
+Keep `wallets.txt` free of blank/comment/invalid lines to preserve numbering.
+
+Choose a fixed amount, random range, or percent of the balance after the gas
+reserve. The bot displays destination mappings and requires confirmation of
+the deposit network. Check deposit availability, minimum amount and addresses
+in OKX yourself; an EVM address alone cannot prove the intended network or
+exchange ownership. Only the network's native asset is supported (ETH on Base,
+not USDC or WETH). OKX API credentials are not needed for deposits.
+Dry/paper mode never broadcasts deposits. CSV status `sent` means broadcast,
+not confirmation that OKX credited the account. Menu 20 remains available.
+
+Offline tests: `python -m unittest test_okx_deposits -v`.
+
 ## Disclaimer
 
 Проект предоставляется как есть. Вы сами отвечаете за приватные ключи, транзакции, комиссии, выставленные цены, offers, торговые решения и последствия использования бота.

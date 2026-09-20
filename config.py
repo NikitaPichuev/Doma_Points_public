@@ -94,6 +94,7 @@ class BotConfig:
     replay_csv_file: Path = Path(os.getenv("REPLAY_CSV_FILE", "reports/trades.csv"))
     okx_withdraw_addresses_file: Path = Path(os.getenv("OKX_WITHDRAW_ADDRESSES_FILE", os.getenv("WALLETS_FILE", "wallets.txt")))
     exchange_deposit_addresses_file: Path = Path(os.getenv("EXCHANGE_DEPOSIT_ADDRESSES_FILE", "exchange_deposit_addresses.txt"))
+    okx_deposit_addresses_file: Path = Path(os.getenv("OKX_DEPOSIT_ADDRESSES_FILE", "okx_deposit_addresses.txt"))
     privy_access_tokens_file: Path = Path(os.getenv("PRIVY_ACCESS_TOKENS_FILE", "privy_access_tokens.txt"))
     privy_refresh_tokens_file: Path = Path(os.getenv("PRIVY_REFRESH_TOKENS_FILE", "privy_refresh_tokens.txt"))
     sweep_token_exclusions_file: Path = Path(

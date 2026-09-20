@@ -1,0 +1,8 @@
+# Use okx_deposit_addresses.txt for actual addresses, WITHOUT this header.
+# One OKX EVM deposit address per wallet, in the same order as wallets.txt.
+# Line 1 -> wallet 1; line 2 -> wallet 2, etc.
+# Empty/comment-only lines occupy a wallet slot; they are NOT removed.
+# A single address is NOT automatically reused for all wallets.
+# For a shared destination, repeat the address on each wallet's line.
+# Select the SAME asset/network in OKX and the bot (Base -> Base, ETH).
+# Never put private keys here. Actual addresses are ignored by Git.
