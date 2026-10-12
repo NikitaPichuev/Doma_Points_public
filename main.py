@@ -6305,14 +6305,13 @@ def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str, str]
 
 
 def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str, str, str]]:
-    print("\nBuy cheap domain tokens and claim subdomains:")
+    print("\nStake a subdomain: existing token balances first, small buy only as fallback.")
     max_price_raw = input("Maximum token price USD [0.01]: ").strip() or "0.01"
     buy_amount_min_raw = input("Minimum USDC.E amount per buy [0.01]: ").strip() or "0.01"
     buy_amount_max_raw = input("Maximum USDC.E amount per buy [0.01]: ").strip() or "0.01"
-    tokens_min_raw = input("Minimum tokens to buy per wallet [1]: ").strip() or "1"
-    tokens_max_raw = input("Maximum tokens to buy per wallet [1]: ").strip() or "1"
-    subdomains_min_raw = input("Minimum subdomains to claim per token [1]: ").strip() or "1"
-    subdomains_max_raw = input("Maximum subdomains to claim per token [1]: ").strip() or "1"
+    tokens_min_raw = input("Minimum fallback token attempts per wallet [1]: ").strip() or "1"
+    tokens_max_raw = input("Maximum fallback token attempts per wallet [1]: ").strip() or "1"
+    subdomains_min_raw = subdomains_max_raw = "1"
     delay_min_raw = input(f"Minimum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MIN_SEC}]: ").strip()
     delay_max_raw = input(f"Maximum delay between buys sec [{DOMAIN_LISTING_DEFAULT_DELAY_MAX_SEC}]: ").strip()
     if not delay_min_raw:
@@ -9143,8 +9142,14 @@ def _claim_subdomains_for_domain_token(
     delay_min: Decimal,
     delay_max: Decimal,
     max_claims: Optional[int] = None,
+    allow_topup: bool = True,
 ) -> Tuple[int, int]:
+    if cfg.dry_run or cfg.paper_mode or not cfg.enable_execution:
+        logger.info("[CHEAP_BUY] DRY/PAPER: subdomain staking disabled; no transactions sent")
+        return 0, 0
     prices_raw = exec_client.get_subdomain_staking_prices(domain_token.address)
+    if not prices_raw:
+        return 0, 0
     subdomains_to_claim = random.randint(subdomains_min_per_token, subdomains_max_per_token)
     if max_claims is not None:
         subdomains_to_claim = min(subdomains_to_claim, max(0, max_claims))
@@ -9155,9 +9160,16 @@ def _claim_subdomains_for_domain_token(
     failed_count = 0
     for sub_idx in range(1, subdomains_to_claim + 1):
         token_balance = exec_client.get_erc20_balance(domain_token.address, domain_token.decimals)
-        label_length = random.randint(20, 40)
-        label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
-        required_amount = _subdomain_staking_amount_for_length(prices_raw, domain_token.decimals, len(label))
+        label, required_amount = _pick_affordable_subdomain_label(
+            exec_client, domain_token.address, prices_raw, domain_token.decimals, token_balance,
+        )
+        if label is None:
+            if not allow_topup:
+                logger.info("[CHEAP_BUY] wallet=%s token=%s no affordable available subdomain; no swap", wallet, domain_token.symbol)
+                break
+            label_length = random.randint(20, 40)
+            label = _pick_available_subdomain_label(exec_client, domain_token.address, label_length)
+            required_amount = _subdomain_staking_amount_for_length(prices_raw, domain_token.decimals, len(label))
         if token_balance < required_amount:
             if not _top_up_domain_token_for_subdomain(
                 cfg,
@@ -9215,6 +9227,9 @@ def _claim_subdomains_for_domain_token(
                 logger.info("[CHEAP_BUY] wallet=%s subdomain DNS save tx sent: %s", wallet, dns_hash)
             success_count += 1
         except Exception as exc:
+            if "tx=" in str(exc):
+                # A submitted stake may still confirm: never buy/stake again blindly.
+                raise
             failed_count += 1
             logger.warning("[CHEAP_BUY] wallet=%s token=%s subdomain claim/save failed: %s", wallet, domain_token.symbol, exc)
         if sub_idx < subdomains_to_claim:
@@ -9222,6 +9237,50 @@ def _claim_subdomains_for_domain_token(
             logger.info("[CHEAP_BUY] delay before next subdomain: %.2f sec", delay_sec)
             time.sleep(delay_sec)
     return success_count, failed_count
+
+
+def _claim_existing_subdomain(
+    cfg: BotConfig, logger: logging.Logger, state: BotState, doma_api: DomaApiClient,
+    exec_client: EvmExecutionClient, wallet: str, catalog: List[LaunchpadTokenInfo],
+    quote_token: Token, weth_token: Token,
+) -> bool:
+    seen = {quote_token.address.lower(), weth_token.address.lower()}
+    balance_errors = 0
+    for info in catalog:
+        address = (info.address or "").strip().lower()
+        if not address or address in seen:
+            continue
+        seen.add(address)
+        if {str(info.name or "").lower(), str(info.symbol or "").lower()} & CHEAP_BUY_TOKEN_BLOCKLIST:
+            continue
+        try:
+            balance = exec_client.get_erc20_balance(info.address, info.decimals)
+        except Exception as exc:
+            balance_errors += 1
+            logger.warning("[CHEAP_BUY] wallet=%s token=%s balance scan failed: %s", wallet, info.name, exc)
+            continue
+        if balance <= 0:
+            continue
+        logger.info("[CHEAP_BUY] wallet=%s existing token=%s balance=%s; trying stake without buy", wallet, info.name, balance)
+        try:
+            claimed, _ = _claim_subdomains_for_domain_token(
+                cfg=cfg, logger=logger, state=state, doma_api=doma_api,
+                exec_client=exec_client, chain_id=cfg.chain_id, wallet=wallet,
+                domain_token=_token_from_launchpad_price(info, Decimal("0")),
+                quote_token=quote_token, weth_token=weth_token, eth_price=Decimal("0"),
+                domain_name=info.name, subdomains_min_per_token=1, subdomains_max_per_token=1,
+                delay_min=Decimal("0"), delay_max=Decimal("0"), max_claims=1, allow_topup=False,
+            )
+        except Exception as exc:
+            if "tx=" in str(exc):
+                raise
+            logger.info("[CHEAP_BUY] wallet=%s existing token=%s cannot stake: %s", wallet, info.name, exc)
+            continue
+        if claimed:
+            return True
+    if balance_errors:
+        raise RuntimeError("Existing-token balance scan incomplete; refusing fallback purchase")
+    return False
 
 
 def _eligible_cheap_tokens(catalog: List[LaunchpadTokenInfo], quote_token: Token, max_price_usd: Decimal) -> List[LaunchpadTokenInfo]:
@@ -9843,8 +9902,32 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             tokens_per_wallet = random.randint(tokens_min_per_wallet, tokens_max_per_wallet)
             exec_client = _build_exec_client_with_rpc_fallback(cfg, logger, wallet, private_key, proxies=proxies, log_prefix="[CHEAP_BUY]")
             logger.info("[CHEAP_BUY] wallet=%s RPC ready", wallet)
+            if cfg.dry_run or cfg.paper_mode or not cfg.enable_execution:
+                skipped_wallets += 1
+                logger.info("[CHEAP_BUY] DRY/PAPER: no purchases or stakes sent")
+                continue
+            try:
+                daily_done = _is_daily_subdomain_stake_quest_completed(doma_api, wallet, cfg.chain_id)
+            except Exception as exc:
+                daily_done = None
+                logger.warning("[CHEAP_BUY] wallet=%s quest check unavailable: %s", wallet, exc)
+            if daily_done is True:
+                skipped_wallets += 1
+                logger.info("[CHEAP_BUY] wallet=%s daily subdomain quest already completed", wallet)
+                continue
+            logger.info("[CHEAP_BUY] wallet=%s scanning existing domain-token balances before any swap", wallet)
+            if _claim_existing_subdomain(cfg, logger, state, doma_api, exec_client, wallet, catalog, quote_token, weth_token):
+                subdomain_success_count += 1
+                success_wallets += 1
+                try:
+                    daily_done = _wait_daily_subdomain_stake_quest_completed(doma_api, wallet, cfg.chain_id)
+                except Exception as exc:
+                    daily_done = None
+                    logger.warning("[CHEAP_BUY] wallet=%s quest verification unavailable: %s", wallet, exc)
+                logger.info("[CHEAP_BUY] wallet=%s staked existing token; quest_completed=%s; no purchase needed", wallet, daily_done)
+                continue
             eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, quote_token)
-            logger.info("[CHEAP_BUY] wallet=%s ETH price ready | skipping full existing-token scan", wallet)
+            logger.info("[CHEAP_BUY] wallet=%s no usable existing balance; small-buy fallback", wallet)
             wallet_success = wallet_failed = 0
             existing_token_addresses: set[str] = set()
             existing_subdomains_claimed = 0
@@ -9951,9 +10034,14 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                         subdomains_max_per_token=subdomains_max_per_token,
                         delay_min=delay_min,
                         delay_max=delay_max,
+                        max_claims=1,
+                        allow_topup=False,
                     )
                     subdomain_success_count += claimed_ok
                     subdomain_failed_count += claimed_failed
+                    if claimed_ok == 0 and claimed_failed == 0:
+                        wallet_failed += 1
+                        _remember_failed_wallet(wallet_number, wallet, f"purchased balance cannot stake token={domain_token.symbol}; no extra buy")
                     if claimed_ok > 0:
                         try:
                             daily_done = _wait_daily_subdomain_stake_quest_completed(doma_api, wallet, cfg.chain_id)
@@ -9970,6 +10058,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                             logger.warning("[CHEAP_BUY] wallet=%s %s", wallet, reason)
                             _remember_subdomain_failed(wallet_number, wallet, reason)
                             _remember_failed_wallet(wallet_number, wallet, reason)
+                            break
                         else:
                             wallet_success += 1
                             logger.info("[CHEAP_BUY] wallet=%s subdomain stake sent but daily quest status is unknown | staked=%s", wallet, claimed_ok)
@@ -14676,7 +14765,7 @@ def get_menu_choice() -> str:
     print("8) Набить объем для задания токена домена")
     print("9) Выставить домены на продажу")
     print("10) Отменить активные листинги доменов")
-    print("11) Купить дешевые токены и создать субдомены")
+    print("11) Стейк субдомена: свои токены, иначе минимальная покупка")
     print("12) Выполнить bridge домена Doma -> Base")
     print("13) Разместить офферы на домены")
     print("14) Принять полученные офферы на домены")

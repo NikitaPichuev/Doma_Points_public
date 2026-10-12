@@ -263,7 +263,8 @@ Current sweep routing:
 
 ## 11) Buy $0.01 cheap tokens + claim subdomain
 
-Покупает дешевые domain tokens и клеймит subdomains.
+Выполняет дейлик на стейкинг одного субдомена. Сначала использует имеющиеся
+domain tokens, покупка на $0.01 по умолчанию нужна только как запасной вариант.
 
 Параметры:
 
@@ -271,10 +272,8 @@ Current sweep routing:
 Maximum token price USD
 Minimum USDC.E amount per buy
 Maximum USDC.E amount per buy
-Minimum tokens to buy per wallet
-Maximum tokens to buy per wallet
-Minimum subdomains to claim per token
-Maximum subdomains to claim per token
+Minimum fallback token attempts per wallet
+Maximum fallback token attempts per wallet
 Minimum delay between buys sec
 Maximum delay between buys sec
 Start from wallet number
@@ -282,10 +281,14 @@ Start from wallet number
 
 Текущая логика:
 
-- сначала проверяет уже имеющиеся domain tokens на кошельке;
+- пропускает кошелек, если API уже отмечает ежедневный квест выполненным;
+- проверяет on-chain балансы токенов из загруженного каталога Doma (до 1000 токенов), без фильтра по цене или наличию пула для имеющихся токенов;
 - если существующего токена хватает на subdomain staking price, сразу создает subdomain из него;
-- может сделать несколько subdomains из одного токена, если баланса хватает;
+- ищет доступное имя длиной 20-40 символов, на которое хватает баланса;
+- после одного успешного стейка останавливается, даже если API квеста еще не обновился;
 - покупает новые токены только если существующих балансов не хватило;
+- при ошибке чтения балансов не покупает вслепую; при неподходящем токене пробует следующий;
+- не делает дополнительные докупки сверх выбранной суммы, если купленных токенов не хватило для стейка;
 - если USDC.E нет, бот пробует свапнуть ETH -> USDC.E;
 - оставляет газовый резерв около `$0.05`;
 - в конце выводит только номер кошелька, адрес и `insufficient balance` для кошельков, где реально не хватило баланса.
