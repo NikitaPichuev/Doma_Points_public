@@ -6306,9 +6306,9 @@ def get_domain_bridge_to_base_menu_input() -> Optional[Tuple[str, str, str, str]
 
 def get_cheap_token_buy_menu_input() -> Optional[Tuple[str, str, str, str, str, str, str, str, str]]:
     print("\nStake a subdomain: existing token balances first, small buy only as fallback.")
-    max_price_raw = input("Maximum token price USD [0.01]: ").strip() or "0.01"
-    buy_amount_min_raw = input("Minimum USDC.E amount per buy [0.01]: ").strip() or "0.01"
-    buy_amount_max_raw = input("Maximum USDC.E amount per buy [0.01]: ").strip() or "0.01"
+    max_price_raw = "0.01"
+    buy_amount_min_raw = buy_amount_max_raw = "0.01"
+    print("Fallback purchase: $0.01 per token.")
     tokens_min_raw = input("Minimum fallback token attempts per wallet [1]: ").strip() or "1"
     tokens_max_raw = input("Maximum fallback token attempts per wallet [1]: ").strip() or "1"
     subdomains_min_raw = subdomains_max_raw = "1"
@@ -9805,6 +9805,7 @@ def run_cheap_token_buy_once(cfg: BotConfig, logger: logging.Logger, state: BotS
         logger.info("[CHEAP_BUY] mode canceled by user.")
         return
     max_price_raw, buy_amount_min_raw, buy_amount_max_raw, tokens_min_raw, tokens_max_raw, subdomains_min_raw, subdomains_max_raw, delay_min_raw, delay_max_raw = picked
+    buy_amount_min_raw = buy_amount_max_raw = "0.01"
     max_price_usd = _parse_decimal_input(max_price_raw)
     buy_amount_min_usdc = _parse_decimal_input(buy_amount_min_raw)
     buy_amount_max_usdc = _parse_decimal_input(buy_amount_max_raw)

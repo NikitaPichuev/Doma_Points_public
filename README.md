@@ -264,14 +264,12 @@ Current sweep routing:
 ## 11) Buy $0.01 cheap tokens + claim subdomain
 
 Выполняет дейлик на стейкинг одного субдомена. Сначала использует имеющиеся
-domain tokens, покупка на $0.01 по умолчанию нужна только как запасной вариант.
+domain tokens, покупка строго на $0.01 нужна только как запасной вариант.
+Сумма покупки и предел цены токена ($0.01) заданы автоматически.
 
 Параметры:
 
 ```text
-Maximum token price USD
-Minimum USDC.E amount per buy
-Maximum USDC.E amount per buy
 Minimum fallback token attempts per wallet
 Maximum fallback token attempts per wallet
 Minimum delay between buys sec
