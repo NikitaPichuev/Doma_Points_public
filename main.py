@@ -4842,32 +4842,82 @@ def _normalize_domain_swap_asset(raw: str) -> str:
     return _normalize_domain_token_symbol(value)
 
 
-def get_domain_single_swap_menu_input(state: BotState) -> Optional[Tuple[str, str, str, str, str, str]]:
+def _select_domain_swap_token(catalog: List[LaunchpadTokenInfo]) -> Optional[str]:
+    tokens = {}
+    for info in catalog:
+        name = (info.name or info.symbol or "").strip()
+        if name:
+            tokens.setdefault(_normalize_domain_token_symbol(name), info)
+    ordered = sorted(tokens.items(), key=lambda item: (item[0] != "SOFTWARE.AI", item[0]))
+    if not ordered:
+        raise ValueError("В каталоге Doma нет токенов")
+    page, page_size = 0, 20
+    while True:
+        start = page * page_size
+        print(f"\nТокены Doma, страница {page + 1}/{(len(ordered) + page_size - 1) // page_size}:")
+        for index, (name, info) in enumerate(ordered[start:start + page_size], start + 1):
+            print(f"{index}) {name} | цена ~${_format_decimal_plain(info.price_usd)}")
+        print("n) Следующая страница | p) Предыдущая | 0) Назад")
+        choice = input("Номер токена: ").strip().lower()
+        if choice == "0":
+            return None
+        if choice == "n":
+            page = min(page + 1, (len(ordered) - 1) // page_size)
+        elif choice == "p":
+            page = max(0, page - 1)
+        elif choice.isdigit() and start < int(choice) <= min(start + page_size, len(ordered)):
+            return ordered[int(choice) - 1][0]
+        else:
+            print("Выберите номер токена на текущей странице.")
+
+
+def get_domain_single_swap_menu_input(cfg: BotConfig, logger: logging.Logger, state: BotState) -> Optional[Tuple[str, str, str, str, str, str]]:
     _ = state
-    print("\nOne domain token swap (Doma):")
-    print("Examples: ETH, WETH, USDC.E, warriors.xyz, full Doma URL")
-    src_symbol = _normalize_domain_swap_asset(input("From token: ").strip())
-    dst_symbol = _normalize_domain_swap_asset(input("To token: ").strip())
-    if src_symbol == dst_symbol:
-        raise ValueError("From token and To token cannot be the same")
-
-    print("\nAmount mode:")
-    print(f"1) Number ({src_symbol})")
-    print("2) Percent (%)")
-    mode_raw = input("Select [1-2]: ").strip()
-    if mode_raw not in {"1", "2"}:
-        raise ValueError("Invalid amount mode selection")
-    amount_mode = "number" if mode_raw == "1" else "percent"
-
-    if amount_mode == "percent":
-        percent_raw = input("Percent: ").strip()
-        _ = _parse_decimal_input(percent_raw)
-        return src_symbol, dst_symbol, amount_mode, percent_raw
-
-    min_raw = input("Minimum: ").strip()
-    max_raw = input("Maximum: ").strip()
-    _ = _parse_decimal_input(min_raw)
-    _ = _parse_decimal_input(max_raw)
+    print("\nРазовый обмен токена домена:")
+    print("1) Купить токен и оставить на кошельке")
+    print("2) Продать токен")
+    print("0) Назад")
+    action = input("Выберите [0-2]: ").strip()
+    if action == "0":
+        return None
+    if action not in {"1", "2"}:
+        raise ValueError("Выберите покупку или продажу")
+    records = _build_wallet_key_records(cfg, logger, "DOMAIN_MENU")
+    _, catalog, _ = _fetch_fractional_tokens_with_wallet_proxy_fallback(
+        cfg, logger, records, "DOMAIN_MENU", take=100, max_pages=100,
+    )
+    domain = _select_domain_swap_token(catalog)
+    if domain is None:
+        return None
+    print("\nЧем платить:" if action == "1" else "Что получить:")
+    print("1) USDC.E\n2) ETH\n3) WETH\n0) Назад")
+    base_choice = input("Выберите [0-3]: ").strip()
+    if base_choice == "0":
+        return None
+    base = {"1": "USDC.E", "2": "ETH", "3": "WETH"}.get(base_choice)
+    if base is None:
+        raise ValueError("Неверный выбор валюты")
+    src_symbol, dst_symbol = (base, domain) if action == "1" else (domain, base)
+    print(f"\nОбмен: {src_symbol} -> {dst_symbol}")
+    print(f"1) Фиксированная сумма в {src_symbol}\n2) Диапазон сумм в {src_symbol}\n3) Процент баланса {src_symbol}\n0) Назад")
+    mode_raw = input("Выберите [0-3]: ").strip()
+    if mode_raw == "0":
+        return None
+    if mode_raw == "1":
+        min_raw = max_raw = input(f"Сколько {src_symbol} потратить: ").strip()
+    elif mode_raw == "2":
+        min_raw = input(f"Минимум {src_symbol}: ").strip()
+        max_raw = input(f"Максимум {src_symbol}: ").strip()
+    elif mode_raw == "3":
+        min_raw = max_raw = input("Процент баланса: ").strip()
+    else:
+        raise ValueError("Неверный режим суммы")
+    amount_mode = "percent" if mode_raw == "3" else "number"
+    minimum, maximum = _parse_decimal_input(min_raw), _parse_decimal_input(max_raw)
+    if not minimum.is_finite() or not maximum.is_finite() or minimum <= 0 or maximum < minimum:
+        raise ValueError("Сумма должна быть положительной, максимум не меньше минимума")
+    if amount_mode == "percent" and maximum > 100:
+        raise ValueError("Процент не может превышать 100")
     delay_min_raw = input("Minimum delay after approve sec [4]: ").strip() or "4"
     delay_max_raw = input("Maximum delay after approve sec [10]: ").strip() or "10"
     delay_min = _parse_decimal_input(delay_min_raw)
@@ -12252,7 +12302,7 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
         run_domain_quest_volume_once(cfg, logger, state)
         return
     is_one_swap = domain_mode == "one_swap"
-    picked = get_domain_single_swap_menu_input(state) if is_one_swap else get_domain_swap_menu_input(state)
+    picked = get_domain_single_swap_menu_input(cfg, logger, state) if is_one_swap else get_domain_swap_menu_input(state)
     if not picked:
         logger.info("Domain swap canceled by user.")
         return
