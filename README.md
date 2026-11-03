@@ -92,6 +92,11 @@ wallets.txt line 2 -> keys.txt line 2 -> api_keys.txt line 2 -> proxies.txt line
 
 `proxies.txt` необязателен для части режимов, но marketplace/cheap-buy режимы обычно используют прокси построчно.
 
+Формат строки: `http://LOGIN:PASSWORD@HOST:PORT` либо
+`socks5h://LOGIN:PASSWORD@HOST:SOCKS_PORT`. Для SOCKS5 укажите именно
+SOCKS-порт из кабинета провайдера; он может отличаться от HTTP-порта.
+Зависимость `requests[socks]` устанавливает поддержку SOCKS5.
+
 ## Актуальное меню
 
 ```text
