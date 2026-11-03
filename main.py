@@ -26,6 +26,7 @@ from eth_account.messages import encode_defunct
 from web3 import Web3
 
 from config import BotConfig
+from domapunks_checker import fetch_domapunks_claim
 from galxe_api import (
     GALXE_DEFAULT_CAMPAIGN_ID,
     GALXE_DEFAULT_CHAIN,
@@ -14899,7 +14900,8 @@ def get_points_menu_choice() -> str:
     print("1) Проверить поинты и задания")
     print("2) Проверить только балансы")
     print("3) Назад")
-    return input("Выберите [1-3]: ").strip()
+    print("4) Doma Punks: проверить право на клейм")
+    return input("Выберите [1-4]: ").strip()
 
 
 def get_doma_quest_menu_choice() -> str:
@@ -14992,6 +14994,58 @@ def run_doma_quests_menu_once(cfg: BotConfig, logger: logging.Logger, state: Bot
         raise ValueError("Invalid Doma quest selection")
 
 
+def run_domapunks_check_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    _ = state
+    wallets = cfg.points_wallets or ([cfg.account_address] if cfg.account_address else [])
+    if not wallets:
+        logger.warning("[DOMAPUNKS] No wallets configured")
+        return
+    start = _prompt_start_wallet_number(len(wallets))
+    end = _prompt_end_wallet_number(len(wallets), start)
+    records = list(enumerate(wallets))[start - 1:end]
+    if _prompt_wallet_order(default_random=True) == "random":
+        random.shuffle(records)
+    report = cfg.points_csv_file.parent / "domapunks_claims.csv"
+    ensure_csv(report, ["timestamp_utc", "wallet_number", "wallet", "eligibility", "claims",
+                       "punk_id", "price", "payment_symbol", "payment_balance", "quote_symbol",
+                       "quote_balance", "claimed", "supply", "chain_id", "block", "error"],
+               delimiter=cfg.csv_delimiter)
+    counts = dict(eligible=0, ineligible=0, claimed=0, unknown=0)
+    for position, (idx, wallet) in enumerate(records):
+        result = None
+        error = ""
+        try:
+            proxies, skip = _proxy_for_line(cfg, idx, logger, "DOMAPUNKS")
+            if skip:
+                raise ValueError("Wallet proxy unavailable; check skipped")
+            result = fetch_domapunks_claim(wallet, chain_id=cfg.chain_id, proxies=proxies)
+            counts[result["eligibility"]] += 1
+            logger.info(
+                "[DOMAPUNKS] wallet#%s | %s | claims=%s | punk_id=%s | price=%s %s | balance=%s %s | quote=%s %s | claimed=%s/%s | block=%s",
+                idx + 1, result["eligibility"].upper(), result["claims"], result["punk_id"] or "-",
+                result["price"], result["payment_symbol"], result["balance"], result["payment_symbol"],
+                result["quote_balance"], result["quote_symbol"], result["claimed"], result["supply"], result["block"],
+            )
+        except Exception as exc:
+            counts["unknown"] += 1
+            error = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            logger.warning("[DOMAPUNKS] wallet#%s | UNKNOWN | %s", idx + 1, error)
+        row = [datetime.now(timezone.utc).isoformat(), idx + 1, wallet]
+        if result is None:
+            row += ["unknown"] + [""] * 11 + [error]
+        else:
+            row += [result[key] for key in ("eligibility", "claims", "punk_id", "price", "payment_symbol",
+                                           "balance", "quote_symbol", "quote_balance", "claimed", "supply",
+                                           "chain_id", "block")] + [""]
+        append_csv(report, row, delimiter=cfg.csv_delimiter)
+        if position < len(records) - 1:
+            time.sleep(random.uniform(2, 5))
+    logger.info("[DOMAPUNKS] total=%s | eligible=%s | claimed=%s | ineligible=%s | unknown=%s | report=%s",
+                len(records), counts["eligible"], counts["claimed"], counts["ineligible"], counts["unknown"], report.resolve())
+    print("ELIGIBLE = есть право на клейм; CLAIMED = уже получен; INELIGIBLE = нет в списке; UNKNOWN = ошибка проверки.")
+    print("Право на клейм и доступность клейма показаны отдельно. Баланс USDC.e не является расчетом стоимости клейма.")
+
+
 def run_points_menu_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
     while True:
         choice = get_points_menu_choice()
@@ -15002,6 +15056,9 @@ def run_points_menu_once(cfg: BotConfig, logger: logging.Logger, state: BotState
             run_balances_once(cfg, logger, state)
             return
         if choice == "3":
+            return
+        if choice == "4":
+            run_domapunks_check_once(cfg, logger, state)
             return
         raise ValueError("Invalid points submenu selection")
 
