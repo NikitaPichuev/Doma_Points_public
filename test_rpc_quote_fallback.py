@@ -20,6 +20,9 @@ FEE_RECIPIENT = "0x582366f5f9c5ae5c658c30758dd24d57ce4f111a"
 
 
 class QuoteTests(unittest.TestCase):
+    def setUp(self):
+        module._FACTORY_CACHE.clear()
+
     def route(self, native_in=False, native_out=False, portion=10):
         tokens = [module.WETH, module.USDC] if not native_out else [module.USDC, module.WETH]
         data, output = module.encode_router_route(tokens, [100], 1000, 2000, Decimal("2.5"),
@@ -77,6 +80,62 @@ class QuoteTests(unittest.TestCase):
         reader.calls = Mock(return_value=["0x" + (100).to_bytes(32, "big").hex() + "00" * 96, None, None, None])
         self.assertEqual(reader.best_leg(module.WETH, module.USDC, 1000), (100, 100))
         self.assertTrue(reader.calls.call_args.args[0][0][1].startswith("0xc6a5026a"))
+
+    def test_single_read_uses_plain_rpc_request(self):
+        reader = module.RpcReader(None)
+        self.addCleanup(reader.close)
+        reader.request = Mock(return_value=dict(id=1, result="0x01"))
+        self.assertEqual(reader.calls([(module.QUOTER, "0xc45a0155")]), ["0x01"])
+        self.assertIsInstance(reader.request.call_args.args[0], dict)
+
+    def test_factory_transient_failure_retries_and_caches_across_readers(self):
+        reader = module.RpcReader(None)
+        other = module.RpcReader(None)
+        self.addCleanup(reader.close)
+        self.addCleanup(other.close)
+        address = "0x2e50b586d5bcd04cb6125e028a6a669f7f3cf1c2"
+        word = "0x" + "0" * 24 + address[2:]
+        reader.calls = Mock(side_effect=[[None], [None], [word]])
+        other.calls = Mock(side_effect=AssertionError("cache should avoid factory RPC"))
+        with patch.object(module.time, "sleep"):
+            self.assertEqual(reader.factory(), address)
+            self.assertEqual(other.factory(), address)
+        self.assertEqual(reader.calls.call_count, 3)
+        other.calls.assert_not_called()
+
+    def test_invalid_factory_never_cached(self):
+        reader = module.RpcReader(None)
+        self.addCleanup(reader.close)
+        for word in (None, "0x" + "0" * 64, "0x" + "f" * 64, "0xnot-an-address"):
+            reader.calls = Mock(return_value=[word])
+            with patch.object(module.time, "sleep"), self.assertRaises(RuntimeError):
+                reader.factory()
+            self.assertFalse(module._FACTORY_CACHE)
+
+    def test_metadata_error_does_not_require_whole_quote_retry(self):
+        reader = module.RpcReader(None)
+        self.addCleanup(reader.close)
+        reader.calls = Mock(side_effect=[[None], ["0x01"]])
+        with patch.object(module.time, "sleep"):
+            self.assertEqual(reader.required_calls([(module.QUOTER, "0x01")], "pool", bool), ["0x01"])
+        self.assertEqual(reader.calls.call_count, 2)
+
+    def test_transport_retries_only_transient_statuses(self):
+        reader = module.RpcReader({"https": "socks5h://test"})
+        self.addCleanup(reader.close)
+        response = Mock()
+        response.json.return_value = dict(result="0x01")
+        reader.session.post = Mock(side_effect=[requests.Timeout(), response])
+        with patch.object(module.time, "sleep"):
+            self.assertEqual(reader.request(dict(method="eth_chainId")), dict(result="0x01"))
+        self.assertEqual(reader.session.post.call_count, 2)
+        self.assertEqual(reader.session.post.call_args.kwargs["proxies"], reader.proxies)
+        response.raise_for_status.side_effect = requests.HTTPError(response=NS(status_code=400))
+        reader.session.post.reset_mock(side_effect=True)
+        reader.session.post.return_value = response
+        with patch.object(module.time, "sleep"), self.assertRaises(requests.HTTPError):
+            reader.request(dict(method="eth_chainId"))
+        self.assertEqual(reader.session.post.call_count, 1)
 
     def test_network_failure_switches_only_quotes_to_same_proxy_rpc(self):
         tree = ast.parse((ROOT / "doma_api.py").read_text(encoding="utf-8-sig"))

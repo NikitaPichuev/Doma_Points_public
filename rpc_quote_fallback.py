@@ -2,6 +2,7 @@
 import os
 import time
 from decimal import Decimal
+from threading import Lock
 
 import requests
 from eth_abi import encode
@@ -16,6 +17,8 @@ NATIVE = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 CALLER = "0x0000000000000000000000000000000000000001"
 THIS = "0x0000000000000000000000000000000000000002"
 FEES = (100, 500, 3000, 10000)
+_FACTORY_CACHE = {}
+_FACTORY_LOCK = Lock()
 
 
 def _calldata(signature, types, values):
@@ -33,9 +36,16 @@ class RpcReader:
         self.session.close()
 
     def request(self, payload):
-        response = self.session.post(self.url, json=payload, proxies=self.proxies, timeout=20)
-        response.raise_for_status()
-        return response.json()
+        for attempt in range(3):
+            try:
+                response = self.session.post(self.url, json=payload, proxies=self.proxies, timeout=20)
+                response.raise_for_status()
+                return response.json()
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if attempt == 2 or (status is not None and status != 429 and status < 500):
+                    raise
+                time.sleep(0.25 * (attempt + 1))
 
     def verify_chain(self):
         data = self.request(dict(jsonrpc="2.0", id=1, method="eth_chainId", params=[]))
@@ -43,16 +53,46 @@ class RpcReader:
             raise RuntimeError("RPC quote fallback: wrong chain")
 
     def calls(self, calls):
+        if not calls:
+            return []
         payload = [dict(jsonrpc="2.0", id=i + 1, method="eth_call", params=[
             {"to": Web3.to_checksum_address(address), "data": calldata}, "latest"])
             for i, (address, calldata) in enumerate(calls)]
-        response = self.request(payload)
+        # Some RPC nodes intermittently reject a one-element batch. Use a plain call.
+        response = self.request(payload[0] if len(payload) == 1 else payload)
+        if len(payload) == 1 and isinstance(response, dict):
+            response = [response]
         if not isinstance(response, list):
             raise RuntimeError("RPC quote fallback: batch calls unavailable")
         answers = {item.get("id"): item for item in response if isinstance(item, dict)}
         if len(answers) != len(payload) or set(answers) != set(range(1, len(payload) + 1)):
             raise RuntimeError("RPC quote fallback: incomplete batch response")
         return [None if answers[i].get("error") else answers[i].get("result") for i in range(1, len(payload) + 1)]
+
+    def required_calls(self, calls, label, valid):
+        for attempt in range(3):
+            try:
+                answers = self.calls(calls)
+                if all(valid(value) for value in answers):
+                    return answers
+            except RuntimeError:
+                if attempt == 2:
+                    raise
+            if attempt < 2:
+                time.sleep(0.25 * (attempt + 1))
+        raise RuntimeError(f"RPC quote fallback: {label} unavailable after 3 reads")
+
+    def factory(self):
+        key = (self.url, CHAIN_ID, QUOTER)
+        with _FACTORY_LOCK:
+            if key not in _FACTORY_CACHE:
+                def valid(value):
+                    return (isinstance(value, str) and len(value) == 66 and value.startswith("0x")
+                            and value[2:26] == "0" * 24
+                            and Web3.is_address("0x" + value[-40:]) and int(value, 16) > 0)
+                answer = self.required_calls([(QUOTER, "0xc45a0155")], "factory", valid)[0]
+                _FACTORY_CACHE[key] = "0x" + answer[-40:]
+            return _FACTORY_CACHE[key]
 
     def best_leg(self, token_in, token_out, amount):
         calls = [(QUOTER, _calldata("quoteExactInputSingle((address,address,uint256,uint24,uint160))",
@@ -63,16 +103,14 @@ class RpcReader:
         return max(candidates, default=(0, 0))
 
     def spot_output(self, tokens, fees, amount):
-        factory_answer = self.calls([(QUOTER, "0xc45a0155")])[0]
-        if not factory_answer:
-            raise RuntimeError("RPC quote fallback: factory unavailable")
-        factory = "0x" + factory_answer[-40:]
-        pools = self.calls([(factory, _calldata("getPool(address,address,uint24)",
+        factory = self.factory()
+        valid_word = lambda value: (isinstance(value, str) and len(value) >= 66
+                                    and value.startswith("0x") and all(c in "0123456789abcdefABCDEF" for c in value[2:])
+                                    and int(value[2:66], 16) > 0)
+        pools = self.required_calls([(factory, _calldata("getPool(address,address,uint24)",
                             ["address", "address", "uint24"], [a, b, fee]))
-                            for a, b, fee in zip(tokens, tokens[1:], fees)])
-        if any(not pool or int(pool, 16) == 0 for pool in pools):
-            raise RuntimeError("RPC quote fallback: pool unavailable")
-        states = self.calls([("0x" + pool[-40:], "0x3850c7bd") for pool in pools])
+                            for a, b, fee in zip(tokens, tokens[1:], fees)], "pool", valid_word)
+        states = self.required_calls([("0x" + pool[-40:], "0x3850c7bd") for pool in pools], "pool price", valid_word)
         output = Decimal(amount)
         for a, b, state in zip(tokens, tokens[1:], states):
             sqrt_price = int(state[2:66], 16) if state else 0
