@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import logging
 import warnings
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
@@ -2405,14 +2406,18 @@ class DomaApiClient:
         if portion_bips > 0 and portion_recipient:
             params["portionBips"] = str(int(portion_bips))
             params["portionRecipient"] = Web3.to_checksum_address(portion_recipient)
-        resp = requests.get(
-            DOMA_INTERFACE_QUOTE_URL,
-            params=params,
-            timeout=20,
-            proxies=self.proxies,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        data = None
+        if not getattr(self, "_quote_rpc_mode", False):
+            try:
+                resp = requests.get(DOMA_INTERFACE_QUOTE_URL, params=params, timeout=20, proxies=self.proxies)
+                resp.raise_for_status()
+                data = resp.json()
+            except (requests.ConnectionError, requests.Timeout):
+                self._quote_rpc_mode = True
+                logging.getLogger("doma_swap_bot").warning("[QUOTE] Routing API connection failed; switching to on-chain RPC quotes via the same wallet proxy")
+        if data is None:
+            from rpc_quote_fallback import build_rpc_quote
+            data = build_rpc_quote(params, proxies=self.proxies)
         method = data.get("methodParameters") or {}
         to = str(method.get("to") or "").strip()
         calldata = str(method.get("calldata") or "").strip()
