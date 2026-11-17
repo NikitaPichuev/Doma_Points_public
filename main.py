@@ -265,6 +265,11 @@ BONDING_DAILY_BOOTSTRAP_GAS_BUFFER_USD = Decimal("0.03")
 BONDING_DAILY_INITIAL_MIN_USDCE = Decimal("1")
 BONDING_DAILY_CONTINUATION_MIN_USDCE = Decimal("0.20")
 SWEEP_MIN_TOKEN_VALUE_USD = Decimal("0.01")
+SWEEP_PROTECTED_SYMBOLS = {
+    "ETH", "WETH", "USDC", "USDC.E", "USDT", "USDT.E", "USDT0", "USDBC",
+    "DAI", "USDS", "SDAI", "SUSDS", "USDE", "SUSDE", "FRAX", "LUSD", "USDD",
+    "FDUSD", "TUSD", "PYUSD", "GHO", "BUSD", "DOLA", "CRVUSD", "USD0", "USD1",
+}
 DOMAIN_PURCHASE_RELIST_MARKUP_MIN = Decimal("0.02")
 DOMAIN_PURCHASE_RELIST_MARKUP_MAX = Decimal("0.05")
 DOMAIN_PURCHASE_CLAIM_WAIT_TIMEOUT_SEC = 45 * 60
@@ -293,6 +298,12 @@ def _is_sweep_token_excluded(info: LaunchpadTokenInfo, exclusions: set[str]) -> 
     }
     identifiers.discard("")
     return bool(identifiers & exclusions)
+
+
+def _is_sweep_protected_asset(info: LaunchpadTokenInfo, protected_addresses: set[str]) -> bool:
+    return ((info.address or "").strip().lower() in protected_addresses
+            or canonical_symbol(info.symbol or "") in SWEEP_PROTECTED_SYMBOLS
+            or canonical_symbol(info.name or "") in SWEEP_PROTECTED_SYMBOLS)
 
 
 KNOWN_ETH_USDCE_POOL_ADDRESSES = [
@@ -13220,10 +13231,13 @@ def get_sweep_menu_input(state: BotState) -> Optional[Tuple[str, str]]:
     print("1) Collect to USDC.E")
     print("2) Collect to ETH")
     print("3) Back")
+    print("4) Продать токены стоимостью > $0.05 в USDC.E, кроме стейблов и ETH/WETH")
     print("Token exceptions: sweep_token_exclusions.txt (one name, symbol, or address per line)")
-    target_raw = input("Select [1-3]: ").strip()
+    target_raw = input("Select [1-4]: ").strip()
     if target_raw == "3":
         return None
+    if target_raw == "4":
+        return "ALTS_TO_USDC.E", "0"
     if target_raw not in {"1", "2"}:
         raise ValueError("Invalid sweep target selection")
     target_asset = "USDC.E" if target_raw == "1" else "ETH"
@@ -13253,6 +13267,12 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
         logger.info("Sweep mode canceled by user.")
         return
     target_asset, eth_percent_raw = picked
+    alt_only = target_asset == "ALTS_TO_USDC.E"
+    if alt_only:
+        target_asset = "USDC.E"
+    min_token_value = Decimal("0.05") if alt_only else SWEEP_MIN_TOKEN_VALUE_USD
+    if alt_only:
+        logger.info("[SWEEP] tokens-only mode | holding value > $0.05 | stablecoins and ETH/WETH protected | proceeds=USDC.E")
     eth_percent = _parse_decimal_input(eth_percent_raw)
     sweep_exclusions = _load_sweep_token_exclusions(cfg.sweep_token_exclusions_file)
 
@@ -13279,18 +13299,20 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
         time.sleep(delay_sec)
 
     logger.info("[SWEEP] loading shared metadata...")
-    shared_doma_api = DomaApiClient(
-        cfg.doma_api_url,
-        api_key=cfg.doma_api_key,
-        api_keys=cfg.doma_api_keys,
-        proxies=None,
+    shared_doma_api, token_catalog, _ = _fetch_fractional_tokens_with_wallet_proxy_fallback(
+        cfg, logger, wallet_key_records, "SWEEP", take=100, max_pages=100 if alt_only else 10,
     )
+    if alt_only and len(token_catalog) >= 10000:
+        raise RuntimeError("Sweep catalog pagination limit reached; refusing partial scan")
     usdc_token = _usdce_token_from_config(cfg)
     weth_token = _token_from_config_override(cfg, "WETH", 18)
+    protected_addresses = {usdc_token.address.lower(), weth_token.address.lower()}
+    for symbol, address in cfg.token_address_overrides.items():
+        if canonical_symbol(symbol) in SWEEP_PROTECTED_SYMBOLS:
+            protected_addresses.add(address.lower())
     eth_price = _fetch_eth_price_via_doma_quote(cfg, shared_doma_api, usdc_token)
     if eth_price <= 0:
         raise RuntimeError("Failed to resolve ETH/USD")
-    token_catalog = shared_doma_api.fetch_fractional_tokens(take=100, max_pages=10)
     if not token_catalog:
         raise RuntimeError("Doma fractional token catalog is empty")
     try:
@@ -13311,6 +13333,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
             skipped_wallets += 1
             continue
         logger.info("[SWEEP] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
+        doma_api = _doma_api_client_for_proxies(cfg, proxies)
 
         exec_client = _build_exec_client_with_rpc_fallback(
             cfg=cfg,
@@ -13331,6 +13354,8 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
             if token_symbol in {"ETH", "USDC", "USDC.E"}:
                 continue
             token_address = (info.address or "").lower()
+            if alt_only and _is_sweep_protected_asset(info, protected_addresses):
+                continue
             if not token_address or token_address in seen_token_addresses:
                 continue
             try:
@@ -13348,40 +13373,41 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     _format_decimal_plain(balance_dec),
                 )
                 continue
-            token_value_usd = balance_dec * info.price_usd if info.price_usd > 0 else Decimal("0")
-            if info.price_usd <= 0:
+            if not info.price_usd.is_finite() or info.price_usd <= 0:
                 logger.info(
                     "[SWEEP] wallet=%s token=%s skipped | token price unavailable",
                     wallet,
                     token_symbol,
                 )
                 continue
-            if token_value_usd < SWEEP_MIN_TOKEN_VALUE_USD:
+            token_value_usd = balance_dec * info.price_usd
+            if not token_value_usd.is_finite() or (token_value_usd <= min_token_value if alt_only else token_value_usd < min_token_value):
                 logger.info(
-                    "[SWEEP] wallet=%s token=%s dust skipped | value=$%s < $%s",
+                    "[SWEEP] wallet=%s token=%s dust skipped | value=$%s below sale threshold $%s",
                     wallet,
                     token_symbol,
                     _format_decimal_plain(token_value_usd),
-                    _format_decimal_plain(SWEEP_MIN_TOKEN_VALUE_USD),
+                    _format_decimal_plain(min_token_value),
                 )
                 continue
             held_launchpad_tokens.append((info, balance_dec))
 
         held_weth_balance = Decimal("0")
         try:
-            held_weth_balance = exec_client.get_erc20_balance(weth_token.address, weth_token.decimals)
+            if not alt_only:
+                held_weth_balance = exec_client.get_erc20_balance(weth_token.address, weth_token.decimals)
         except Exception:
             held_weth_balance = Decimal("0")
         held_weth_value_usd = held_weth_balance * eth_price
         if held_weth_balance > 0 and held_weth_value_usd < SWEEP_MIN_TOKEN_VALUE_USD:
             logger.info(
-                "[SWEEP] wallet=%s token=WETH dust skipped | value=$%s < $%s",
+                "[SWEEP] wallet=%s token=WETH dust skipped | value=$%s below sale threshold $%s",
                 wallet,
                 _format_decimal_plain(held_weth_value_usd),
                 _format_decimal_plain(SWEEP_MIN_TOKEN_VALUE_USD),
             )
             held_weth_balance = Decimal("0")
-        native_eth_balance = exec_client.get_native_balance()
+        native_eth_balance = exec_client.get_native_balance() if not alt_only else Decimal("0")
         reserve_eth = _native_gas_reserve_eth(eth_price)
         spendable_eth = native_eth_balance - reserve_eth
         spendable_eth = spendable_eth if spendable_eth > 0 else Decimal("0")
@@ -13425,7 +13451,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     cfg=cfg,
                     logger=logger,
                     state=state,
-                    doma_api=shared_doma_api,
+                    doma_api=doma_api,
                     exec_client=exec_client,
                     token_in=token_meta,
                     token_out=usdc_token,
@@ -13438,7 +13464,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     unwrap_to_native=False,
                     wait_for_pre_tx=True,
                 )
-            if not ok and info.pool_address:
+            if not ok and info.pool_address and not alt_only:
                 pool = _find_pool_by_address(pools, info.pool_address)
                 if pool is None:
                     pool = _find_best_pool_for_symbols(cfg, pools, token_symbol, "USDC.E", ignore_limits=True)
@@ -13455,12 +13481,12 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                         eth_price=eth_price,
                         label=f"SWEEP {wallet} {token_symbol}>USDC.E",
                         bypass_risk_checks=True,
-                        allow_no_quoter_execution=True,
+                        allow_no_quoter_execution=not alt_only,
                         wait_for_pre_tx=True,
                     )
                 else:
                     logger.warning("[SWEEP] wallet=%s token=%s no pool route to USDC.E", wallet, token_symbol)
-            if not ok and info.launchpad_address and info.quote_token_address == usdc_token.address:
+            if not ok and info.launchpad_address and info.quote_token_address == usdc_token.address and (not alt_only or not info.pool_address):
                 ok = _execute_launchpad_sell(
                     cfg=cfg,
                     logger=logger,
@@ -13510,7 +13536,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     cfg=cfg,
                     logger=logger,
                     state=state,
-                    doma_api=shared_doma_api,
+                    doma_api=doma_api,
                     exec_client=exec_client,
                     token_in=weth_token,
                     token_out=usdc_token,
@@ -13545,7 +13571,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     cfg=cfg,
                     logger=logger,
                     state=state,
-                    doma_api=shared_doma_api,
+                    doma_api=doma_api,
                     exec_client=exec_client,
                     token_in=weth_token,
                     token_out=usdc_token,
@@ -13580,7 +13606,7 @@ def run_sweep_tokens_to_usdce_once(cfg: BotConfig, logger: logging.Logger, state
                     cfg=cfg,
                     logger=logger,
                     state=state,
-                    doma_api=shared_doma_api,
+                    doma_api=doma_api,
                     exec_client=exec_client,
                     token_in=usdc_token,
                     token_out=weth_token,
