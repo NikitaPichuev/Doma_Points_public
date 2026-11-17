@@ -81,12 +81,14 @@ class CheckerTests(unittest.TestCase):
     def test_menu_flow_preserves_rows_and_errors(self):
         tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8-sig"))
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
-                 {"run_domapunks_check_once", "run_points_menu_once"}]
+                 {"run_domapunks_check_once", "run_points_menu_once", "_run_wallet_reads"}]
         module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
         with tempfile.TemporaryDirectory() as tmp:
             rows = []
             fetch = Mock(side_effect=[checker.parse_domapunks_claim(payload(), WALLET, 97477), RuntimeError("offline")])
+            from decimal import getcontext, localcontext
             ns = dict(datetime=datetime, timezone=timezone, fetch_domapunks_claim=fetch,
+                      getcontext=getcontext, localcontext=localcontext,
                       _prompt_start_wallet_number=Mock(return_value=1), _prompt_end_wallet_number=Mock(return_value=2),
                       _prompt_wallet_order=Mock(return_value="in_order"), _proxy_for_line=Mock(return_value=(None, False)),
                       ensure_csv=Mock(), append_csv=lambda path, row, **kwargs: rows.append(row),

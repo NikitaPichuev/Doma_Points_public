@@ -40,6 +40,25 @@ class QuestWorkersTests(unittest.TestCase):
     def setUp(self):
         self.run_workers, self.ns = load("_run_quest_wallet_workers")
 
+    def test_read_workers_keep_result_order_and_decimal_context(self):
+        read, _ = load("_run_wallet_reads")
+        barrier = threading.Barrier(6, timeout=5)
+        threads = set()
+        lock = threading.Lock()
+
+        def worker(index, record):
+            if index < 6:
+                with lock:
+                    threads.add(threading.get_ident())
+                barrier.wait()
+            return record, getcontext().prec
+
+        with localcontext() as context:
+            context.prec = 41
+            result = list(read(list(range(61)), Mock(), "READ", worker))
+        self.assertEqual(result, [(i, 41) for i in range(61)])
+        self.assertEqual(len(threads), 6)
+
     def test_worker_count_boundaries(self):
         for count, workers in ((0, 1), (1, 1), (30, 1), (31, 2), (60, 2), (61, 3), (90, 3), (120, 3)):
             logger = Mock()

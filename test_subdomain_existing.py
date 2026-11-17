@@ -34,7 +34,7 @@ class ExistingTests(unittest.TestCase):
         self.ns.update(_claim_subdomains_for_domain_token=self.claim,
                        _token_from_launchpad_price=lambda info, price: info)
         self.client = Mock()
-        self.client.get_erc20_balance.return_value = Decimal("1")
+        self.client.get_erc20_balances.side_effect = lambda tokens: {t.address: Decimal("1") for t in tokens}
         self.cfg = NS(chain_id=97477)
 
     def run_existing(self, catalog):
@@ -52,7 +52,8 @@ class ExistingTests(unittest.TestCase):
         self.assertEqual(self.claim.call_count, 3)
 
     def test_no_held_balance_requests_fallback(self):
-        self.client.get_erc20_balance.return_value = Decimal("0")
+        self.client.get_erc20_balances.side_effect = None
+        self.client.get_erc20_balances.return_value = {"empty": Decimal("0")}
         self.assertFalse(self.run_existing([token("empty")]))
         self.claim.assert_not_called()
 
@@ -63,10 +64,11 @@ class ExistingTests(unittest.TestCase):
     def test_skip_duplicates_and_quote_assets(self):
         self.claim.return_value = (0, 0)
         self.run_existing([token("usdc"), token("weth"), token("a"), token("A")])
-        self.client.get_erc20_balance.assert_called_once_with("a", 18)
+        self.assertEqual([t.address for t in self.client.get_erc20_balances.call_args.args[0]], ["a"])
 
     def test_balance_read_error_blocks_purchase(self):
-        self.client.get_erc20_balance.side_effect = RuntimeError("RPC unavailable")
+        self.client.get_erc20_balances.side_effect = None
+        self.client.get_erc20_balances.return_value = {"held": None}
         with self.assertRaisesRegex(RuntimeError, "scan incomplete"):
             self.run_existing([token("held")])
 

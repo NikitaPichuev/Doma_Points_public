@@ -649,12 +649,13 @@ def _print_mode_summary(
 
 
 def ensure_csv(path: Path, header: List[str], delimiter: str = ",") -> None:
-    if path.exists():
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f, delimiter=delimiter)
-        w.writerow(header)
+    with CSV_WRITE_LOCK:
+        if path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f, delimiter=delimiter)
+            w.writerow(header)
 
 
 CSV_WRITE_LOCK = Lock()
@@ -2097,12 +2098,14 @@ def _log_wallet_balances_column(
     api: DomaApiClient,
     proxies: Optional[Dict[str, str]],
     token_catalog: List[LaunchpadTokenInfo],
+    eth_price: Decimal,
 ) -> None:
+    from wallet_balances import fetch_erc20_balances
+
     min_value_usd = Decimal("0.01")
     web3 = _balance_reader_web3(cfg, proxies)
     quote_token = _usdce_token_from_config(cfg)
     weth_token = _token_from_config_override(cfg, "WETH", 18)
-    eth_price = _fetch_eth_price_via_doma_quote(cfg, api, quote_token)
     balances: List[Tuple[str, Decimal, Decimal]] = []
 
     native_eth = Decimal(web3.eth.get_balance(Web3.to_checksum_address(wallet))) / Decimal(10**18)
@@ -2110,37 +2113,69 @@ def _log_wallet_balances_column(
     if native_usd > min_value_usd:
         balances.append(("ETH", native_eth, native_usd))
 
-    seen_addresses: set[str] = set()
+    indexed = _indexed_wallet_scan(api, wallet, cfg.chain_id, logger, "BALANCES")
+    candidates = {}
 
     def _add_erc20(symbol: str, address: str, decimals: int, price_usd: Decimal) -> None:
         addr = (address or "").strip().lower()
-        if not addr or addr in seen_addresses or price_usd <= 0:
-            return
-        seen_addresses.add(addr)
-        try:
-            balance = _erc20_balance_readonly(web3, wallet, addr, decimals)
-        except Exception as exc:
-            logger.warning("Balances [%s] [line=%s]: token=%s read failed: %s", wallet, line_no, symbol, exc)
-            return
-        value_usd = balance * price_usd
-        if value_usd > min_value_usd:
-            balances.append((symbol, balance, value_usd))
+        if addr and price_usd.is_finite() and price_usd > 0:
+            candidates.setdefault(addr, (symbol, decimals, price_usd))
 
     _add_erc20("WETH", weth_token.address, weth_token.decimals, eth_price)
     _add_erc20("USDC.E", quote_token.address, quote_token.decimals, Decimal("1"))
     for info in token_catalog:
-        _add_erc20(canonical_symbol(info.symbol or info.name), info.address, info.decimals, info.price_usd)
+        if indexed is None or (info.address or "").lower() in indexed:
+            _add_erc20(canonical_symbol(info.symbol or info.name), info.address, info.decimals, info.price_usd)
+
+    reads = fetch_erc20_balances(web3.provider.endpoint_uri, wallet,
+                                 [(addr, fields[1]) for addr, fields in candidates.items()], proxies)
+    missing = 0
+    for addr, (symbol, _, price_usd) in candidates.items():
+        balance = reads.get(addr)
+        if balance is None:
+            missing += 1
+            continue
+        value_usd = balance * price_usd
+        if value_usd > min_value_usd:
+            balances.append((symbol, balance, value_usd))
+    if missing:
+        logger.warning("Balances [%s] [line=%s]: incomplete, %s balances unavailable", wallet, line_no, missing)
 
     balances.sort(key=lambda item: item[2], reverse=True)
     if not balances:
-        logger.info("Balances [%s] [line=%s]: no tokens above $0.01", wallet, line_no)
+        logger.info("Balances [%s] [line=%s]: no verified tokens above $0.01", wallet, line_no)
         return
     lines = [f"Balances [{wallet}] [line={line_no}] > $0.01"]
     total_usd = sum((value for _, _, value in balances), Decimal("0"))
     for symbol, amount, value_usd in balances:
         lines.append(f"  {symbol}: {_format_decimal_plain(amount)} (~${_format_decimal_plain(value_usd)})")
-    lines.append(f"  TOTAL: ~${_format_decimal_plain(total_usd)}")
+    lines.append(f"  {'PARTIAL TOTAL' if missing else 'TOTAL'}: ~${_format_decimal_plain(total_usd)}")
     logger.info("\n".join(lines))
+
+
+def _indexed_wallet_scan(api, wallet, chain_id, logger, mode):
+    try:
+        return api.fetch_wallet_token_addresses(wallet, chain_id)
+    except Exception as exc:
+        logger.warning("[%s] wallet=%s index unavailable; using batched catalog scan | %s",
+                       mode, wallet, type(exc).__name__)
+        return None
+
+
+def _run_wallet_reads(records, logger, mode, worker):
+    workers = min(6, max(1, (len(records) + 9) // 10))
+    logger.info("[%s] wallets=%s | workers=%s", mode, len(records), workers)
+    context = getcontext().copy()
+
+    def run(record):
+        with localcontext(context):
+            return worker(*record)
+
+    if workers == 1:
+        yield from map(run, enumerate(records))
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"{mode.lower()}-read") as executor:
+            yield from executor.map(run, enumerate(records))
 
 
 def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
@@ -2156,10 +2191,11 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     points_wallet_order = _prompt_wallet_order(default_random=True)
     if points_wallet_order == "random":
         random.shuffle(wallet_records)
-    for order_idx, (idx, wallet) in enumerate(wallet_records):
+    def check(_order_idx, record):
+        idx, wallet = record
         ctx = _wallet_api_context(cfg, idx, logger, "Points/quests check")
         if ctx is None:
-            continue
+            return
         api_key, proxies = ctx
         api = DomaApiClient(
             cfg.doma_api_url,
@@ -2175,10 +2211,8 @@ def run_points_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
             _write_quest_statuses(cfg, logger, wallet, idx + 1, api)
         except Exception as exc:
             logger.warning("Quest check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
-        if order_idx < len(wallet_records) - 1:
-            delay_sec = random.uniform(2, 5)
-            logger.info("Delay before next wallet: %.2f sec", delay_sec)
-            time.sleep(delay_sec)
+    for _ in _run_wallet_reads(wallet_records, logger, "POINTS", check):
+        pass
 
     try:
         cost_since = datetime.now(timezone.utc) - timedelta(days=7)
@@ -3040,16 +3074,35 @@ def run_balances_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -
     if wallet_order == "random":
         random.shuffle(wallet_records)
 
-    balance_token_catalog: Optional[List[LaunchpadTokenInfo]] = None
     logger.info("[BALANCES] mode started | wallets=%s | start_wallet=%s | end_wallet=%s | min_value=$0.01", len(wallets), start_number, end_number)
-    for order_idx, (idx, wallet) in enumerate(wallet_records):
+    metadata = None
+    quote_token = _usdce_token_from_config(cfg)
+    for idx, _wallet in wallet_records:
+        ctx = _wallet_api_context(cfg, idx, logger, "Balance metadata")
+        if ctx is None:
+            continue
+        api_key, proxies = ctx
+        api = DomaApiClient(cfg.doma_api_url, api_key=api_key, proxies=proxies)
+        try:
+            metadata = (api.fetch_fractional_tokens(take=100, max_pages=20),
+                        _fetch_eth_price_via_doma_quote(cfg, api, quote_token))
+            break
+        except Exception as exc:
+            logger.warning("[BALANCES] shared metadata failed [line=%s]: %s", idx + 1, type(exc).__name__)
+    if metadata is None:
+        logger.warning("[BALANCES] skipped: shared metadata unavailable")
+        return
+    balance_token_catalog, eth_price = metadata
+
+    def check(order_idx, record):
+        idx, wallet = record
         logger.info(
             "[BALANCES] wallet %s",
             _wallet_record_progress_label(order_idx, len(wallet_records), idx, len(wallets), wallet),
         )
         ctx = _wallet_api_context(cfg, idx, logger, "Balance check")
         if ctx is None:
-            continue
+            return
         api_key, proxies = ctx
         api = DomaApiClient(
             cfg.doma_api_url,
@@ -3058,15 +3111,12 @@ def run_balances_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -
             proxies=proxies,
         )
         try:
-            if balance_token_catalog is None:
-                balance_token_catalog = api.fetch_fractional_tokens(take=100, max_pages=20)
-            _log_wallet_balances_column(cfg, logger, wallet, idx + 1, api, proxies, balance_token_catalog)
+            _log_wallet_balances_column(cfg, logger, wallet, idx + 1, api, proxies, balance_token_catalog, eth_price)
         except Exception as exc:
             logger.warning("Balance check failed for %s [line=%s]: %s", wallet, idx + 1, exc)
-        if order_idx < len(wallet_records) - 1:
-            delay_sec = random.uniform(2, 5)
-            logger.info("[BALANCES] delay before next wallet: %.2f sec", delay_sec)
-            time.sleep(delay_sec)
+
+    for _ in _run_wallet_reads(wallet_records, logger, "BALANCES", check):
+        pass
 
 
 def _fetch_wallet_points_snapshot(
@@ -6233,7 +6283,7 @@ def run_domain_quest_volume_once(
 
         return success_wallets, failed_wallets, skipped_wallets, failed_wallet_labels
 
-    for succeeded, failed, skipped, labels in _run_quest_wallet_workers(wallet_key_records, state, logger, _process_wallet):
+    for succeeded, failed, skipped, labels in _run_quest_wallet_workers(wallet_key_records, state, logger, _process_wallet, wallets_per_worker=10, max_workers=6):
         success_wallets += succeeded
         failed_wallets += failed
         skipped_wallets += skipped
@@ -9366,7 +9416,7 @@ def _claim_existing_subdomain(
     quote_token: Token, weth_token: Token,
 ) -> bool:
     seen = {quote_token.address.lower(), weth_token.address.lower()}
-    balance_errors = 0
+    candidates = []
     for info in catalog:
         address = (info.address or "").strip().lower()
         if not address or address in seen:
@@ -9374,11 +9424,13 @@ def _claim_existing_subdomain(
         seen.add(address)
         if {str(info.name or "").lower(), str(info.symbol or "").lower()} & CHEAP_BUY_TOKEN_BLOCKLIST:
             continue
-        try:
-            balance = exec_client.get_erc20_balance(info.address, info.decimals)
-        except Exception as exc:
+        candidates.append(info)
+    balances = exec_client.get_erc20_balances(candidates)
+    balance_errors = 0
+    for info in candidates:
+        balance = balances.get(info.address.strip().lower())
+        if balance is None:
             balance_errors += 1
-            logger.warning("[CHEAP_BUY] wallet=%s token=%s balance scan failed: %s", wallet, info.name, exc)
             continue
         if balance <= 0:
             continue
@@ -12359,12 +12411,6 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
     skipped_wallets = 0
     failed_wallet_addresses: List[str] = []
 
-    def _fail_wallet() -> None:
-        nonlocal failed_wallets
-        failed_wallets += 1
-        wallet_label = f"wallet#{line_idx + 1}"
-        if wallet_label not in failed_wallet_addresses:
-            failed_wallet_addresses.append(wallet_label)
     domain_mode = get_domain_mode_menu_choice()
     if not domain_mode:
         logger.info("Domain swap canceled by user.")
@@ -12473,385 +12519,488 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
     except Exception as exc:
         logger.warning("[DOMAIN] metadata prefetch failed for %s: %s", dst_symbol, exc)
 
-    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
-        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "DOMAIN")
-        if skip_wallet:
-            skipped_wallets += 1
-            continue
-        logger.info("[DOMAIN] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
-        before_points_snapshot: Optional[PointsSnapshot] = None
-        try:
-            if is_one_swap:
-                try:
-                    doma_api = DomaApiClient(
-                        cfg.doma_api_url,
-                        api_key=cfg.doma_api_key,
-                        api_keys=cfg.doma_api_keys,
-                        proxies=proxies,
-                    )
-                    pools: List[Pool] = []
-                    eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, _usdce_token_from_config(cfg))
-                    if eth_price <= 0:
-                        raise RuntimeError("Failed to resolve ETH/USD")
+    def _process_wallet(idx, record, state):
+        success_wallets = failed_wallets = skipped_wallets = 0
+        failed_wallet_addresses = []
 
-                    def _resolve_single_swap_token_with_fallback(symbol: str) -> Tuple[Token, str, bool, bool]:
-                        nonlocal pools, eth_price
-                        try:
-                            return _resolve_single_swap_token(
-                                cfg=cfg,
-                                doma_api=doma_api,
-                                pools=pools,
-                                eth_price=eth_price,
-                                symbol=symbol,
-                            )
-                        except Exception as first_exc:
-                            if pools:
-                                raise
-                            try:
-                                subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
-                                pools = subgraph.fetch_top_pools(limit=1000)
-                            except Exception as exc:
-                                logger.warning("[DOMAIN] wallet=%s token lookup subgraph fallback failed: %s", wallet, exc)
-                                raise first_exc
-                            return _resolve_single_swap_token(
-                                cfg=cfg,
-                                doma_api=doma_api,
-                                pools=pools,
-                                eth_price=eth_price,
-                                symbol=symbol,
-                            )
+        def _fail_wallet() -> None:
+            nonlocal failed_wallets
+            failed_wallets += 1
+            wallet_label = f"wallet#{line_idx + 1}"
+            if wallet_label not in failed_wallet_addresses:
+                failed_wallet_addresses.append(wallet_label)
 
-                    exec_client = _build_exec_client_with_rpc_fallback(
-                        cfg=cfg,
-                        logger=logger,
-                        wallet=wallet,
-                        private_key=private_key,
-                        proxies=proxies,
-                        log_prefix="[DOMAIN]",
-                    )
-                    before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
-                    amount_expr = _pick_random_amount_expr(
-                        amount_mode,
-                        _parse_decimal_input(min_raw),
-                        _parse_decimal_input(max_raw),
-                        state,
-                        min_raw=min_raw,
-                        max_raw=max_raw,
-                    )
-                    token_in, display_in, is_eth_source, _ = _resolve_single_swap_token_with_fallback(src_symbol)
-                    token_out, display_out, _, _ = _resolve_single_swap_token_with_fallback(dst_symbol)
-                    unwrap_to_native = display_out == "ETH"
-                    logger.info("[DOMAIN] wallet=%s one swap | %s->%s amount=%s %s", wallet, display_in, display_out, amount_expr, display_in)
-                    ok = _execute_trade_via_doma_ui_route(
-                        cfg=cfg,
-                        logger=logger,
-                        state=state,
-                        doma_api=doma_api,
-                        exec_client=exec_client,
-                        token_in=token_in,
-                        token_out=token_out,
-                        display_in_symbol=display_in,
-                        display_out_symbol=display_out,
-                        trade_amount_expr=amount_expr,
-                        eth_price=eth_price,
-                        label=f"DOMAIN {wallet} {display_in}>{display_out}",
-                        is_eth_source=is_eth_source,
-                        unwrap_to_native=unwrap_to_native,
-                        wait_for_pre_tx=True,
-                        post_approve_delay_range=domain_pre_tx_delay_range,
-                    )
-                    if ok:
-                        success_wallets += 1
-                    else:
-                        _fail_wallet()
-                except Exception as exc:
-                    _fail_wallet()
-                    logger.warning("[DOMAIN] wallet=%s one swap failed: %s", wallet, exc)
-                if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
-                    delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
-                    logger.info("[DOMAIN] delay before next wallet: %.2f sec", delay_sec)
-                    time.sleep(delay_sec)
+        for idx, (line_idx, wallet, private_key) in [(idx, record)]:
+            proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "DOMAIN")
+            if skip_wallet:
+                skipped_wallets += 1
                 continue
+            logger.info("[DOMAIN] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
+            before_points_snapshot: Optional[PointsSnapshot] = None
+            try:
+                if is_one_swap:
+                    try:
+                        doma_api = DomaApiClient(
+                            cfg.doma_api_url,
+                            api_key=cfg.doma_api_key,
+                            api_keys=cfg.doma_api_keys,
+                            proxies=proxies,
+                        )
+                        pools: List[Pool] = []
+                        eth_price = _fetch_eth_price_via_doma_quote(cfg, doma_api, _usdce_token_from_config(cfg))
+                        if eth_price <= 0:
+                            raise RuntimeError("Failed to resolve ETH/USD")
 
-            if pooled_launchpad_info and pooled_quote_token and pooled_domain_token and pooled_weth_token and pooled_eth_price > 0:
-                try:
-                    doma_api = DomaApiClient(
-                        cfg.doma_api_url,
-                        api_key=cfg.doma_api_key,
-                        api_keys=cfg.doma_api_keys,
-                        proxies=proxies,
-                    )
-                    exec_client = _build_exec_client_with_rpc_fallback(
-                        cfg=cfg,
-                        logger=logger,
-                        wallet=wallet,
-                        private_key=private_key,
-                        proxies=proxies,
-                        log_prefix="[DOMAIN]",
-                    )
-                    before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
-                    amount_expr = _pick_random_amount_expr(
-                        amount_mode,
-                        _parse_decimal_input(min_raw),
-                        _parse_decimal_input(max_raw),
-                        state,
-                        min_raw=min_raw,
-                        max_raw=max_raw,
-                    )
-                    logger.info("[DOMAIN] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
-                    if src_symbol == "ETH":
-                        forward_token_in = pooled_weth_token
-                        forward_display_in = "ETH"
-                        forward_is_eth_source = True
-                        reverse_token_out = pooled_weth_token
-                        reverse_display_out = "ETH"
-                        reverse_unwrap_to_native = True
-                    elif src_symbol == "USDC.E":
-                        forward_token_in = pooled_quote_token
-                        forward_display_in = "USDC.E"
-                        forward_is_eth_source = False
-                        reverse_token_out = pooled_quote_token
-                        reverse_display_out = "USDC.E"
-                        reverse_unwrap_to_native = False
-                    else:
-                        logger.warning("[DOMAIN] wallet=%s unsupported source %s for %s", wallet, src_symbol, dst_symbol)
-                        _fail_wallet()
-                        continue
+                        def _resolve_single_swap_token_with_fallback(symbol: str) -> Tuple[Token, str, bool, bool]:
+                            nonlocal pools, eth_price
+                            try:
+                                return _resolve_single_swap_token(
+                                    cfg=cfg,
+                                    doma_api=doma_api,
+                                    pools=pools,
+                                    eth_price=eth_price,
+                                    symbol=symbol,
+                                )
+                            except Exception as first_exc:
+                                if pools:
+                                    raise
+                                try:
+                                    subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
+                                    pools = subgraph.fetch_top_pools(limit=1000)
+                                except Exception as exc:
+                                    logger.warning("[DOMAIN] wallet=%s token lookup subgraph fallback failed: %s", wallet, exc)
+                                    raise first_exc
+                                return _resolve_single_swap_token(
+                                    cfg=cfg,
+                                    doma_api=doma_api,
+                                    pools=pools,
+                                    eth_price=eth_price,
+                                    symbol=symbol,
+                                )
 
-                    before_dst = exec_client.get_erc20_balance(pooled_domain_token.address, pooled_domain_token.decimals)
-                    ok_fw = _execute_trade_via_doma_ui_route(
-                        cfg=cfg,
-                        logger=logger,
-                        state=state,
-                        doma_api=doma_api,
-                        exec_client=exec_client,
-                        token_in=forward_token_in,
-                        token_out=pooled_domain_token,
-                        display_in_symbol=forward_display_in,
-                        display_out_symbol=pooled_domain_token.symbol,
-                        trade_amount_expr=amount_expr,
-                        eth_price=pooled_eth_price,
-                        label=f"DOMAIN {wallet} {src_symbol}>{pooled_domain_token.symbol}",
-                        is_eth_source=forward_is_eth_source,
-                        wait_for_pre_tx=True,
-                        post_approve_delay_range=domain_pre_tx_delay_range,
-                    )
-                    if not ok_fw:
+                        exec_client = _build_exec_client_with_rpc_fallback(
+                            cfg=cfg,
+                            logger=logger,
+                            wallet=wallet,
+                            private_key=private_key,
+                            proxies=proxies,
+                            log_prefix="[DOMAIN]",
+                        )
+                        before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
+                        amount_expr = _pick_random_amount_expr(
+                            amount_mode,
+                            _parse_decimal_input(min_raw),
+                            _parse_decimal_input(max_raw),
+                            state,
+                            min_raw=min_raw,
+                            max_raw=max_raw,
+                        )
+                        token_in, display_in, is_eth_source, _ = _resolve_single_swap_token_with_fallback(src_symbol)
+                        token_out, display_out, _, _ = _resolve_single_swap_token_with_fallback(dst_symbol)
+                        unwrap_to_native = display_out == "ETH"
+                        logger.info("[DOMAIN] wallet=%s one swap | %s->%s amount=%s %s", wallet, display_in, display_out, amount_expr, display_in)
+                        ok = _execute_trade_via_doma_ui_route(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            doma_api=doma_api,
+                            exec_client=exec_client,
+                            token_in=token_in,
+                            token_out=token_out,
+                            display_in_symbol=display_in,
+                            display_out_symbol=display_out,
+                            trade_amount_expr=amount_expr,
+                            eth_price=eth_price,
+                            label=f"DOMAIN {wallet} {display_in}>{display_out}",
+                            is_eth_source=is_eth_source,
+                            unwrap_to_native=unwrap_to_native,
+                            wait_for_pre_tx=True,
+                            post_approve_delay_range=domain_pre_tx_delay_range,
+                        )
+                        if ok:
+                            success_wallets += 1
+                        else:
+                            _fail_wallet()
+                    except Exception as exc:
                         _fail_wallet()
-                        continue
-                    if state.last_tx_hash:
-                        _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
-                        _sleep_between_domain_swaps()
-
-                    after_dst = exec_client.get_erc20_balance(pooled_domain_token.address, pooled_domain_token.decimals)
-                    delta_dst = after_dst - before_dst
-                    if delta_dst <= 0:
-                        logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, pooled_domain_token.symbol)
-                        _fail_wallet()
-                        continue
-
-                    ok_bw = _execute_trade_via_doma_ui_route(
-                        cfg=cfg,
-                        logger=logger,
-                        state=state,
-                        doma_api=doma_api,
-                        exec_client=exec_client,
-                        token_in=pooled_domain_token,
-                        token_out=reverse_token_out,
-                        display_in_symbol=pooled_domain_token.symbol,
-                        display_out_symbol=reverse_display_out,
-                        trade_amount_expr=_format_decimal_plain(delta_dst),
-                        eth_price=pooled_eth_price,
-                        label=f"DOMAIN {wallet} {pooled_domain_token.symbol}>{src_symbol}",
-                        is_eth_source=False,
-                        unwrap_to_native=reverse_unwrap_to_native,
-                        wait_for_pre_tx=True,
-                        post_approve_delay_range=domain_pre_tx_delay_range,
-                    )
-                    if ok_bw:
-                        success_wallets += 1
-                    else:
-                        _fail_wallet()
+                        logger.warning("[DOMAIN] wallet=%s one swap failed: %s", wallet, exc)
                     if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
                         delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
                         logger.info("[DOMAIN] delay before next wallet: %.2f sec", delay_sec)
                         time.sleep(delay_sec)
                     continue
-                except Exception as exc:
-                    _fail_wallet()
-                    logger.warning("[DOMAIN] wallet=%s Doma UI route failed: %s", wallet, exc)
-                    continue
 
-            try:
-                subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
-                doma_api = DomaApiClient(
-                    cfg.doma_api_url,
-                    api_key=cfg.doma_api_key,
-                    api_keys=cfg.doma_api_keys,
-                    proxies=proxies,
-                )
-                pools = subgraph.fetch_top_pools(limit=1000)
-                eth_price = subgraph.fetch_eth_price_usd()
-                if eth_price <= 0:
-                    raise RuntimeError("Failed to resolve ETH/USD")
-                launchpad_info = doma_api.fetch_fractional_token_by_name(dst_symbol.lower())
-                has_target = any(p.token0.symbol == dst_symbol or p.token1.symbol == dst_symbol for p in pools)
-                if not has_target and not launchpad_info:
-                    raise RuntimeError(f"Token {dst_symbol} not found in top pools")
-            except Exception as exc:
-                _fail_wallet()
-                logger.warning("[DOMAIN] wallet=%s init failed: %s", wallet, exc)
-                continue
-
-            def _pick_pool(a: str, b: str) -> Optional[Pool]:
-                return _find_best_pool_for_symbols(cfg, pools, a, b, ignore_limits=True)
-
-            def _find_token_by_symbol(sym: str) -> Optional[Token]:
-                target = canonical_symbol(sym)
-                for p in pools:
-                    if p.token0.symbol == target:
-                        return p.token0
-                    if p.token1.symbol == target:
-                        return p.token1
-                return None
-
-            amount_expr = _pick_random_amount_expr(
-                amount_mode,
-                _parse_decimal_input(min_raw),
-                _parse_decimal_input(max_raw),
-                state,
-                min_raw=min_raw,
-                max_raw=max_raw,
-            )
-            logger.info("[DOMAIN] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
-            exec_client = _build_exec_client_with_rpc_fallback(
-                cfg=cfg,
-                logger=logger,
-                wallet=wallet,
-                private_key=private_key,
-                proxies=proxies,
-                log_prefix="[DOMAIN]",
-            )
-            before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
-
-            if use_relay_swap:
-                src_token = _find_token_by_symbol(src_symbol) if src_symbol != "ETH" else None
-                dst_token = _find_token_by_symbol(dst_symbol)
-                if not dst_token:
-                    logger.warning("[DOMAIN] wallet=%s token %s not found for relay swap", wallet, dst_symbol)
-                    _fail_wallet()
-                    continue
-
-                if src_symbol == "ETH":
-                    src_balance_dec = exec_client.get_native_balance()
-                    src_decimals = 18
-                    src_usd = eth_price
-                    src_currency_for_relay = NATIVE_ETH
-                    src_currency_for_balance = NATIVE_ETH
-                else:
-                    if not src_token:
-                        logger.warning("[DOMAIN] wallet=%s source token %s not found", wallet, src_symbol)
-                        _fail_wallet()
-                        continue
-                    src_balance_dec = exec_client.get_erc20_balance(src_token.address, src_token.decimals)
-                    src_decimals = src_token.decimals
-                    src_usd = pick_token_usd_price(src_token, eth_price)
-                    src_currency_for_relay = src_token.address
-                    src_currency_for_balance = src_token.address
-
-                try:
-                    amount_in_dec, _ = resolve_trade_amount(amount_expr, src_balance_dec, src_usd)
-                except Exception as exc:
-                    logger.warning("[DOMAIN] wallet=%s amount resolve failed: %s", wallet, exc)
-                    _fail_wallet()
-                    continue
-                amount_in_raw = decimal_to_raw(amount_in_dec, src_decimals)
-                if amount_in_raw <= 0:
-                    logger.warning("[DOMAIN] wallet=%s amount too small", wallet)
-                    _fail_wallet()
-                    continue
-
-                before_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
-                try:
-                    execute_relay_swap(
-                        logger=logger,
-                        wallet=wallet,
-                        private_key=private_key,
-                        chain_id=cfg.chain_id,
-                        origin_currency=src_currency_for_relay,
-                        destination_currency=dst_token.address,
-                        amount_raw=amount_in_raw,
-                        proxies=proxies,
-                    )
-                except Exception as exc:
-                    logger.warning("[DOMAIN] wallet=%s relay swap failed %s->%s: %s", wallet, src_symbol, dst_symbol, exc)
-                    _fail_wallet()
-                    continue
-
-                _sleep_between_domain_swaps()
-                after_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
-                delta_dst = after_dst - before_dst
-                if delta_dst <= 0:
-                    logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
-                    _fail_wallet()
-                    continue
-
-                amount_back_raw = decimal_to_raw(delta_dst, dst_token.decimals)
-                dest_back_currency = src_currency_for_balance
-                try:
-                    execute_relay_swap(
-                        logger=logger,
-                        wallet=wallet,
-                        private_key=private_key,
-                        chain_id=cfg.chain_id,
-                        origin_currency=dst_token.address,
-                        destination_currency=dest_back_currency,
-                        amount_raw=amount_back_raw,
-                        proxies=proxies,
-                    )
-                except Exception as exc:
-                    logger.warning("[DOMAIN] wallet=%s relay reverse swap failed %s->%s: %s", wallet, dst_symbol, src_symbol, exc)
-                    _fail_wallet()
-                    continue
-                success_wallets += 1
-                continue
-
-            if launchpad_info and not launchpad_info.pool_address:
-                quote_token = _find_token_by_address(pools, launchpad_info.quote_token_address)
-                if not quote_token:
-                    quote_token = Token(
-                        address=launchpad_info.quote_token_address,
-                        symbol="USDC.E",
-                        decimals=6,
-                        derived_eth=Decimal("0"),
-                    )
-                launchpad_token = _token_from_launchpad(launchpad_info)
-
-                if src_symbol == "USDC.E":
-                    if canonical_symbol(quote_token.symbol) != "USDC.E":
-                        logger.warning(
-                            "[DOMAIN] wallet=%s unsupported launchpad quote token %s for source %s",
-                            wallet,
-                            quote_token.symbol,
-                            src_symbol,
+                if pooled_launchpad_info and pooled_quote_token and pooled_domain_token and pooled_weth_token and pooled_eth_price > 0:
+                    try:
+                        doma_api = DomaApiClient(
+                            cfg.doma_api_url,
+                            api_key=cfg.doma_api_key,
+                            api_keys=cfg.doma_api_keys,
+                            proxies=proxies,
                         )
+                        exec_client = _build_exec_client_with_rpc_fallback(
+                            cfg=cfg,
+                            logger=logger,
+                            wallet=wallet,
+                            private_key=private_key,
+                            proxies=proxies,
+                            log_prefix="[DOMAIN]",
+                        )
+                        before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
+                        amount_expr = _pick_random_amount_expr(
+                            amount_mode,
+                            _parse_decimal_input(min_raw),
+                            _parse_decimal_input(max_raw),
+                            state,
+                            min_raw=min_raw,
+                            max_raw=max_raw,
+                        )
+                        logger.info("[DOMAIN] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
+                        if src_symbol == "ETH":
+                            forward_token_in = pooled_weth_token
+                            forward_display_in = "ETH"
+                            forward_is_eth_source = True
+                            reverse_token_out = pooled_weth_token
+                            reverse_display_out = "ETH"
+                            reverse_unwrap_to_native = True
+                        elif src_symbol == "USDC.E":
+                            forward_token_in = pooled_quote_token
+                            forward_display_in = "USDC.E"
+                            forward_is_eth_source = False
+                            reverse_token_out = pooled_quote_token
+                            reverse_display_out = "USDC.E"
+                            reverse_unwrap_to_native = False
+                        else:
+                            logger.warning("[DOMAIN] wallet=%s unsupported source %s for %s", wallet, src_symbol, dst_symbol)
+                            _fail_wallet()
+                            continue
+
+                        before_dst = exec_client.get_erc20_balance(pooled_domain_token.address, pooled_domain_token.decimals)
+                        ok_fw = _execute_trade_via_doma_ui_route(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            doma_api=doma_api,
+                            exec_client=exec_client,
+                            token_in=forward_token_in,
+                            token_out=pooled_domain_token,
+                            display_in_symbol=forward_display_in,
+                            display_out_symbol=pooled_domain_token.symbol,
+                            trade_amount_expr=amount_expr,
+                            eth_price=pooled_eth_price,
+                            label=f"DOMAIN {wallet} {src_symbol}>{pooled_domain_token.symbol}",
+                            is_eth_source=forward_is_eth_source,
+                            wait_for_pre_tx=True,
+                            post_approve_delay_range=domain_pre_tx_delay_range,
+                        )
+                        if not ok_fw:
+                            _fail_wallet()
+                            continue
+                        if state.last_tx_hash:
+                            _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                            _sleep_between_domain_swaps()
+
+                        after_dst = exec_client.get_erc20_balance(pooled_domain_token.address, pooled_domain_token.decimals)
+                        delta_dst = after_dst - before_dst
+                        if delta_dst <= 0:
+                            logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, pooled_domain_token.symbol)
+                            _fail_wallet()
+                            continue
+
+                        ok_bw = _execute_trade_via_doma_ui_route(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            doma_api=doma_api,
+                            exec_client=exec_client,
+                            token_in=pooled_domain_token,
+                            token_out=reverse_token_out,
+                            display_in_symbol=pooled_domain_token.symbol,
+                            display_out_symbol=reverse_display_out,
+                            trade_amount_expr=_format_decimal_plain(delta_dst),
+                            eth_price=pooled_eth_price,
+                            label=f"DOMAIN {wallet} {pooled_domain_token.symbol}>{src_symbol}",
+                            is_eth_source=False,
+                            unwrap_to_native=reverse_unwrap_to_native,
+                            wait_for_pre_tx=True,
+                            post_approve_delay_range=domain_pre_tx_delay_range,
+                        )
+                        if ok_bw:
+                            success_wallets += 1
+                        else:
+                            _fail_wallet()
+                        if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+                            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+                            logger.info("[DOMAIN] delay before next wallet: %.2f sec", delay_sec)
+                            time.sleep(delay_sec)
+                        continue
+                    except Exception as exc:
+                        _fail_wallet()
+                        logger.warning("[DOMAIN] wallet=%s Doma UI route failed: %s", wallet, exc)
+                        continue
+
+                try:
+                    subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
+                    doma_api = DomaApiClient(
+                        cfg.doma_api_url,
+                        api_key=cfg.doma_api_key,
+                        api_keys=cfg.doma_api_keys,
+                        proxies=proxies,
+                    )
+                    pools = subgraph.fetch_top_pools(limit=1000)
+                    eth_price = subgraph.fetch_eth_price_usd()
+                    if eth_price <= 0:
+                        raise RuntimeError("Failed to resolve ETH/USD")
+                    launchpad_info = doma_api.fetch_fractional_token_by_name(dst_symbol.lower())
+                    has_target = any(p.token0.symbol == dst_symbol or p.token1.symbol == dst_symbol for p in pools)
+                    if not has_target and not launchpad_info:
+                        raise RuntimeError(f"Token {dst_symbol} not found in top pools")
+                except Exception as exc:
+                    _fail_wallet()
+                    logger.warning("[DOMAIN] wallet=%s init failed: %s", wallet, exc)
+                    continue
+
+                def _pick_pool(a: str, b: str) -> Optional[Pool]:
+                    return _find_best_pool_for_symbols(cfg, pools, a, b, ignore_limits=True)
+
+                def _find_token_by_symbol(sym: str) -> Optional[Token]:
+                    target = canonical_symbol(sym)
+                    for p in pools:
+                        if p.token0.symbol == target:
+                            return p.token0
+                        if p.token1.symbol == target:
+                            return p.token1
+                    return None
+
+                amount_expr = _pick_random_amount_expr(
+                    amount_mode,
+                    _parse_decimal_input(min_raw),
+                    _parse_decimal_input(max_raw),
+                    state,
+                    min_raw=min_raw,
+                    max_raw=max_raw,
+                )
+                logger.info("[DOMAIN] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
+                exec_client = _build_exec_client_with_rpc_fallback(
+                    cfg=cfg,
+                    logger=logger,
+                    wallet=wallet,
+                    private_key=private_key,
+                    proxies=proxies,
+                    log_prefix="[DOMAIN]",
+                )
+                before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
+
+                if use_relay_swap:
+                    src_token = _find_token_by_symbol(src_symbol) if src_symbol != "ETH" else None
+                    dst_token = _find_token_by_symbol(dst_symbol)
+                    if not dst_token:
+                        logger.warning("[DOMAIN] wallet=%s token %s not found for relay swap", wallet, dst_symbol)
                         _fail_wallet()
                         continue
+
+                    if src_symbol == "ETH":
+                        src_balance_dec = exec_client.get_native_balance()
+                        src_decimals = 18
+                        src_usd = eth_price
+                        src_currency_for_relay = NATIVE_ETH
+                        src_currency_for_balance = NATIVE_ETH
+                    else:
+                        if not src_token:
+                            logger.warning("[DOMAIN] wallet=%s source token %s not found", wallet, src_symbol)
+                            _fail_wallet()
+                            continue
+                        src_balance_dec = exec_client.get_erc20_balance(src_token.address, src_token.decimals)
+                        src_decimals = src_token.decimals
+                        src_usd = pick_token_usd_price(src_token, eth_price)
+                        src_currency_for_relay = src_token.address
+                        src_currency_for_balance = src_token.address
+
+                    try:
+                        amount_in_dec, _ = resolve_trade_amount(amount_expr, src_balance_dec, src_usd)
+                    except Exception as exc:
+                        logger.warning("[DOMAIN] wallet=%s amount resolve failed: %s", wallet, exc)
+                        _fail_wallet()
+                        continue
+                    amount_in_raw = decimal_to_raw(amount_in_dec, src_decimals)
+                    if amount_in_raw <= 0:
+                        logger.warning("[DOMAIN] wallet=%s amount too small", wallet)
+                        _fail_wallet()
+                        continue
+
+                    before_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
+                    try:
+                        execute_relay_swap(
+                            logger=logger,
+                            wallet=wallet,
+                            private_key=private_key,
+                            chain_id=cfg.chain_id,
+                            origin_currency=src_currency_for_relay,
+                            destination_currency=dst_token.address,
+                            amount_raw=amount_in_raw,
+                            proxies=proxies,
+                        )
+                    except Exception as exc:
+                        logger.warning("[DOMAIN] wallet=%s relay swap failed %s->%s: %s", wallet, src_symbol, dst_symbol, exc)
+                        _fail_wallet()
+                        continue
+
+                    _sleep_between_domain_swaps()
+                    after_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
+                    delta_dst = after_dst - before_dst
+                    if delta_dst <= 0:
+                        logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
+                        _fail_wallet()
+                        continue
+
+                    amount_back_raw = decimal_to_raw(delta_dst, dst_token.decimals)
+                    dest_back_currency = src_currency_for_balance
+                    try:
+                        execute_relay_swap(
+                            logger=logger,
+                            wallet=wallet,
+                            private_key=private_key,
+                            chain_id=cfg.chain_id,
+                            origin_currency=dst_token.address,
+                            destination_currency=dest_back_currency,
+                            amount_raw=amount_back_raw,
+                            proxies=proxies,
+                        )
+                    except Exception as exc:
+                        logger.warning("[DOMAIN] wallet=%s relay reverse swap failed %s->%s: %s", wallet, dst_symbol, src_symbol, exc)
+                        _fail_wallet()
+                        continue
+                    success_wallets += 1
+                    continue
+
+                if launchpad_info and not launchpad_info.pool_address:
+                    quote_token = _find_token_by_address(pools, launchpad_info.quote_token_address)
+                    if not quote_token:
+                        quote_token = Token(
+                            address=launchpad_info.quote_token_address,
+                            symbol="USDC.E",
+                            decimals=6,
+                            derived_eth=Decimal("0"),
+                        )
+                    launchpad_token = _token_from_launchpad(launchpad_info)
+
+                    if src_symbol == "USDC.E":
+                        if canonical_symbol(quote_token.symbol) != "USDC.E":
+                            logger.warning(
+                                "[DOMAIN] wallet=%s unsupported launchpad quote token %s for source %s",
+                                wallet,
+                                quote_token.symbol,
+                                src_symbol,
+                            )
+                            _fail_wallet()
+                            continue
+                        before_dst = exec_client.get_erc20_balance(launchpad_token.address, launchpad_token.decimals)
+                        ok_fw = _execute_launchpad_buy(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            exec_client=exec_client,
+                            launchpad=launchpad_info,
+                            quote_token=quote_token,
+                            trade_amount_expr=amount_expr,
+                            eth_price=eth_price,
+                            label=f"DOMAIN {wallet} USDC.E>{dst_symbol}",
+                            wait_for_pre_tx=True,
+                            post_approve_delay_range=domain_pre_tx_delay_range,
+                        )
+                        if not ok_fw:
+                            _fail_wallet()
+                            continue
+                        if state.last_tx_hash:
+                            _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                            _sleep_between_domain_swaps()
+                        after_dst = exec_client.get_erc20_balance(launchpad_token.address, launchpad_token.decimals)
+                        delta_dst = after_dst - before_dst
+                        if delta_dst <= 0:
+                            logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
+                            _fail_wallet()
+                            continue
+                        ok_bw = _execute_launchpad_sell(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            exec_client=exec_client,
+                            launchpad=launchpad_info,
+                            quote_token=quote_token,
+                            trade_amount_expr=_format_decimal_plain(delta_dst),
+                            eth_price=eth_price,
+                            label=f"DOMAIN {wallet} {dst_symbol}>USDC.E",
+                            wait_for_pre_tx=True,
+                            post_approve_delay_range=domain_pre_tx_delay_range,
+                        )
+                        if ok_bw:
+                            success_wallets += 1
+                        else:
+                            _fail_wallet()
+                        if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+                            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+                            logger.info("[DOMAIN] delay before next wallet: %.2f sec", delay_sec)
+                            time.sleep(delay_sec)
+                        continue
+
+                    pool_eth_usdc = _pick_pool("ETH", "USDC.E")
+                    pool_usdc_eth = _pick_pool("USDC.E", "ETH")
+                    if not pool_eth_usdc or not pool_usdc_eth:
+                        logger.warning("[DOMAIN] wallet=%s no route ETH<->USDC.E for launchpad token %s", wallet, dst_symbol)
+                        _fail_wallet()
+                        continue
+                    usdc_pair = _find_tokens_for_direction(pool_eth_usdc, "ETH", "USDC.E")
+                    if not usdc_pair:
+                        logger.warning("[DOMAIN] wallet=%s invalid ETH>USDC.E pool for launchpad token %s", wallet, dst_symbol)
+                        _fail_wallet()
+                        continue
+
+                    before_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                    ok_eth_to_usdc = _execute_trade_for_pair(
+                        cfg=cfg,
+                        logger=logger,
+                        state=state,
+                        exec_client=exec_client,
+                        pool=pool_eth_usdc,
+                        symbol_in="ETH",
+                        symbol_out="USDC.E",
+                        trade_amount_expr=amount_expr,
+                        eth_price=eth_price,
+                        label=f"DOMAIN {wallet} ETH>USDC.E",
+                        bypass_risk_checks=True,
+                        allow_no_quoter_execution=True,
+                        wait_for_pre_tx=True,
+                        post_approve_delay_range=domain_pre_tx_delay_range,
+                    )
+                    if not ok_eth_to_usdc:
+                        logger.warning("[DOMAIN] wallet=%s first leg failed ETH>USDC.E", wallet)
+                        _fail_wallet()
+                        continue
+                    if state.last_tx_hash:
+                        _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                        _sleep_between_domain_swaps()
+                    after_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                    delta_usdc = after_usdc - before_usdc
+                    if delta_usdc <= 0:
+                        logger.warning("[DOMAIN] wallet=%s no received USDC.E for launchpad buy", wallet)
+                        _fail_wallet()
+                        continue
+
                     before_dst = exec_client.get_erc20_balance(launchpad_token.address, launchpad_token.decimals)
-                    ok_fw = _execute_launchpad_buy(
+                    ok_buy = _execute_launchpad_buy(
                         cfg=cfg,
                         logger=logger,
                         state=state,
                         exec_client=exec_client,
                         launchpad=launchpad_info,
                         quote_token=quote_token,
-                        trade_amount_expr=amount_expr,
+                        trade_amount_expr=_format_decimal_plain(delta_usdc),
                         eth_price=eth_price,
                         label=f"DOMAIN {wallet} USDC.E>{dst_symbol}",
                         wait_for_pre_tx=True,
                         post_approve_delay_range=domain_pre_tx_delay_range,
                     )
-                    if not ok_fw:
+                    if not ok_buy:
                         _fail_wallet()
                         continue
                     if state.last_tx_hash:
@@ -12863,7 +13012,9 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                         logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
                         _fail_wallet()
                         continue
-                    ok_bw = _execute_launchpad_sell(
+
+                    before_usdc_back = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                    ok_sell = _execute_launchpad_sell(
                         cfg=cfg,
                         logger=logger,
                         state=state,
@@ -12876,7 +13027,36 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                         wait_for_pre_tx=True,
                         post_approve_delay_range=domain_pre_tx_delay_range,
                     )
-                    if ok_bw:
+                    if not ok_sell:
+                        _fail_wallet()
+                        continue
+                    if state.last_tx_hash:
+                        _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                        _sleep_between_domain_swaps()
+                    after_usdc_back = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
+                    delta_usdc_back = after_usdc_back - before_usdc_back
+                    if delta_usdc_back <= 0:
+                        logger.warning("[DOMAIN] wallet=%s no received USDC.E for final swap back to ETH", wallet)
+                        _fail_wallet()
+                        continue
+
+                    ok_usdc_to_eth = _execute_trade_for_pair(
+                        cfg=cfg,
+                        logger=logger,
+                        state=state,
+                        exec_client=exec_client,
+                        pool=pool_usdc_eth,
+                        symbol_in="USDC.E",
+                        symbol_out="ETH",
+                        trade_amount_expr=_format_decimal_plain(delta_usdc_back),
+                        eth_price=eth_price,
+                        label=f"DOMAIN {wallet} USDC.E>ETH",
+                        bypass_risk_checks=True,
+                        allow_no_quoter_execution=True,
+                        wait_for_pre_tx=True,
+                        post_approve_delay_range=domain_pre_tx_delay_range,
+                    )
+                    if ok_usdc_to_eth:
                         success_wallets += 1
                     else:
                         _fail_wallet()
@@ -12886,336 +13066,224 @@ def run_domain_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState
                         time.sleep(delay_sec)
                     continue
 
-                pool_eth_usdc = _pick_pool("ETH", "USDC.E")
-                pool_usdc_eth = _pick_pool("USDC.E", "ETH")
-                if not pool_eth_usdc or not pool_usdc_eth:
-                    logger.warning("[DOMAIN] wallet=%s no route ETH<->USDC.E for launchpad token %s", wallet, dst_symbol)
-                    _fail_wallet()
-                    continue
-                usdc_pair = _find_tokens_for_direction(pool_eth_usdc, "ETH", "USDC.E")
-                if not usdc_pair:
-                    logger.warning("[DOMAIN] wallet=%s invalid ETH>USDC.E pool for launchpad token %s", wallet, dst_symbol)
-                    _fail_wallet()
-                    continue
-
-                before_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-                ok_eth_to_usdc = _execute_trade_for_pair(
-                    cfg=cfg,
-                    logger=logger,
-                    state=state,
-                    exec_client=exec_client,
-                    pool=pool_eth_usdc,
-                    symbol_in="ETH",
-                    symbol_out="USDC.E",
-                    trade_amount_expr=amount_expr,
-                    eth_price=eth_price,
-                    label=f"DOMAIN {wallet} ETH>USDC.E",
-                    bypass_risk_checks=True,
-                    allow_no_quoter_execution=True,
-                    wait_for_pre_tx=True,
-                    post_approve_delay_range=domain_pre_tx_delay_range,
-                )
-                if not ok_eth_to_usdc:
-                    logger.warning("[DOMAIN] wallet=%s first leg failed ETH>USDC.E", wallet)
-                    _fail_wallet()
-                    continue
-                if state.last_tx_hash:
-                    _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
-                    _sleep_between_domain_swaps()
-                after_usdc = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-                delta_usdc = after_usdc - before_usdc
-                if delta_usdc <= 0:
-                    logger.warning("[DOMAIN] wallet=%s no received USDC.E for launchpad buy", wallet)
-                    _fail_wallet()
-                    continue
-
-                before_dst = exec_client.get_erc20_balance(launchpad_token.address, launchpad_token.decimals)
-                ok_buy = _execute_launchpad_buy(
-                    cfg=cfg,
-                    logger=logger,
-                    state=state,
-                    exec_client=exec_client,
-                    launchpad=launchpad_info,
-                    quote_token=quote_token,
-                    trade_amount_expr=_format_decimal_plain(delta_usdc),
-                    eth_price=eth_price,
-                    label=f"DOMAIN {wallet} USDC.E>{dst_symbol}",
-                    wait_for_pre_tx=True,
-                    post_approve_delay_range=domain_pre_tx_delay_range,
-                )
-                if not ok_buy:
-                    _fail_wallet()
-                    continue
-                if state.last_tx_hash:
-                    _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
-                    _sleep_between_domain_swaps()
-                after_dst = exec_client.get_erc20_balance(launchpad_token.address, launchpad_token.decimals)
-                delta_dst = after_dst - before_dst
-                if delta_dst <= 0:
-                    logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
-                    _fail_wallet()
-                    continue
-
-                before_usdc_back = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-                ok_sell = _execute_launchpad_sell(
-                    cfg=cfg,
-                    logger=logger,
-                    state=state,
-                    exec_client=exec_client,
-                    launchpad=launchpad_info,
-                    quote_token=quote_token,
-                    trade_amount_expr=_format_decimal_plain(delta_dst),
-                    eth_price=eth_price,
-                    label=f"DOMAIN {wallet} {dst_symbol}>USDC.E",
-                    wait_for_pre_tx=True,
-                    post_approve_delay_range=domain_pre_tx_delay_range,
-                )
-                if not ok_sell:
-                    _fail_wallet()
-                    continue
-                if state.last_tx_hash:
-                    _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
-                    _sleep_between_domain_swaps()
-                after_usdc_back = exec_client.get_erc20_balance(quote_token.address, quote_token.decimals)
-                delta_usdc_back = after_usdc_back - before_usdc_back
-                if delta_usdc_back <= 0:
-                    logger.warning("[DOMAIN] wallet=%s no received USDC.E for final swap back to ETH", wallet)
-                    _fail_wallet()
-                    continue
-
-                ok_usdc_to_eth = _execute_trade_for_pair(
-                    cfg=cfg,
-                    logger=logger,
-                    state=state,
-                    exec_client=exec_client,
-                    pool=pool_usdc_eth,
-                    symbol_in="USDC.E",
-                    symbol_out="ETH",
-                    trade_amount_expr=_format_decimal_plain(delta_usdc_back),
-                    eth_price=eth_price,
-                    label=f"DOMAIN {wallet} USDC.E>ETH",
-                    bypass_risk_checks=True,
-                    allow_no_quoter_execution=True,
-                    wait_for_pre_tx=True,
-                    post_approve_delay_range=domain_pre_tx_delay_range,
-                )
-                if ok_usdc_to_eth:
-                    success_wallets += 1
-                else:
-                    _fail_wallet()
-                if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
-                    delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
-                    logger.info("[DOMAIN] delay before next wallet: %.2f sec", delay_sec)
-                    time.sleep(delay_sec)
-                continue
-
-            if src_symbol == "USDC.E":
-                pool_fw = _pick_pool("USDC.E", dst_symbol)
-                pool_bw = _pick_pool(dst_symbol, "USDC.E")
-                if not pool_fw or not pool_bw:
-                    logger.warning("[DOMAIN] wallet=%s no route USDC.E<->%s", wallet, dst_symbol)
-                    _fail_wallet()
-                else:
-                    pair_fw = _find_tokens_for_direction(pool_fw, "USDC.E", dst_symbol)
-                    if not pair_fw:
-                        logger.warning("[DOMAIN] wallet=%s invalid pool direction USDC.E>%s", wallet, dst_symbol)
+                if src_symbol == "USDC.E":
+                    pool_fw = _pick_pool("USDC.E", dst_symbol)
+                    pool_bw = _pick_pool(dst_symbol, "USDC.E")
+                    if not pool_fw or not pool_bw:
+                        logger.warning("[DOMAIN] wallet=%s no route USDC.E<->%s", wallet, dst_symbol)
                         _fail_wallet()
                     else:
-                        dst_token = pair_fw[1]
-                        before_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
-                        ok_fw = _execute_trade_for_pair(
-                            cfg=cfg,
-                            logger=logger,
-                            state=state,
-                            exec_client=exec_client,
-                            pool=pool_fw,
-                            symbol_in="USDC.E",
-                            symbol_out=dst_symbol,
-                            trade_amount_expr=amount_expr,
-                            eth_price=eth_price,
-                            label=f"DOMAIN {wallet} USDC.E>{dst_symbol}",
-                            bypass_risk_checks=True,
-                            allow_no_quoter_execution=True,
-                            wait_for_pre_tx=True,
-                            post_approve_delay_range=domain_pre_tx_delay_range,
-                        )
-                        if not ok_fw:
-                            _fail_wallet()
-                            continue
-                        if ok_fw and state.last_tx_hash:
-                            _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
-                            _sleep_between_domain_swaps()
-                        after_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
-                        delta_dst = after_dst - before_dst
-                        if delta_dst <= 0:
-                            logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
+                        pair_fw = _find_tokens_for_direction(pool_fw, "USDC.E", dst_symbol)
+                        if not pair_fw:
+                            logger.warning("[DOMAIN] wallet=%s invalid pool direction USDC.E>%s", wallet, dst_symbol)
                             _fail_wallet()
                         else:
-                            back_expr = _format_decimal_plain(delta_dst)
-                            ok_bw = _execute_trade_for_pair(
-                                cfg=cfg,
-                                logger=logger,
-                                state=state,
-                                exec_client=exec_client,
-                                pool=pool_bw,
-                                symbol_in=dst_symbol,
-                                symbol_out="USDC.E",
-                                trade_amount_expr=back_expr,
-                                eth_price=eth_price,
-                                label=f"DOMAIN {wallet} {dst_symbol}>USDC.E",
-                                bypass_risk_checks=True,
-                                allow_no_quoter_execution=True,
-                                wait_for_pre_tx=True,
-                                post_approve_delay_range=domain_pre_tx_delay_range,
-                            )
-                            if ok_bw:
-                                success_wallets += 1
-                            else:
-                                _fail_wallet()
-            else:
-                pool_direct_fw = _pick_pool("ETH", dst_symbol)
-                pool_direct_bw = _pick_pool(dst_symbol, "ETH")
-                if pool_direct_fw and pool_direct_bw:
-                    pair_fw = _find_tokens_for_direction(pool_direct_fw, "ETH", dst_symbol)
-                    if not pair_fw:
-                        logger.warning("[DOMAIN] wallet=%s invalid direct pool direction ETH>%s", wallet, dst_symbol)
-                        _fail_wallet()
-                    else:
-                        dst_token = pair_fw[1]
-                        before_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
-                        ok_fw = _execute_trade_for_pair(
-                            cfg=cfg,
-                            logger=logger,
-                            state=state,
-                            exec_client=exec_client,
-                            pool=pool_direct_fw,
-                            symbol_in="ETH",
-                            symbol_out=dst_symbol,
-                            trade_amount_expr=amount_expr,
-                            eth_price=eth_price,
-                            label=f"DOMAIN {wallet} ETH>{dst_symbol}",
-                            bypass_risk_checks=True,
-                            allow_no_quoter_execution=True,
-                            wait_for_pre_tx=True,
-                            post_approve_delay_range=domain_pre_tx_delay_range,
-                        )
-                        if not ok_fw:
-                            _fail_wallet()
-                            continue
-                        if ok_fw and state.last_tx_hash:
-                            _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
-                            _sleep_between_domain_swaps()
-                        after_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
-                        delta_dst = after_dst - before_dst
-                        if delta_dst <= 0:
-                            logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
-                            _fail_wallet()
-                        else:
-                            back_expr = _format_decimal_plain(delta_dst)
-                            ok_bw = _execute_trade_for_pair(
-                                cfg=cfg,
-                                logger=logger,
-                                state=state,
-                                exec_client=exec_client,
-                                pool=pool_direct_bw,
-                                symbol_in=dst_symbol,
-                                symbol_out="ETH",
-                                trade_amount_expr=back_expr,
-                                eth_price=eth_price,
-                                label=f"DOMAIN {wallet} {dst_symbol}>ETH",
-                                bypass_risk_checks=True,
-                                allow_no_quoter_execution=True,
-                                wait_for_pre_tx=True,
-                                post_approve_delay_range=domain_pre_tx_delay_range,
-                            )
-                            if ok_bw:
-                                success_wallets += 1
-                            else:
-                                _fail_wallet()
-                else:
-                    pool_eth_usdc = _pick_pool("ETH", "USDC.E")
-                    pool_usdc_dst = _pick_pool("USDC.E", dst_symbol)
-                    pool_dst_usdc = _pick_pool(dst_symbol, "USDC.E")
-                    pool_usdc_eth = _pick_pool("USDC.E", "ETH")
-                    if not pool_eth_usdc or not pool_usdc_dst or not pool_dst_usdc or not pool_usdc_eth:
-                        logger.warning("[DOMAIN] wallet=%s no route ETH>USDC.E>%s and back", wallet, dst_symbol)
-                        _fail_wallet()
-                    else:
-                        usdc_from_eth_pair = _find_tokens_for_direction(pool_eth_usdc, "ETH", "USDC.E")
-                        dst_from_usdc_pair = _find_tokens_for_direction(pool_usdc_dst, "USDC.E", dst_symbol)
-                        usdc_from_dst_pair = _find_tokens_for_direction(pool_dst_usdc, dst_symbol, "USDC.E")
-                        eth_from_usdc_pair = _find_tokens_for_direction(pool_usdc_eth, "USDC.E", "ETH")
-                        if not usdc_from_eth_pair or not dst_from_usdc_pair or not usdc_from_dst_pair or not eth_from_usdc_pair:
-                            logger.warning("[DOMAIN] wallet=%s invalid multi-hop pool direction for %s", wallet, dst_symbol)
-                            _fail_wallet()
-                        else:
-                            weth_token = usdc_from_eth_pair[0]
-                            usdc_token = usdc_from_eth_pair[1]
-                            dst_token = dst_from_usdc_pair[1]
-
-                            # Forward in one logical swap: ETH -> DOMAIN_TOKEN (via USDC.E path).
+                            dst_token = pair_fw[1]
                             before_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
-                            ok_fw = _execute_trade_for_path(
+                            ok_fw = _execute_trade_for_pair(
                                 cfg=cfg,
                                 logger=logger,
                                 state=state,
                                 exec_client=exec_client,
-                                token_in=weth_token,
-                                token_out=dst_token,
-                                path_tokens=[weth_token, usdc_token, dst_token],
-                                path_token_addresses=[weth_token.address, usdc_token.address, dst_token.address],
-                                path_fee_tiers=[pool_eth_usdc.fee_tier, pool_usdc_dst.fee_tier],
+                                pool=pool_fw,
+                                symbol_in="USDC.E",
+                                symbol_out=dst_symbol,
                                 trade_amount_expr=amount_expr,
                                 eth_price=eth_price,
-                                label=f"DOMAIN {wallet} ETH>{dst_symbol}",
-                                is_eth_source=True,
+                                label=f"DOMAIN {wallet} USDC.E>{dst_symbol}",
+                                bypass_risk_checks=True,
+                                allow_no_quoter_execution=True,
                                 wait_for_pre_tx=True,
                                 post_approve_delay_range=domain_pre_tx_delay_range,
                             )
                             if not ok_fw:
-                                logger.warning("[DOMAIN] wallet=%s first leg failed ETH>%s", wallet, dst_symbol)
+                                _fail_wallet()
+                                continue
+                            if ok_fw and state.last_tx_hash:
+                                _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                                _sleep_between_domain_swaps()
+                            after_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
+                            delta_dst = after_dst - before_dst
+                            if delta_dst <= 0:
+                                logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
                                 _fail_wallet()
                             else:
-                                if state.last_tx_hash:
-                                    _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
-                                    _sleep_between_domain_swaps()
-                                after_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
-                                delta_dst = after_dst - before_dst
-                                if delta_dst <= 0:
-                                    logger.warning("[DOMAIN] wallet=%s no received %s for reverse route", wallet, dst_symbol)
+                                back_expr = _format_decimal_plain(delta_dst)
+                                ok_bw = _execute_trade_for_pair(
+                                    cfg=cfg,
+                                    logger=logger,
+                                    state=state,
+                                    exec_client=exec_client,
+                                    pool=pool_bw,
+                                    symbol_in=dst_symbol,
+                                    symbol_out="USDC.E",
+                                    trade_amount_expr=back_expr,
+                                    eth_price=eth_price,
+                                    label=f"DOMAIN {wallet} {dst_symbol}>USDC.E",
+                                    bypass_risk_checks=True,
+                                    allow_no_quoter_execution=True,
+                                    wait_for_pre_tx=True,
+                                    post_approve_delay_range=domain_pre_tx_delay_range,
+                                )
+                                if ok_bw:
+                                    success_wallets += 1
+                                else:
+                                    _fail_wallet()
+                else:
+                    pool_direct_fw = _pick_pool("ETH", dst_symbol)
+                    pool_direct_bw = _pick_pool(dst_symbol, "ETH")
+                    if pool_direct_fw and pool_direct_bw:
+                        pair_fw = _find_tokens_for_direction(pool_direct_fw, "ETH", dst_symbol)
+                        if not pair_fw:
+                            logger.warning("[DOMAIN] wallet=%s invalid direct pool direction ETH>%s", wallet, dst_symbol)
+                            _fail_wallet()
+                        else:
+                            dst_token = pair_fw[1]
+                            before_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
+                            ok_fw = _execute_trade_for_pair(
+                                cfg=cfg,
+                                logger=logger,
+                                state=state,
+                                exec_client=exec_client,
+                                pool=pool_direct_fw,
+                                symbol_in="ETH",
+                                symbol_out=dst_symbol,
+                                trade_amount_expr=amount_expr,
+                                eth_price=eth_price,
+                                label=f"DOMAIN {wallet} ETH>{dst_symbol}",
+                                bypass_risk_checks=True,
+                                allow_no_quoter_execution=True,
+                                wait_for_pre_tx=True,
+                                post_approve_delay_range=domain_pre_tx_delay_range,
+                            )
+                            if not ok_fw:
+                                _fail_wallet()
+                                continue
+                            if ok_fw and state.last_tx_hash:
+                                _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                                _sleep_between_domain_swaps()
+                            after_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
+                            delta_dst = after_dst - before_dst
+                            if delta_dst <= 0:
+                                logger.warning("[DOMAIN] wallet=%s no received %s for reverse swap", wallet, dst_symbol)
+                                _fail_wallet()
+                            else:
+                                back_expr = _format_decimal_plain(delta_dst)
+                                ok_bw = _execute_trade_for_pair(
+                                    cfg=cfg,
+                                    logger=logger,
+                                    state=state,
+                                    exec_client=exec_client,
+                                    pool=pool_direct_bw,
+                                    symbol_in=dst_symbol,
+                                    symbol_out="ETH",
+                                    trade_amount_expr=back_expr,
+                                    eth_price=eth_price,
+                                    label=f"DOMAIN {wallet} {dst_symbol}>ETH",
+                                    bypass_risk_checks=True,
+                                    allow_no_quoter_execution=True,
+                                    wait_for_pre_tx=True,
+                                    post_approve_delay_range=domain_pre_tx_delay_range,
+                                )
+                                if ok_bw:
+                                    success_wallets += 1
+                                else:
+                                    _fail_wallet()
+                    else:
+                        pool_eth_usdc = _pick_pool("ETH", "USDC.E")
+                        pool_usdc_dst = _pick_pool("USDC.E", dst_symbol)
+                        pool_dst_usdc = _pick_pool(dst_symbol, "USDC.E")
+                        pool_usdc_eth = _pick_pool("USDC.E", "ETH")
+                        if not pool_eth_usdc or not pool_usdc_dst or not pool_dst_usdc or not pool_usdc_eth:
+                            logger.warning("[DOMAIN] wallet=%s no route ETH>USDC.E>%s and back", wallet, dst_symbol)
+                            _fail_wallet()
+                        else:
+                            usdc_from_eth_pair = _find_tokens_for_direction(pool_eth_usdc, "ETH", "USDC.E")
+                            dst_from_usdc_pair = _find_tokens_for_direction(pool_usdc_dst, "USDC.E", dst_symbol)
+                            usdc_from_dst_pair = _find_tokens_for_direction(pool_dst_usdc, dst_symbol, "USDC.E")
+                            eth_from_usdc_pair = _find_tokens_for_direction(pool_usdc_eth, "USDC.E", "ETH")
+                            if not usdc_from_eth_pair or not dst_from_usdc_pair or not usdc_from_dst_pair or not eth_from_usdc_pair:
+                                logger.warning("[DOMAIN] wallet=%s invalid multi-hop pool direction for %s", wallet, dst_symbol)
+                                _fail_wallet()
+                            else:
+                                weth_token = usdc_from_eth_pair[0]
+                                usdc_token = usdc_from_eth_pair[1]
+                                dst_token = dst_from_usdc_pair[1]
+
+                                # Forward in one logical swap: ETH -> DOMAIN_TOKEN (via USDC.E path).
+                                before_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
+                                ok_fw = _execute_trade_for_path(
+                                    cfg=cfg,
+                                    logger=logger,
+                                    state=state,
+                                    exec_client=exec_client,
+                                    token_in=weth_token,
+                                    token_out=dst_token,
+                                    path_tokens=[weth_token, usdc_token, dst_token],
+                                    path_token_addresses=[weth_token.address, usdc_token.address, dst_token.address],
+                                    path_fee_tiers=[pool_eth_usdc.fee_tier, pool_usdc_dst.fee_tier],
+                                    trade_amount_expr=amount_expr,
+                                    eth_price=eth_price,
+                                    label=f"DOMAIN {wallet} ETH>{dst_symbol}",
+                                    is_eth_source=True,
+                                    wait_for_pre_tx=True,
+                                    post_approve_delay_range=domain_pre_tx_delay_range,
+                                )
+                                if not ok_fw:
+                                    logger.warning("[DOMAIN] wallet=%s first leg failed ETH>%s", wallet, dst_symbol)
                                     _fail_wallet()
                                 else:
-                                    ok_bw = _execute_trade_for_path(
-                                        cfg=cfg,
-                                        logger=logger,
-                                        state=state,
-                                        exec_client=exec_client,
-                                        token_in=dst_token,
-                                        token_out=eth_from_usdc_pair[1],
-                                        path_tokens=[dst_token, usdc_token, eth_from_usdc_pair[1]],
-                                        path_token_addresses=[dst_token.address, usdc_token.address, eth_from_usdc_pair[1].address],
-                                        path_fee_tiers=[pool_dst_usdc.fee_tier, pool_usdc_eth.fee_tier],
-                                        trade_amount_expr=_format_decimal_plain(delta_dst),
-                                        eth_price=eth_price,
-                                        label=f"DOMAIN {wallet} {dst_symbol}>ETH",
-                                        is_eth_source=False,
-                                        wait_for_pre_tx=True,
-                                        post_approve_delay_range=domain_pre_tx_delay_range,
-                                    )
-                                    if ok_bw:
-                                        success_wallets += 1
-                                    else:
+                                    if state.last_tx_hash:
+                                        _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180)
+                                        _sleep_between_domain_swaps()
+                                    after_dst = exec_client.get_erc20_balance(dst_token.address, dst_token.decimals)
+                                    delta_dst = after_dst - before_dst
+                                    if delta_dst <= 0:
+                                        logger.warning("[DOMAIN] wallet=%s no received %s for reverse route", wallet, dst_symbol)
                                         _fail_wallet()
+                                    else:
+                                        ok_bw = _execute_trade_for_path(
+                                            cfg=cfg,
+                                            logger=logger,
+                                            state=state,
+                                            exec_client=exec_client,
+                                            token_in=dst_token,
+                                            token_out=eth_from_usdc_pair[1],
+                                            path_tokens=[dst_token, usdc_token, eth_from_usdc_pair[1]],
+                                            path_token_addresses=[dst_token.address, usdc_token.address, eth_from_usdc_pair[1].address],
+                                            path_fee_tiers=[pool_dst_usdc.fee_tier, pool_usdc_eth.fee_tier],
+                                            trade_amount_expr=_format_decimal_plain(delta_dst),
+                                            eth_price=eth_price,
+                                            label=f"DOMAIN {wallet} {dst_symbol}>ETH",
+                                            is_eth_source=False,
+                                            wait_for_pre_tx=True,
+                                            post_approve_delay_range=domain_pre_tx_delay_range,
+                                        )
+                                        if ok_bw:
+                                            success_wallets += 1
+                                        else:
+                                            _fail_wallet()
 
-        finally:
-            if before_points_snapshot is not None:
-                after_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
-                _log_wallet_points_delta(logger, "DOMAIN", wallet, before_points_snapshot, after_points_snapshot)
+            finally:
+                if before_points_snapshot is not None:
+                    after_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "DOMAIN")
+                    _log_wallet_points_delta(logger, "DOMAIN", wallet, before_points_snapshot, after_points_snapshot)
 
-        if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
-            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
-            logger.info("[DOMAIN] delay before next wallet: %.2f sec", delay_sec)
-            time.sleep(delay_sec)
+            if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+                delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+                logger.info("[DOMAIN] delay before next wallet: %.2f sec", delay_sec)
+                time.sleep(delay_sec)
+
+        return success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses
+
+    for succeeded, failed, skipped, labels in _run_quest_wallet_workers(
+        wallet_key_records, state, logger, _process_wallet,
+        wallets_per_worker=10, max_workers=6, mode_tag="DOMAIN_SWAP",
+    ):
+        success_wallets += succeeded
+        failed_wallets += failed
+        skipped_wallets += skipped
+        failed_wallet_addresses.extend(labels)
     _print_mode_summary(
         "DOMAIN",
         len(wallet_key_records),
@@ -13738,11 +13806,6 @@ def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) 
     skipped_wallets = 0
     failed_wallet_addresses: List[str] = []
 
-    def _fail_wallet() -> None:
-        nonlocal failed_wallets
-        failed_wallets += 1
-        if wallet not in failed_wallet_addresses:
-            failed_wallet_addresses.append(wallet)
     picked = get_pair_swap_menu_input(state)
     if not picked:
         logger.info("Pair swap canceled by user.")
@@ -13765,142 +13828,163 @@ def run_pair_swap_once(cfg: BotConfig, logger: logging.Logger, state: BotState) 
         wallet_start_offset + 1,
     )
 
-    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
-        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "PAIR")
-        if skip_wallet:
-            skipped_wallets += 1
-            continue
-        logger.info("[PAIR] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
-        before_points_snapshot: Optional[PointsSnapshot] = None
-        try:
+    def _process_wallet(idx, record, state):
+        success_wallets = failed_wallets = skipped_wallets = 0
+        failed_wallet_addresses = []
+
+        def _fail_wallet() -> None:
+            nonlocal failed_wallets
+            failed_wallets += 1
+            if wallet not in failed_wallet_addresses:
+                failed_wallet_addresses.append(wallet)
+
+        for idx, (line_idx, wallet, private_key) in [(idx, record)]:
+            proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "PAIR")
+            if skip_wallet:
+                skipped_wallets += 1
+                continue
+            logger.info("[PAIR] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
+            before_points_snapshot: Optional[PointsSnapshot] = None
             try:
-                subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
-                doma_api = DomaApiClient(
-                    cfg.doma_api_url,
-                    api_key=cfg.doma_api_key,
-                    api_keys=cfg.doma_api_keys,
-                    proxies=proxies,
-                )
-                pools = subgraph.fetch_top_pools(limit=1000)
-                eth_price = subgraph.fetch_eth_price_usd()
-                if eth_price <= 0:
-                    raise RuntimeError("Failed to resolve ETH/USD")
-                pool = _find_best_pool_for_symbols(cfg, pools, src_symbol, dst_symbol, ignore_limits=True)
-                if not pool:
-                    raise RuntimeError(f"No pool route found for {src_symbol}->{dst_symbol}")
-            except Exception as exc:
-                logger.warning("[PAIR] wallet=%s subgraph init failed, using Doma quote fallback: %s", wallet, exc)
                 try:
+                    subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
                     doma_api = DomaApiClient(
                         cfg.doma_api_url,
                         api_key=cfg.doma_api_key,
                         api_keys=cfg.doma_api_keys,
                         proxies=proxies,
                     )
-                    pool, eth_price = _fallback_eth_usdce_pool_for_ui_route(cfg, doma_api)
-                except Exception as fallback_exc:
-                    _fail_wallet()
-                    logger.warning("[PAIR] wallet=%s init failed: %s", wallet, fallback_exc)
-                    continue
-
-            if amount_mode == "percent":
-                amount_expr = f"{amount_raw}%"
-            else:
-                min_raw, max_raw = [x.strip() for x in amount_raw.split("|", 1)]
-                amount_expr = _pick_random_amount_expr(
-                    amount_mode,
-                    _parse_decimal_input(min_raw),
-                    _parse_decimal_input(max_raw),
-                    state,
-                    min_raw=min_raw,
-                    max_raw=max_raw,
-                )
-            logger.info("[PAIR] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
-            exec_client = _build_exec_client_with_rpc_fallback(
-                cfg=cfg,
-                logger=logger,
-                wallet=wallet,
-                private_key=private_key,
-                proxies=proxies,
-                log_prefix="[PAIR]",
-            )
-            before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "PAIR")
-
-            usdc_token, weth_token = _find_tokens_for_direction(pool, "USDC.E", "ETH") or (None, None)
-            if not usdc_token or not weth_token:
-                _fail_wallet()
-                logger.warning("[PAIR] wallet=%s invalid ETH<->USDC.E pool metadata", wallet)
-                continue
-
-            if src_symbol == "WETH" and dst_symbol == "ETH":
-                weth_balance = exec_client.get_erc20_balance(weth_token.address, weth_token.decimals)
-                try:
-                    amount_in_dec, trade_usd = resolve_trade_amount(amount_expr, weth_balance, eth_price)
+                    pools = subgraph.fetch_top_pools(limit=1000)
+                    eth_price = subgraph.fetch_eth_price_usd()
+                    if eth_price <= 0:
+                        raise RuntimeError("Failed to resolve ETH/USD")
+                    pool = _find_best_pool_for_symbols(cfg, pools, src_symbol, dst_symbol, ignore_limits=True)
+                    if not pool:
+                        raise RuntimeError(f"No pool route found for {src_symbol}->{dst_symbol}")
                 except Exception as exc:
-                    logger.warning("[PAIR] wallet=%s invalid WETH unwrap amount '%s': %s", wallet, amount_expr, exc)
-                    ok_swap = False
+                    logger.warning("[PAIR] wallet=%s subgraph init failed, using Doma quote fallback: %s", wallet, exc)
+                    try:
+                        doma_api = DomaApiClient(
+                            cfg.doma_api_url,
+                            api_key=cfg.doma_api_key,
+                            api_keys=cfg.doma_api_keys,
+                            proxies=proxies,
+                        )
+                        pool, eth_price = _fallback_eth_usdce_pool_for_ui_route(cfg, doma_api)
+                    except Exception as fallback_exc:
+                        _fail_wallet()
+                        logger.warning("[PAIR] wallet=%s init failed: %s", wallet, fallback_exc)
+                        continue
+
+                if amount_mode == "percent":
+                    amount_expr = f"{amount_raw}%"
                 else:
-                    amount_in_raw = decimal_to_raw(amount_in_dec, weth_token.decimals)
-                    if amount_in_dec > weth_balance or amount_in_raw <= 0:
-                        logger.warning(
-                            "[PAIR] wallet=%s insufficient WETH for unwrap: need=%s have=%s",
-                            wallet,
-                            _format_decimal_plain(amount_in_dec),
-                            _format_decimal_plain(weth_balance),
-                        )
-                        ok_swap = False
-                    elif cfg.paper_mode or cfg.dry_run or not cfg.enable_execution:
-                        logger.info(
-                            "[PAIR %s WETH>ETH] PAPER/DRY mode active. Would unwrap %s WETH (~$%s).",
-                            wallet,
-                            _format_decimal_plain(amount_in_dec),
-                            _format_decimal_plain(trade_usd),
-                        )
-                        ok_swap = True
-                    else:
-                        tx_hash = exec_client.unwrap_weth(weth_token.address, amount_in_raw)
-                        state.last_tx_hash = tx_hash
-                        logger.info(
-                            "[PAIR] wallet=%s WETH->ETH unwrap tx=%s | amount=%s WETH (~$%s)",
-                            wallet,
-                            tx_hash,
-                            _format_decimal_plain(amount_in_dec),
-                            _format_decimal_plain(trade_usd),
-                        )
-                        ok_swap = bool(tx_hash) and _wait_tx_receipt(exec_client, tx_hash, timeout_sec=180)
-            else:
-                ui_token_in = weth_token if src_symbol in {"ETH", "WETH"} else usdc_token
-                ui_token_out = weth_token if dst_symbol == "ETH" else usdc_token
-                ok_swap = _execute_trade_via_doma_ui_route(
+                    min_raw, max_raw = [x.strip() for x in amount_raw.split("|", 1)]
+                    amount_expr = _pick_random_amount_expr(
+                        amount_mode,
+                        _parse_decimal_input(min_raw),
+                        _parse_decimal_input(max_raw),
+                        state,
+                        min_raw=min_raw,
+                        max_raw=max_raw,
+                    )
+                logger.info("[PAIR] wallet=%s amount=%s %s", wallet, amount_expr, src_symbol)
+                exec_client = _build_exec_client_with_rpc_fallback(
                     cfg=cfg,
                     logger=logger,
-                    state=state,
-                    doma_api=doma_api,
-                    exec_client=exec_client,
-                    token_in=ui_token_in,
-                    token_out=ui_token_out,
-                    display_in_symbol=src_symbol,
-                    display_out_symbol=dst_symbol,
-                    trade_amount_expr=amount_expr,
-                    eth_price=eth_price,
-                    label=f"PAIR {wallet} {src_symbol}>{dst_symbol}",
-                    is_eth_source=src_symbol == "ETH",
-                    unwrap_to_native=dst_symbol == "ETH",
-                    wait_for_pre_tx=True,
+                    wallet=wallet,
+                    private_key=private_key,
+                    proxies=proxies,
+                    log_prefix="[PAIR]",
                 )
-            if ok_swap:
-                success_wallets += 1
-            else:
-                _fail_wallet()
-        finally:
-            if before_points_snapshot is not None:
-                after_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "PAIR")
-                _log_wallet_points_delta(logger, "PAIR", wallet, before_points_snapshot, after_points_snapshot)
+                before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "PAIR")
 
-        if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
-            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
-            logger.info("[PAIR] delay before next wallet: %.2f sec", delay_sec)
-            time.sleep(delay_sec)
+                usdc_token, weth_token = _find_tokens_for_direction(pool, "USDC.E", "ETH") or (None, None)
+                if not usdc_token or not weth_token:
+                    _fail_wallet()
+                    logger.warning("[PAIR] wallet=%s invalid ETH<->USDC.E pool metadata", wallet)
+                    continue
+
+                if src_symbol == "WETH" and dst_symbol == "ETH":
+                    weth_balance = exec_client.get_erc20_balance(weth_token.address, weth_token.decimals)
+                    try:
+                        amount_in_dec, trade_usd = resolve_trade_amount(amount_expr, weth_balance, eth_price)
+                    except Exception as exc:
+                        logger.warning("[PAIR] wallet=%s invalid WETH unwrap amount '%s': %s", wallet, amount_expr, exc)
+                        ok_swap = False
+                    else:
+                        amount_in_raw = decimal_to_raw(amount_in_dec, weth_token.decimals)
+                        if amount_in_dec > weth_balance or amount_in_raw <= 0:
+                            logger.warning(
+                                "[PAIR] wallet=%s insufficient WETH for unwrap: need=%s have=%s",
+                                wallet,
+                                _format_decimal_plain(amount_in_dec),
+                                _format_decimal_plain(weth_balance),
+                            )
+                            ok_swap = False
+                        elif cfg.paper_mode or cfg.dry_run or not cfg.enable_execution:
+                            logger.info(
+                                "[PAIR %s WETH>ETH] PAPER/DRY mode active. Would unwrap %s WETH (~$%s).",
+                                wallet,
+                                _format_decimal_plain(amount_in_dec),
+                                _format_decimal_plain(trade_usd),
+                            )
+                            ok_swap = True
+                        else:
+                            tx_hash = exec_client.unwrap_weth(weth_token.address, amount_in_raw)
+                            state.last_tx_hash = tx_hash
+                            logger.info(
+                                "[PAIR] wallet=%s WETH->ETH unwrap tx=%s | amount=%s WETH (~$%s)",
+                                wallet,
+                                tx_hash,
+                                _format_decimal_plain(amount_in_dec),
+                                _format_decimal_plain(trade_usd),
+                            )
+                            ok_swap = bool(tx_hash) and _wait_tx_receipt(exec_client, tx_hash, timeout_sec=180)
+                else:
+                    ui_token_in = weth_token if src_symbol in {"ETH", "WETH"} else usdc_token
+                    ui_token_out = weth_token if dst_symbol == "ETH" else usdc_token
+                    ok_swap = _execute_trade_via_doma_ui_route(
+                        cfg=cfg,
+                        logger=logger,
+                        state=state,
+                        doma_api=doma_api,
+                        exec_client=exec_client,
+                        token_in=ui_token_in,
+                        token_out=ui_token_out,
+                        display_in_symbol=src_symbol,
+                        display_out_symbol=dst_symbol,
+                        trade_amount_expr=amount_expr,
+                        eth_price=eth_price,
+                        label=f"PAIR {wallet} {src_symbol}>{dst_symbol}",
+                        is_eth_source=src_symbol == "ETH",
+                        unwrap_to_native=dst_symbol == "ETH",
+                        wait_for_pre_tx=True,
+                    )
+                if ok_swap:
+                    success_wallets += 1
+                else:
+                    _fail_wallet()
+            finally:
+                if before_points_snapshot is not None:
+                    after_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "PAIR")
+                    _log_wallet_points_delta(logger, "PAIR", wallet, before_points_snapshot, after_points_snapshot)
+
+            if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+                delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+                logger.info("[PAIR] delay before next wallet: %.2f sec", delay_sec)
+                time.sleep(delay_sec)
+
+        return success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses
+
+    for succeeded, failed, skipped, labels in _run_quest_wallet_workers(
+        wallet_key_records, state, logger, _process_wallet,
+        wallets_per_worker=10, max_workers=6, mode_tag="PAIR",
+    ):
+        success_wallets += succeeded
+        failed_wallets += failed
+        skipped_wallets += skipped
+        failed_wallet_addresses.extend(labels)
     _print_mode_summary(
         "PAIR",
         len(wallet_key_records),
@@ -14004,11 +14088,6 @@ def run_volume_farm_once(
     skipped_wallets = 0
     failed_wallet_addresses: List[str] = []
 
-    def _fail_wallet() -> None:
-        nonlocal failed_wallets
-        failed_wallets += 1
-        if wallet not in failed_wallet_addresses:
-            failed_wallet_addresses.append(wallet)
 
     picked = preset or get_volume_farm_menu_input(state, default_check_weekly=weekly_remaining)
     if not picked:
@@ -14049,406 +14128,427 @@ def run_volume_farm_once(
         logger.info("[VOLUME] delay between swaps: %.2f sec", delay_sec)
         time.sleep(delay_sec)
 
-    for idx, (line_idx, wallet, private_key) in enumerate(wallet_key_records):
-        proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "VOLUME")
-        if skip_wallet:
-            skipped_wallets += 1
-            continue
-        logger.info("[VOLUME] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
-        before_points_snapshot: Optional[PointsSnapshot] = None
-        try:
-            pools: List[Pool] = []
+    def _process_wallet(idx, record, state):
+        success_wallets = failed_wallets = skipped_wallets = 0
+        failed_wallet_addresses = []
+
+        def _fail_wallet() -> None:
+            nonlocal failed_wallets
+            failed_wallets += 1
+            if wallet not in failed_wallet_addresses:
+                failed_wallet_addresses.append(wallet)
+
+        for idx, (line_idx, wallet, private_key) in [(idx, record)]:
+            proxies, skip_wallet = _proxy_for_line(cfg, line_idx, logger, "VOLUME")
+            if skip_wallet:
+                skipped_wallets += 1
+                continue
+            logger.info("[VOLUME] wallet %s", _wallet_record_progress_label(idx, len(wallet_key_records), line_idx, total_loaded_wallets, wallet))
+            before_points_snapshot: Optional[PointsSnapshot] = None
             try:
-                subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
-                doma_api = DomaApiClient(
-                    cfg.doma_api_url,
-                    api_key=cfg.doma_api_key,
-                    api_keys=cfg.doma_api_keys,
-                    proxies=proxies,
-                )
-                pools = subgraph.fetch_top_pools(limit=1000)
-                eth_price = subgraph.fetch_eth_price_usd()
-                if eth_price <= 0:
-                    raise RuntimeError("Failed to resolve ETH/USD")
-                pool = _find_best_pool_for_symbols(cfg, pools, "ETH", "USDC.E", ignore_limits=True)
-                if not pool:
-                    raise RuntimeError("No pool route found for ETH<->USDC.E")
-            except Exception as exc:
-                logger.warning(
-                    "[VOLUME] wallet=%s subgraph init failed, using Doma quote fallback: %s",
-                    wallet,
-                    exc,
-                )
+                pools: List[Pool] = []
                 try:
+                    subgraph = DomaSubgraphClient(cfg.subgraph_url, proxies=proxies)
                     doma_api = DomaApiClient(
                         cfg.doma_api_url,
                         api_key=cfg.doma_api_key,
                         api_keys=cfg.doma_api_keys,
                         proxies=proxies,
                     )
-                    pool, eth_price = _fallback_eth_usdce_pool_for_ui_route(cfg, doma_api)
-                except Exception as fallback_exc:
-                    _fail_wallet()
-                    logger.warning("[VOLUME] wallet=%s init failed: %s", wallet, fallback_exc)
-                    continue
-
-            exec_client = _build_exec_client_with_rpc_fallback(
-                cfg=cfg,
-                logger=logger,
-                wallet=wallet,
-                private_key=private_key,
-                proxies=proxies,
-                log_prefix="[VOLUME]",
-            )
-
-            usdc_token, weth_token = _find_tokens_for_direction(pool, "USDC.E", "ETH") or (None, None)
-            if not usdc_token or not weth_token:
-                _fail_wallet()
-                logger.warning("[VOLUME] wallet=%s invalid ETH<->USDC.E pool metadata", wallet)
-                continue
-
-            before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "VOLUME")
-            accumulated_volume = Decimal("0")
-            wallet_target_volume = target_volume
-            if weekly_since is not None:
-                try:
-                    weekly_done = _fetch_weekly_total_volume(doma_api, wallet, pools, weekly_since)
+                    pools = subgraph.fetch_top_pools(limit=1000)
+                    eth_price = subgraph.fetch_eth_price_usd()
+                    if eth_price <= 0:
+                        raise RuntimeError("Failed to resolve ETH/USD")
+                    pool = _find_best_pool_for_symbols(cfg, pools, "ETH", "USDC.E", ignore_limits=True)
+                    if not pool:
+                        raise RuntimeError("No pool route found for ETH<->USDC.E")
                 except Exception as exc:
                     logger.warning(
-                        "[VOLUME] wallet=%s weekly total volume fetch failed, assuming 0: %s",
+                        "[VOLUME] wallet=%s subgraph init failed, using Doma quote fallback: %s",
                         wallet,
                         exc,
                     )
-                    weekly_done = Decimal("0")
-                weekly_remaining_volume = target_volume - weekly_done
-                if weekly_remaining_volume <= 0:
+                    try:
+                        doma_api = DomaApiClient(
+                            cfg.doma_api_url,
+                            api_key=cfg.doma_api_key,
+                            api_keys=cfg.doma_api_keys,
+                            proxies=proxies,
+                        )
+                        pool, eth_price = _fallback_eth_usdce_pool_for_ui_route(cfg, doma_api)
+                    except Exception as fallback_exc:
+                        _fail_wallet()
+                        logger.warning("[VOLUME] wallet=%s init failed: %s", wallet, fallback_exc)
+                        continue
+
+                exec_client = _build_exec_client_with_rpc_fallback(
+                    cfg=cfg,
+                    logger=logger,
+                    wallet=wallet,
+                    private_key=private_key,
+                    proxies=proxies,
+                    log_prefix="[VOLUME]",
+                )
+
+                usdc_token, weth_token = _find_tokens_for_direction(pool, "USDC.E", "ETH") or (None, None)
+                if not usdc_token or not weth_token:
+                    _fail_wallet()
+                    logger.warning("[VOLUME] wallet=%s invalid ETH<->USDC.E pool metadata", wallet)
+                    continue
+
+                before_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "VOLUME")
+                accumulated_volume = Decimal("0")
+                wallet_target_volume = target_volume
+                if weekly_since is not None:
+                    try:
+                        weekly_done = _fetch_weekly_total_volume(doma_api, wallet, pools, weekly_since)
+                    except Exception as exc:
+                        logger.warning(
+                            "[VOLUME] wallet=%s weekly total volume fetch failed, assuming 0: %s",
+                            wallet,
+                            exc,
+                        )
+                        weekly_done = Decimal("0")
+                    weekly_remaining_volume = target_volume - weekly_done
+                    if weekly_remaining_volume <= 0:
+                        logger.info(
+                            "[VOLUME] wallet=%s weekly total volume already complete | done=%s/%s since=%s | skipping wallet",
+                            wallet,
+                            _format_decimal_plain(weekly_done),
+                            _format_decimal_plain(target_volume),
+                            weekly_since.isoformat(),
+                        )
+                        skipped_wallets += 1
+                        continue
+                    wallet_target_volume = weekly_remaining_volume + WEEKLY_VOLUME_TOPUP_BUFFER_USD
                     logger.info(
-                        "[VOLUME] wallet=%s weekly total volume already complete | done=%s/%s since=%s | skipping wallet",
+                        "[VOLUME] wallet=%s weekly total volume | done=%s/%s since=%s | remaining=%s | planned_topup=%s | topup_pair=ETH<->USDC.E",
                         wallet,
                         _format_decimal_plain(weekly_done),
                         _format_decimal_plain(target_volume),
                         weekly_since.isoformat(),
+                        _format_decimal_plain(weekly_remaining_volume),
+                        _format_decimal_plain(wallet_target_volume),
                     )
-                    skipped_wallets += 1
-                    continue
-                wallet_target_volume = weekly_remaining_volume + WEEKLY_VOLUME_TOPUP_BUFFER_USD
-                logger.info(
-                    "[VOLUME] wallet=%s weekly total volume | done=%s/%s since=%s | remaining=%s | planned_topup=%s | topup_pair=ETH<->USDC.E",
-                    wallet,
-                    _format_decimal_plain(weekly_done),
-                    _format_decimal_plain(target_volume),
-                    weekly_since.isoformat(),
-                    _format_decimal_plain(weekly_remaining_volume),
-                    _format_decimal_plain(wallet_target_volume),
-                )
-            cycle = 0
-            wallet_failed = False
-            partial_min = _parse_decimal_input(min_raw)
-            partial_max = _parse_decimal_input(max_raw)
-            if partial_min <= 0 or partial_max <= 0:
-                raise ValueError("Partial return percent must be > 0")
-            if partial_max > 100:
-                raise ValueError("Partial return percent cannot be > 100")
+                cycle = 0
+                wallet_failed = False
+                partial_min = _parse_decimal_input(min_raw)
+                partial_max = _parse_decimal_input(max_raw)
+                if partial_min <= 0 or partial_max <= 0:
+                    raise ValueError("Partial return percent must be > 0")
+                if partial_max > 100:
+                    raise ValueError("Partial return percent cannot be > 100")
 
-            while accumulated_volume < wallet_target_volume:
-                cycle += 1
-                logger.info(
-                    "[VOLUME] wallet=%s cycle=%s | progress=%s/%s",
-                    wallet,
-                    cycle,
-                    _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(wallet_target_volume),
-                )
-
-                _cleanup_weth_balance(
-                    logger=logger,
-                    exec_client=exec_client,
-                    weth_token=weth_token,
-                    label=f"VOLUME {wallet} CYCLE",
-                    reason="cycle cleanup",
-                    wait_for_receipt=True,
-                )
-
-                full_balance_usdc = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                reserve_eth = _native_gas_reserve_eth(eth_price)
-                full_balance_eth = exec_client.get_native_balance() - reserve_eth
-                full_balance_eth = full_balance_eth if full_balance_eth > 0 else Decimal("0")
-
-                if full_balance_usdc >= MIN_EXECUTABLE_TRADE_USD:
-                    full_in_symbol = "USDC.E"
-                    full_out_symbol = "ETH"
-                    partial_in_symbol = "ETH"
-                    partial_out_symbol = "USDC.E"
-                    full_balance = full_balance_usdc
-                    full_trade_usd = full_balance_usdc
-                    full_trade_expr = "100%"
-                else:
-                    full_in_symbol = "ETH"
-                    full_out_symbol = "USDC.E"
-                    partial_in_symbol = "USDC.E"
-                    partial_out_symbol = "ETH"
-                    full_balance = full_balance_eth
-                    full_trade_usd = full_balance_eth * eth_price
-                    full_trade_expr = _format_decimal_plain(full_balance_eth)
-
-                if full_balance <= 0 or full_trade_usd <= 0:
-                    logger.warning("[VOLUME] wallet=%s no usable ETH/USDC.E balance for volume cycle", wallet)
-                    wallet_failed = True
-                    break
-                if full_trade_usd < MIN_EXECUTABLE_TRADE_USD:
-                    logger.warning(
-                        "[VOLUME] wallet=%s full step skipped | %s input below $0.10 (%s)",
-                        wallet,
-                        full_in_symbol,
-                        _format_decimal_plain(full_trade_usd),
-                    )
-                    break
-
-                logger.info(
-                    "[VOLUME] wallet=%s full step | %s->%s amount=%s",
-                    wallet,
-                    full_in_symbol,
-                    full_out_symbol,
-                    "100% of USDC.E" if full_in_symbol == "USDC.E" else "100% spendable ETH",
-                )
-                full_before_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                full_ui_token_in = usdc_token if full_in_symbol == "USDC.E" else weth_token
-                full_ui_token_out = weth_token if full_out_symbol == "ETH" else usdc_token
-                ok_full = _execute_trade_via_doma_ui_route(
-                    cfg=cfg,
-                    logger=logger,
-                    state=state,
-                    doma_api=doma_api,
-                    exec_client=exec_client,
-                    token_in=full_ui_token_in,
-                    token_out=full_ui_token_out,
-                    display_in_symbol=full_in_symbol,
-                    display_out_symbol=full_out_symbol,
-                    trade_amount_expr=full_trade_expr,
-                    eth_price=eth_price,
-                    label=f"VOLUME {wallet} {full_in_symbol}>{full_out_symbol}",
-                    is_eth_source=full_in_symbol == "ETH",
-                    unwrap_to_native=full_out_symbol == "ETH",
-                    wait_for_pre_tx=True,
-                )
-                if not ok_full or not state.last_tx_hash:
-                    wallet_failed = True
-                    break
-                if not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
-                    logger.warning("[VOLUME] wallet=%s full step tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
-                    wallet_failed = True
-                    break
-                full_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                full_added_volume = _volume_added_from_usdc_balance_change(
-                    full_before_usdc_balance,
-                    full_after_usdc_balance,
-                    full_in_symbol,
-                )
-                if full_added_volume <= 0:
-                    logger.warning(
-                        "[VOLUME] wallet=%s full step volume fallback used | before_usdc=%s after_usdc=%s input=%s",
-                        wallet,
-                        _format_decimal_plain(full_before_usdc_balance),
-                        _format_decimal_plain(full_after_usdc_balance),
-                        full_in_symbol,
-                    )
-                    full_added_volume = full_trade_usd
-                accumulated_volume += full_added_volume
-                logger.info(
-                    "[VOLUME] wallet=%s full_added_volume=%s | total_volume=%s/%s",
-                    wallet,
-                    _format_decimal_plain(full_added_volume),
-                    _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(wallet_target_volume),
-                )
-                if accumulated_volume >= wallet_target_volume:
-                    break
-                _sleep_between_swaps()
-
-                partial_expr = _pick_random_amount_expr(
-                    "percent",
-                    partial_min,
-                    partial_max,
-                    state,
-                    min_raw=min_raw,
-                    max_raw=max_raw,
-                )
-                if partial_in_symbol == "USDC.E":
-                    partial_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                    _, partial_trade_usd = resolve_trade_amount(partial_expr, partial_balance, Decimal("1"))
-                else:
-                    partial_balance = exec_client.get_native_balance()
-                    _, partial_trade_usd = resolve_trade_amount(partial_expr, partial_balance, eth_price)
-
-                if partial_balance <= 0 or partial_trade_usd <= 0:
-                    logger.warning("[VOLUME] wallet=%s no balance for partial %s step", wallet, partial_in_symbol)
-                    wallet_failed = True
-                    break
-                if partial_trade_usd < MIN_EXECUTABLE_TRADE_USD:
-                    logger.warning(
-                        "[VOLUME] wallet=%s partial step skipped | %s input below $0.10 (%s)",
-                        wallet,
-                        partial_in_symbol,
-                        _format_decimal_plain(partial_trade_usd),
-                    )
-                    break
-
-                logger.info(
-                    "[VOLUME] wallet=%s partial step | %s->%s amount=%s",
-                    wallet,
-                    partial_in_symbol,
-                    partial_out_symbol,
-                    partial_expr,
-                )
-                partial_before_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                partial_ui_token_in = usdc_token if partial_in_symbol == "USDC.E" else weth_token
-                partial_ui_token_out = weth_token if partial_out_symbol == "ETH" else usdc_token
-                ok_partial = _execute_trade_via_doma_ui_route(
-                    cfg=cfg,
-                    logger=logger,
-                    state=state,
-                    doma_api=doma_api,
-                    exec_client=exec_client,
-                    token_in=partial_ui_token_in,
-                    token_out=partial_ui_token_out,
-                    display_in_symbol=partial_in_symbol,
-                    display_out_symbol=partial_out_symbol,
-                    trade_amount_expr=partial_expr,
-                    eth_price=eth_price,
-                    label=f"VOLUME {wallet} {partial_in_symbol}>{partial_out_symbol}",
-                    is_eth_source=partial_in_symbol == "ETH",
-                    unwrap_to_native=partial_out_symbol == "ETH",
-                    wait_for_pre_tx=True,
-                )
-                if not ok_partial or not state.last_tx_hash:
-                    wallet_failed = True
-                    break
-                if not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
-                    logger.warning("[VOLUME] wallet=%s partial step tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
-                    wallet_failed = True
-                    break
-                partial_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                partial_added_volume = _volume_added_from_usdc_balance_change(
-                    partial_before_usdc_balance,
-                    partial_after_usdc_balance,
-                    partial_in_symbol,
-                )
-                if partial_added_volume <= 0:
-                    logger.warning(
-                        "[VOLUME] wallet=%s partial step volume fallback used | before_usdc=%s after_usdc=%s input=%s",
-                        wallet,
-                        _format_decimal_plain(partial_before_usdc_balance),
-                        _format_decimal_plain(partial_after_usdc_balance),
-                        partial_in_symbol,
-                    )
-                    partial_added_volume = partial_trade_usd
-                accumulated_volume += partial_added_volume
-                logger.info(
-                    "[VOLUME] wallet=%s partial_added_volume=%s | total_volume=%s/%s",
-                    wallet,
-                    _format_decimal_plain(partial_added_volume),
-                    _format_decimal_plain(accumulated_volume),
-                    _format_decimal_plain(wallet_target_volume),
-                )
-                if accumulated_volume < wallet_target_volume:
-                    _sleep_between_swaps()
-
-            if wallet_failed:
-                _fail_wallet()
-            elif accumulated_volume >= wallet_target_volume:
-                final_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                if final_usdc_balance >= MIN_EXECUTABLE_TRADE_USD:
+                while accumulated_volume < wallet_target_volume:
+                    cycle += 1
                     logger.info(
-                        "[VOLUME] wallet=%s final settle | USDC.E->ETH amount=100%% of USDC.E",
+                        "[VOLUME] wallet=%s cycle=%s | progress=%s/%s",
                         wallet,
+                        cycle,
+                        _format_decimal_plain(accumulated_volume),
+                        _format_decimal_plain(wallet_target_volume),
                     )
-                    final_before_usdc_balance = final_usdc_balance
-                    ok_settle = _execute_trade_via_doma_ui_route(
+
+                    _cleanup_weth_balance(
+                        logger=logger,
+                        exec_client=exec_client,
+                        weth_token=weth_token,
+                        label=f"VOLUME {wallet} CYCLE",
+                        reason="cycle cleanup",
+                        wait_for_receipt=True,
+                    )
+
+                    full_balance_usdc = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
+                    reserve_eth = _native_gas_reserve_eth(eth_price)
+                    full_balance_eth = exec_client.get_native_balance() - reserve_eth
+                    full_balance_eth = full_balance_eth if full_balance_eth > 0 else Decimal("0")
+
+                    if full_balance_usdc >= MIN_EXECUTABLE_TRADE_USD:
+                        full_in_symbol = "USDC.E"
+                        full_out_symbol = "ETH"
+                        partial_in_symbol = "ETH"
+                        partial_out_symbol = "USDC.E"
+                        full_balance = full_balance_usdc
+                        full_trade_usd = full_balance_usdc
+                        full_trade_expr = "100%"
+                    else:
+                        full_in_symbol = "ETH"
+                        full_out_symbol = "USDC.E"
+                        partial_in_symbol = "USDC.E"
+                        partial_out_symbol = "ETH"
+                        full_balance = full_balance_eth
+                        full_trade_usd = full_balance_eth * eth_price
+                        full_trade_expr = _format_decimal_plain(full_balance_eth)
+
+                    if full_balance <= 0 or full_trade_usd <= 0:
+                        logger.warning("[VOLUME] wallet=%s no usable ETH/USDC.E balance for volume cycle", wallet)
+                        wallet_failed = True
+                        break
+                    if full_trade_usd < MIN_EXECUTABLE_TRADE_USD:
+                        logger.warning(
+                            "[VOLUME] wallet=%s full step skipped | %s input below $0.10 (%s)",
+                            wallet,
+                            full_in_symbol,
+                            _format_decimal_plain(full_trade_usd),
+                        )
+                        break
+
+                    logger.info(
+                        "[VOLUME] wallet=%s full step | %s->%s amount=%s",
+                        wallet,
+                        full_in_symbol,
+                        full_out_symbol,
+                        "100% of USDC.E" if full_in_symbol == "USDC.E" else "100% spendable ETH",
+                    )
+                    full_before_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
+                    full_ui_token_in = usdc_token if full_in_symbol == "USDC.E" else weth_token
+                    full_ui_token_out = weth_token if full_out_symbol == "ETH" else usdc_token
+                    ok_full = _execute_trade_via_doma_ui_route(
                         cfg=cfg,
                         logger=logger,
                         state=state,
                         doma_api=doma_api,
                         exec_client=exec_client,
-                        token_in=usdc_token,
-                        token_out=weth_token,
-                        display_in_symbol="USDC.E",
-                        display_out_symbol="ETH",
-                        trade_amount_expr="100%",
+                        token_in=full_ui_token_in,
+                        token_out=full_ui_token_out,
+                        display_in_symbol=full_in_symbol,
+                        display_out_symbol=full_out_symbol,
+                        trade_amount_expr=full_trade_expr,
                         eth_price=eth_price,
-                        label=f"VOLUME {wallet} USDC.E>ETH FINAL",
-                        is_eth_source=False,
-                        unwrap_to_native=True,
+                        label=f"VOLUME {wallet} {full_in_symbol}>{full_out_symbol}",
+                        is_eth_source=full_in_symbol == "ETH",
+                        unwrap_to_native=full_out_symbol == "ETH",
                         wait_for_pre_tx=True,
                     )
-                    if not ok_settle or not state.last_tx_hash:
+                    if not ok_full or not state.last_tx_hash:
                         wallet_failed = True
-                    elif not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
-                        logger.warning("[VOLUME] wallet=%s final settle tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
+                        break
+                    if not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                        logger.warning("[VOLUME] wallet=%s full step tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
                         wallet_failed = True
-                    else:
-                        final_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
-                        final_added_volume = _volume_added_from_usdc_balance_change(
-                            final_before_usdc_balance,
-                            final_after_usdc_balance,
-                            "USDC.E",
-                        )
-                        if final_added_volume <= 0:
-                            logger.warning(
-                                "[VOLUME] wallet=%s final settle volume fallback used | before_usdc=%s after_usdc=%s",
-                                wallet,
-                                _format_decimal_plain(final_before_usdc_balance),
-                                _format_decimal_plain(final_after_usdc_balance),
-                            )
-                            final_added_volume = final_before_usdc_balance
-                        accumulated_volume += final_added_volume
-                        logger.info(
-                            "[VOLUME] wallet=%s final_settle_added_volume=%s | total_volume=%s/%s",
-                            wallet,
-                            _format_decimal_plain(final_added_volume),
-                            _format_decimal_plain(accumulated_volume),
-                            _format_decimal_plain(wallet_target_volume),
-                        )
-                elif final_usdc_balance > 0:
-                    logger.info(
-                        "[VOLUME] wallet=%s final settle skipped | USDC.E dust below $0.10 (%s)",
-                        wallet,
-                        _format_decimal_plain(final_usdc_balance),
+                        break
+                    full_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
+                    full_added_volume = _volume_added_from_usdc_balance_change(
+                        full_before_usdc_balance,
+                        full_after_usdc_balance,
+                        full_in_symbol,
                     )
+                    if full_added_volume <= 0:
+                        logger.warning(
+                            "[VOLUME] wallet=%s full step volume fallback used | before_usdc=%s after_usdc=%s input=%s",
+                            wallet,
+                            _format_decimal_plain(full_before_usdc_balance),
+                            _format_decimal_plain(full_after_usdc_balance),
+                            full_in_symbol,
+                        )
+                        full_added_volume = full_trade_usd
+                    accumulated_volume += full_added_volume
+                    logger.info(
+                        "[VOLUME] wallet=%s full_added_volume=%s | total_volume=%s/%s",
+                        wallet,
+                        _format_decimal_plain(full_added_volume),
+                        _format_decimal_plain(accumulated_volume),
+                        _format_decimal_plain(wallet_target_volume),
+                    )
+                    if accumulated_volume >= wallet_target_volume:
+                        break
+                    _sleep_between_swaps()
+
+                    partial_expr = _pick_random_amount_expr(
+                        "percent",
+                        partial_min,
+                        partial_max,
+                        state,
+                        min_raw=min_raw,
+                        max_raw=max_raw,
+                    )
+                    if partial_in_symbol == "USDC.E":
+                        partial_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
+                        _, partial_trade_usd = resolve_trade_amount(partial_expr, partial_balance, Decimal("1"))
+                    else:
+                        partial_balance = exec_client.get_native_balance()
+                        _, partial_trade_usd = resolve_trade_amount(partial_expr, partial_balance, eth_price)
+
+                    if partial_balance <= 0 or partial_trade_usd <= 0:
+                        logger.warning("[VOLUME] wallet=%s no balance for partial %s step", wallet, partial_in_symbol)
+                        wallet_failed = True
+                        break
+                    if partial_trade_usd < MIN_EXECUTABLE_TRADE_USD:
+                        logger.warning(
+                            "[VOLUME] wallet=%s partial step skipped | %s input below $0.10 (%s)",
+                            wallet,
+                            partial_in_symbol,
+                            _format_decimal_plain(partial_trade_usd),
+                        )
+                        break
+
+                    logger.info(
+                        "[VOLUME] wallet=%s partial step | %s->%s amount=%s",
+                        wallet,
+                        partial_in_symbol,
+                        partial_out_symbol,
+                        partial_expr,
+                    )
+                    partial_before_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
+                    partial_ui_token_in = usdc_token if partial_in_symbol == "USDC.E" else weth_token
+                    partial_ui_token_out = weth_token if partial_out_symbol == "ETH" else usdc_token
+                    ok_partial = _execute_trade_via_doma_ui_route(
+                        cfg=cfg,
+                        logger=logger,
+                        state=state,
+                        doma_api=doma_api,
+                        exec_client=exec_client,
+                        token_in=partial_ui_token_in,
+                        token_out=partial_ui_token_out,
+                        display_in_symbol=partial_in_symbol,
+                        display_out_symbol=partial_out_symbol,
+                        trade_amount_expr=partial_expr,
+                        eth_price=eth_price,
+                        label=f"VOLUME {wallet} {partial_in_symbol}>{partial_out_symbol}",
+                        is_eth_source=partial_in_symbol == "ETH",
+                        unwrap_to_native=partial_out_symbol == "ETH",
+                        wait_for_pre_tx=True,
+                    )
+                    if not ok_partial or not state.last_tx_hash:
+                        wallet_failed = True
+                        break
+                    if not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                        logger.warning("[VOLUME] wallet=%s partial step tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
+                        wallet_failed = True
+                        break
+                    partial_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
+                    partial_added_volume = _volume_added_from_usdc_balance_change(
+                        partial_before_usdc_balance,
+                        partial_after_usdc_balance,
+                        partial_in_symbol,
+                    )
+                    if partial_added_volume <= 0:
+                        logger.warning(
+                            "[VOLUME] wallet=%s partial step volume fallback used | before_usdc=%s after_usdc=%s input=%s",
+                            wallet,
+                            _format_decimal_plain(partial_before_usdc_balance),
+                            _format_decimal_plain(partial_after_usdc_balance),
+                            partial_in_symbol,
+                        )
+                        partial_added_volume = partial_trade_usd
+                    accumulated_volume += partial_added_volume
+                    logger.info(
+                        "[VOLUME] wallet=%s partial_added_volume=%s | total_volume=%s/%s",
+                        wallet,
+                        _format_decimal_plain(partial_added_volume),
+                        _format_decimal_plain(accumulated_volume),
+                        _format_decimal_plain(wallet_target_volume),
+                    )
+                    if accumulated_volume < wallet_target_volume:
+                        _sleep_between_swaps()
 
                 if wallet_failed:
                     _fail_wallet()
-                else:
-                    _cleanup_weth_balance(
-                        logger=logger,
-                        exec_client=exec_client,
-                        weth_token=weth_token,
-                        label=f"VOLUME {wallet} FINAL",
-                        reason="final cleanup",
-                        wait_for_receipt=True,
-                    )
-                    success_wallets += 1
-                    logger.info(
-                        "[VOLUME] wallet=%s target reached | total_volume=%s USDC.E | final_asset=ETH",
-                        wallet,
-                        _format_decimal_plain(accumulated_volume),
-                    )
-            else:
-                skipped_wallets += 1
-        except Exception as exc:
-            _fail_wallet()
-            if _is_proxy_connectivity_error(exc):
-                logger.warning("[VOLUME] wallet=%s proxy/RPC failed during run, skipping wallet: %s", wallet, exc)
-            else:
-                logger.warning("[VOLUME] wallet=%s runtime failed, skipping wallet: %s", wallet, exc)
-        finally:
-            if before_points_snapshot is not None:
-                after_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "VOLUME")
-                _log_wallet_points_delta(logger, "VOLUME", wallet, before_points_snapshot, after_points_snapshot)
+                elif accumulated_volume >= wallet_target_volume:
+                    final_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
+                    if final_usdc_balance >= MIN_EXECUTABLE_TRADE_USD:
+                        logger.info(
+                            "[VOLUME] wallet=%s final settle | USDC.E->ETH amount=100%% of USDC.E",
+                            wallet,
+                        )
+                        final_before_usdc_balance = final_usdc_balance
+                        ok_settle = _execute_trade_via_doma_ui_route(
+                            cfg=cfg,
+                            logger=logger,
+                            state=state,
+                            doma_api=doma_api,
+                            exec_client=exec_client,
+                            token_in=usdc_token,
+                            token_out=weth_token,
+                            display_in_symbol="USDC.E",
+                            display_out_symbol="ETH",
+                            trade_amount_expr="100%",
+                            eth_price=eth_price,
+                            label=f"VOLUME {wallet} USDC.E>ETH FINAL",
+                            is_eth_source=False,
+                            unwrap_to_native=True,
+                            wait_for_pre_tx=True,
+                        )
+                        if not ok_settle or not state.last_tx_hash:
+                            wallet_failed = True
+                        elif not _wait_tx_receipt(exec_client, state.last_tx_hash, timeout_sec=180):
+                            logger.warning("[VOLUME] wallet=%s final settle tx not confirmed before timeout | tx=%s", wallet, state.last_tx_hash)
+                            wallet_failed = True
+                        else:
+                            final_after_usdc_balance = exec_client.get_erc20_balance(usdc_token.address, usdc_token.decimals)
+                            final_added_volume = _volume_added_from_usdc_balance_change(
+                                final_before_usdc_balance,
+                                final_after_usdc_balance,
+                                "USDC.E",
+                            )
+                            if final_added_volume <= 0:
+                                logger.warning(
+                                    "[VOLUME] wallet=%s final settle volume fallback used | before_usdc=%s after_usdc=%s",
+                                    wallet,
+                                    _format_decimal_plain(final_before_usdc_balance),
+                                    _format_decimal_plain(final_after_usdc_balance),
+                                )
+                                final_added_volume = final_before_usdc_balance
+                            accumulated_volume += final_added_volume
+                            logger.info(
+                                "[VOLUME] wallet=%s final_settle_added_volume=%s | total_volume=%s/%s",
+                                wallet,
+                                _format_decimal_plain(final_added_volume),
+                                _format_decimal_plain(accumulated_volume),
+                                _format_decimal_plain(wallet_target_volume),
+                            )
+                    elif final_usdc_balance > 0:
+                        logger.info(
+                            "[VOLUME] wallet=%s final settle skipped | USDC.E dust below $0.10 (%s)",
+                            wallet,
+                            _format_decimal_plain(final_usdc_balance),
+                        )
 
-        if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
-            delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
-            logger.info("[VOLUME] delay before next wallet: %.2f sec", delay_sec)
-            time.sleep(delay_sec)
+                    if wallet_failed:
+                        _fail_wallet()
+                    else:
+                        _cleanup_weth_balance(
+                            logger=logger,
+                            exec_client=exec_client,
+                            weth_token=weth_token,
+                            label=f"VOLUME {wallet} FINAL",
+                            reason="final cleanup",
+                            wait_for_receipt=True,
+                        )
+                        success_wallets += 1
+                        logger.info(
+                            "[VOLUME] wallet=%s target reached | total_volume=%s USDC.E | final_asset=ETH",
+                            wallet,
+                            _format_decimal_plain(accumulated_volume),
+                        )
+                else:
+                    skipped_wallets += 1
+            except Exception as exc:
+                _fail_wallet()
+                if _is_proxy_connectivity_error(exc):
+                    logger.warning("[VOLUME] wallet=%s proxy/RPC failed during run, skipping wallet: %s", wallet, exc)
+                else:
+                    logger.warning("[VOLUME] wallet=%s runtime failed, skipping wallet: %s", wallet, exc)
+            finally:
+                if before_points_snapshot is not None:
+                    after_points_snapshot = _fetch_wallet_points_snapshot(cfg, wallet, proxies, logger, "VOLUME")
+                    _log_wallet_points_delta(logger, "VOLUME", wallet, before_points_snapshot, after_points_snapshot)
+
+            if idx < len(wallet_key_records) - 1 and cfg.wallet_delay_max_sec > 0:
+                delay_sec = random.uniform(cfg.wallet_delay_min_sec, cfg.wallet_delay_max_sec)
+                logger.info("[VOLUME] delay before next wallet: %.2f sec", delay_sec)
+                time.sleep(delay_sec)
+
+        return success_wallets, failed_wallets, skipped_wallets, failed_wallet_addresses
+
+    for succeeded, failed, skipped, labels in _run_quest_wallet_workers(
+        wallet_key_records, state, logger, _process_wallet,
+        wallets_per_worker=10, max_workers=6, mode_tag="VOLUME",
+    ):
+        success_wallets += succeeded
+        failed_wallets += failed
+        skipped_wallets += skipped
+        failed_wallet_addresses.extend(labels)
 
     _print_mode_summary(
         "VOLUME",
@@ -14631,10 +14731,11 @@ def run_doma_cost_report_once(
         wallet_order = _prompt_wallet_order(default_random=True)
     if wallet_order == "random":
         random.shuffle(wallet_records)
-    for process_idx, (idx, wallet) in enumerate(wallet_records):
+    def fetch_history(process_idx, record):
+        idx, wallet = record
         proxies, skip_wallet = _proxy_for_line(cfg, idx, logger, "COST")
         if skip_wallet:
-            continue
+            return None
         logger.info(
             "[COST] wallet %s",
             _wallet_record_progress_label(process_idx, len(wallet_records), idx, len(wallets), wallet),
@@ -14652,7 +14753,13 @@ def run_doma_cost_report_once(
             internals = api.fetch_wallet_internal_transactions_from_explorer(wallet, max_pages=100, since=since, until=until)
         except Exception as exc:
             logger.warning("[COST] wallet=%s fetch failed: %s", wallet, exc)
+            return None
+        return idx, wallet, eth_price, txs, token_transfers, internals
+
+    for history in _run_wallet_reads(wallet_records, logger, "COST", fetch_history):
+        if history is None:
             continue
+        idx, wallet, eth_price, txs, token_transfers, internals = history
 
         wallet_lc = wallet.lower()
         gas_tx_count = 0
@@ -15076,7 +15183,8 @@ def run_domapunks_check_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                        "quote_balance", "claimed", "supply", "chain_id", "block", "error"],
                delimiter=cfg.csv_delimiter)
     counts = dict(eligible=0, ineligible=0, claimed=0, unknown=0)
-    for position, (idx, wallet) in enumerate(records):
+    def check(_position, record):
+        idx, wallet = record
         result = None
         error = ""
         try:
@@ -15084,7 +15192,6 @@ def run_domapunks_check_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             if skip:
                 raise ValueError("Wallet proxy unavailable; check skipped")
             result = fetch_domapunks_claim(wallet, chain_id=cfg.chain_id, proxies=proxies)
-            counts[result["eligibility"]] += 1
             logger.info(
                 "[DOMAPUNKS] wallet#%s | %s | claims=%s | punk_id=%s | price=%s %s | balance=%s %s | quote=%s %s | claimed=%s/%s | block=%s",
                 idx + 1, result["eligibility"].upper(), result["claims"], result["punk_id"] or "-",
@@ -15092,7 +15199,6 @@ def run_domapunks_check_once(cfg: BotConfig, logger: logging.Logger, state: BotS
                 result["quote_balance"], result["quote_symbol"], result["claimed"], result["supply"], result["block"],
             )
         except Exception as exc:
-            counts["unknown"] += 1
             error = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
             logger.warning("[DOMAPUNKS] wallet#%s | UNKNOWN | %s", idx + 1, error)
         row = [datetime.now(timezone.utc).isoformat(), idx + 1, wallet]
@@ -15102,9 +15208,11 @@ def run_domapunks_check_once(cfg: BotConfig, logger: logging.Logger, state: BotS
             row += [result[key] for key in ("eligibility", "claims", "punk_id", "price", "payment_symbol",
                                            "balance", "quote_symbol", "quote_balance", "claimed", "supply",
                                            "chain_id", "block")] + [""]
+        return result["eligibility"] if result is not None else "unknown", row
+
+    for status, row in _run_wallet_reads(records, logger, "DOMAPUNKS", check):
+        counts[status] += 1
         append_csv(report, row, delimiter=cfg.csv_delimiter)
-        if position < len(records) - 1:
-            time.sleep(random.uniform(2, 5))
     logger.info("[DOMAPUNKS] total=%s | eligible=%s | claimed=%s | ineligible=%s | unknown=%s | report=%s",
                 len(records), counts["eligible"], counts["claimed"], counts["ineligible"], counts["unknown"], report.resolve())
     print("ELIGIBLE = есть право на клейм; CLAIMED = уже получен; INELIGIBLE = нет в списке; UNKNOWN = ошибка проверки.")
