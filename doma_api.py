@@ -2375,6 +2375,44 @@ class DomaApiClient:
                 raise RuntimeError("Bonding catalog pagination limit reached; refusing partial analysis")
         return out
 
+    def fetch_wallet_token_addresses(self, wallet: str, chain_id: int, take: int = 100, max_pages: int = 100) -> set[str]:
+        if not Web3.is_address(wallet):
+            raise ValueError("Invalid wallet for indexed balance scan")
+        query = """
+        query WalletBalances($addresses:[AddressCAIP10!],$take:Int,$skip:Int) {
+          fractionalTokenBalances(addresses:$addresses,take:$take,skip:$skip) {
+            hasNextPage
+            items { address balance deploymentAddress chain { networkId } fractionalToken { address } }
+          }
+        }
+        """
+        held = set()
+        for page in range(max_pages):
+            data = self._post(query, {"addresses": [f"eip155:{chain_id}:{wallet}"], "take": take, "skip": page * take})
+            result = data.get("fractionalTokenBalances")
+            if not isinstance(result, dict) or not isinstance(result.get("items"), list) or type(result.get("hasNextPage")) is not bool:
+                raise RuntimeError("Incomplete indexed wallet balance response")
+            for item in result["items"]:
+                owner = str(item.get("address") or "").split(":")[-1]
+                if owner.lower() != wallet.lower():
+                    raise RuntimeError("Indexed wallet balance owner mismatch")
+                if str((item.get("chain") or {}).get("networkId")) not in {str(chain_id), f"eip155:{chain_id}"}:
+                    continue
+                balance = Decimal(str(item.get("balance")))
+                if not balance.is_finite() or balance < 0:
+                    raise RuntimeError("Invalid indexed wallet balance")
+                if balance == 0:
+                    continue
+                address = item.get("deploymentAddress") or (item.get("fractionalToken") or {}).get("address")
+                if not Web3.is_address(address):
+                    raise RuntimeError("Invalid indexed token address")
+                held.add(address.lower())
+            if not result["hasNextPage"]:
+                return held
+            if not result["items"]:
+                raise RuntimeError("Indexed wallet pagination stalled")
+        raise RuntimeError("Indexed wallet pagination incomplete")
+
     def fetch_universal_router_quote(
         self,
         token_in_address: str,
@@ -2451,6 +2489,7 @@ class EvmExecutionClient:
         request_proxies: Optional[Dict[str, str]] = None,
     ) -> None:
         request_kwargs: Dict[str, object] = {"timeout": 20}
+        self.request_proxies = dict(request_proxies) if request_proxies else None
         if request_proxies:
             request_kwargs["proxies"] = request_proxies
         self.web3 = Web3(RetryingHTTPProvider(rpc_url, request_kwargs=request_kwargs))
@@ -2516,6 +2555,11 @@ class EvmExecutionClient:
         )
         raw = token.functions.balanceOf(self.account_address).call()
         return Decimal(raw) / (Decimal(10) ** decimals)
+
+    def get_erc20_balances(self, tokens) -> Dict[str, Optional[Decimal]]:
+        from wallet_balances import fetch_erc20_balances
+        return fetch_erc20_balances(self.web3.provider.endpoint_uri, self.account_address,
+                                    [(token.address, token.decimals) for token in tokens], self.request_proxies)
 
     def quote_exact_input_single(
         self,

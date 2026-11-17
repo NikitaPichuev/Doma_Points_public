@@ -86,6 +86,23 @@ class QuestWorkersTests(unittest.TestCase):
             self.run_workers([(0, "abc", "fake"), (1, "ABC", "fake")], state(), Mock(), worker)
         worker.assert_not_called()
 
+    def test_sweep_can_run_six_isolated_workers(self):
+        gate = threading.Barrier(6, timeout=5)
+        seen = set()
+        lock = threading.Lock()
+
+        def worker(index, record, local):
+            if index < 6:
+                with lock:
+                    seen.add(threading.current_thread().name)
+                gate.wait()
+            return 1, 0, 0, []
+
+        result = self.run_workers(records(61), state(), Mock(), worker,
+                                  wallets_per_worker=10, max_workers=6, mode_tag="SWEEP")
+        self.assertEqual(len(seen), 6)
+        self.assertEqual(len(result), 61)
+
     def test_failed_wallet_does_not_cancel_others_or_lose_volume(self):
         parent = state()
 

@@ -2,7 +2,9 @@
 import ast
 import os
 import unittest
-from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
+from decimal import Decimal, getcontext, localcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -20,20 +22,23 @@ class SweepTests(unittest.TestCase):
     def setUp(self):
         tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8-sig"))
         names = {"get_sweep_menu_input", "run_sweep_tokens_to_usdce_once", "_is_sweep_protected_asset",
-                 "canonical_symbol", "_is_sweep_token_excluded"}
+                 "canonical_symbol", "_is_sweep_token_excluded", "_run_quest_wallet_workers"}
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names
                  or isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in
                     {"SWEEP_PROTECTED_SYMBOLS", "SWEEP_MIN_TOKEN_VALUE_USD"} for t in n.targets)]
-        self.ns = dict(Decimal=Decimal, print=Mock())
+        self.ns = dict(Decimal=Decimal, print=Mock(), ThreadPoolExecutor=ThreadPoolExecutor,
+                       as_completed=as_completed, deepcopy=deepcopy, getcontext=getcontext, localcontext=localcontext)
         module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
         exec(compile(ast.fix_missing_locations(module), "main.py", "exec"), self.ns)
         self.cfg = NS(sweep_token_exclusions_file=Path("unused"), token_address_overrides={"USDC.E": "usdc", "WETH": "weth", "USDT": "stable-address"},
-                      wallet_delay_max_sec=0)
+                      wallet_delay_max_sec=0, chain_id=97477)
         self.client, self.api, self.wallet_api = Mock(), Mock(), Mock()
         self.api.fetch_top_pools_by_tvl.return_value = []
         self.catalog = []
         self.balances = {}
+        self.wallet_api.fetch_wallet_token_addresses.side_effect = RuntimeError("mock index offline")
         self.client.get_erc20_balance.side_effect = lambda address, decimals: self.balances.get(address, Decimal("1"))
+        self.client.get_erc20_balances.side_effect = lambda tokens: {t.address.lower(): self.balances.get(t.address, Decimal("1")) for t in tokens}
         self.ns.update(get_sweep_menu_input=Mock(return_value=("ALTS_TO_USDC.E", "0")),
             _parse_decimal_input=Decimal, _load_sweep_token_exclusions=Mock(return_value=set()),
             _build_wallet_key_records=Mock(return_value=[(0, "wallet", "fake")]),
@@ -53,7 +58,23 @@ class SweepTests(unittest.TestCase):
             _print_mode_summary=Mock())
 
     def run_sweep(self):
-        self.ns["run_sweep_tokens_to_usdce_once"](self.cfg, Mock(), NS())
+        self.ns["run_sweep_tokens_to_usdce_once"](self.cfg, Mock(), NS(daily_volume_usd=Decimal("0"), last_tx_hash="", last_error=""))
+
+    def test_index_limits_batch_to_existing_tokens(self):
+        self.catalog.extend([token("HELD"), token("NOT_HELD")])
+        self.wallet_api.fetch_wallet_token_addresses.side_effect = None
+        self.wallet_api.fetch_wallet_token_addresses.return_value = {"held"}
+        self.run_sweep()
+        self.assertEqual([t.address for t in self.client.get_erc20_balances.call_args.args[0]], ["held"])
+        self.client.get_erc20_balance.assert_not_called()
+        self.ns["_execute_trade_via_doma_ui_route"].assert_called_once()
+
+    def test_unknown_batch_balance_is_failed_not_empty(self):
+        self.catalog.append(token("HELD"))
+        self.balances["held"] = None
+        self.run_sweep()
+        self.ns["_execute_trade_via_doma_ui_route"].assert_not_called()
+        self.assertEqual(self.ns["_print_mode_summary"].call_args.args[2:5], (0, 1, 0))
 
     def test_strict_threshold_protected_assets_and_wallet_proxy(self):
         self.catalog.extend([token("ABOVE", "0.050001"), token("EXACT", "0.05"), token("BELOW", "0.049999"),
