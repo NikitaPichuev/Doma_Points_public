@@ -2535,6 +2535,29 @@ class EvmExecutionClient:
         tx["gas"] = int(self.web3.eth.estimate_gas(tx) * 1.2)
         return self._send_tx(tx)
 
+    def prepare_taiko_native_sweep(self, to_address: str) -> Optional[dict]:
+        if self.chain_id != 167000:
+            raise ValueError("Taiko native sweep requires chain 167000")
+        destination = Web3.to_checksum_address(to_address)
+        eth = self.web3.eth
+        tx = {**self._base_tx(), "to": destination, "gas": 21000}
+        if int(tx["gasPrice"]) <= 0:
+            raise RuntimeError("Invalid Taiko gas price")
+        balance = eth.get_balance(self.account_address, "pending")
+        tx["value"] = balance - tx["gas"] * tx["gasPrice"]
+        if tx["value"] <= 0:
+            return None
+        if eth.get_code(destination, "pending"):
+            raise RuntimeError("Taiko full sweep requires a deposit address without contract code")
+        call = {k: tx[k] for k in ("from", "to", "value", "gasPrice")}
+        if eth.estimate_gas(call, block_identifier="pending") != tx["gas"]:
+            raise RuntimeError("Taiko full sweep requires a standard 21000-gas transfer")
+        return tx
+
+    def send_prepared_native_sweep(self, tx: dict) -> str:
+        # Repricing a maximum-balance transfer would invalidate its fee budget.
+        return self._send_tx(tx, retry_nonce=False)
+
     def get_chain_id(self) -> int:
         return int(self.web3.eth.chain_id)
 
@@ -2580,7 +2603,7 @@ class EvmExecutionClient:
             ).call()
         )
 
-    def _send_tx(self, tx: dict) -> str:
+    def _send_tx(self, tx: dict, *, retry_nonce: bool = True) -> str:
         last_exc: Optional[Exception] = None
         current_tx = dict(tx)
         for attempt in range(3):
@@ -2590,7 +2613,7 @@ class EvmExecutionClient:
                 return tx_hash.hex()
             except ValueError as exc:
                 message = str(exc)
-                if "nonce too low" not in message and "replacement transaction underpriced" not in message:
+                if not retry_nonce or ("nonce too low" not in message and "replacement transaction underpriced" not in message):
                     raise
                 last_exc = exc
                 time.sleep(1 + attempt)

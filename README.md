@@ -679,12 +679,10 @@ slots block the entire batch before sending. One address is not automatically
 shared by all wallets; repeat a shared address on each corresponding line.
 Keep `wallets.txt` free of blank/comment/invalid lines to preserve numbering.
 
-Choose a fixed amount, random range, or percent of the balance after the gas
-reserve. Menus 19 (deposit) and 20 skip a wallet if its spendable
-balance after the gas reserve or its actual transfer amount is below $1.
-Exactly $1 is allowed at the fetched price. ETH/MNT prices are refreshed for
-each wallet; unavailable or invalid prices cause a skip, never an assumed price.
-This local floor does not replace OKX's asset/network-specific minimum.
+Choose a fixed amount, random range, or percent of the balance after gas.
+Menus 19 (deposit) and 20 have no local USD minimum or price lookup.
+Amounts that round to zero, or balances insufficient for gas, are skipped.
+The exchange's own minimum still applies.
 The bot displays destination mappings and proceeds without an additional
 deposit-network confirmation. Check deposit availability, minimum amount and addresses
 in OKX yourself; an EVM address alone cannot prove the intended network or
@@ -697,7 +695,11 @@ Offline tests: `python -m unittest test_okx_deposits -v`.
 
 Taiko mainnet (native ETH) is network option `6` in both deposit menus.
 To send the full spendable amount, choose amount mode `3` and enter `100`.
-The gas reserve and the bot's $1 minimum still apply. Taiko uses its own
+For Taiko at 100%, the bot sends balance minus the fee budget for a
+standard native transfer (21,000 gas), without a fixed reserve. It checks
+that the destination has no contract code and simulates that amount.
+Other networks and amount modes still use their configured gas reserve.
+Taiko uses its own
 wallet-indexed address file: `okx_deposit_addresses_taiko.txt` for menu 19
 or `exchange_deposit_addresses_taiko.txt` for menu 20 (the configured filename
 stem plus `_taiko.txt`). There is no fallback to another network's addresses
