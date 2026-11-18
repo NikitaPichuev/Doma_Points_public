@@ -3,6 +3,7 @@ keys.txt
 api_keys.txt
 okx_api_keys.txt
 okx_deposit_addresses.txt
+*_taiko.txt
 privy_access_tokens.txt
 privy_refresh_tokens.txt
 privy_refresh_tokens.json

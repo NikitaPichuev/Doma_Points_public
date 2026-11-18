@@ -465,6 +465,7 @@ def _l2_deposit_networks() -> List[Tuple[str, int, str, List[str], Decimal]]:
         ("Optimism | native ETH", 10, "ETH", ["https://optimism-rpc.publicnode.com", "https://mainnet.optimism.io"], Decimal("0.00002")),
         ("Blast | native ETH", 81457, "ETH", ["https://rpc.blast.io", "https://blast-rpc.publicnode.com"], Decimal("0.00002")),
         ("Mantle | native MNT", 5000, "MNT", ["https://rpc.mantle.xyz", "https://mantle-rpc.publicnode.com"], Decimal("0.2")),
+        ("Taiko | native ETH", 167000, "ETH", ["https://rpc.mainnet.taiko.xyz", "https://taiko-rpc.publicnode.com"], Decimal("0.00002")),
     ]
 
 
@@ -4001,11 +4002,6 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     wallet_key_records = _build_wallet_key_records(cfg, logger, "EXCHANGE_DEPOSIT")
     if not wallet_key_records:
         raise RuntimeError("No wallets with private keys found")
-    deposit_addresses = (_load_okx_deposit_addresses(okx_deposit_file) if okx_deposit_file is not None
-                         else _load_exchange_deposit_addresses(cfg))
-    if not any(_is_valid_evm_address(address) for address in deposit_addresses):
-        raise RuntimeError(f"No valid EVM deposit addresses found in {okx_deposit_file or cfg.exchange_deposit_addresses_file}")
-
     networks = _l2_deposit_networks()
     print("\nDeposit to exchange from L2:")
     print("Network:")
@@ -4015,6 +4011,20 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     if not network_raw.isdigit() or not 1 <= int(network_raw) <= len(networks):
         raise ValueError("Invalid network selection")
     chain_label, chain_id, symbol, rpc_urls, native_reserve = networks[int(network_raw) - 1]
+    if chain_id == 167000:
+        base_file = okx_deposit_file if okx_deposit_file is not None else cfg.exchange_deposit_addresses_file
+        address_file = base_file.with_name(base_file.stem + "_taiko.txt")
+        print("Taiko: direct ETH deposit only, no bridge. Use only exchange deposit addresses explicitly issued for ETH on Taiko.")
+        if not address_file.is_file():
+            raise ValueError(f"Taiko-specific deposit address file missing: {address_file}")
+        deposit_addresses = _load_okx_deposit_addresses(address_file)
+    else:
+        address_file = okx_deposit_file or cfg.exchange_deposit_addresses_file
+        deposit_addresses = (_load_okx_deposit_addresses(okx_deposit_file) if okx_deposit_file is not None
+                             else _load_exchange_deposit_addresses(cfg))
+    if not any(_is_valid_evm_address(address) for address in deposit_addresses):
+        raise RuntimeError(f"No valid EVM deposit addresses found in {address_file}")
+    strict_mapping = okx_deposit_file is not None or chain_id == 167000
 
     print("Amount mode:")
     print(f"1) Fixed amount ({symbol})")
@@ -4053,7 +4063,7 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
     order = _prompt_wallet_order(default_random=True)
     selected = _apply_wallet_order(wallet_key_records[start_number - 1 : end_number], order)
 
-    if okx_deposit_file is not None:
+    if strict_mapping:
         _validate_okx_deposit_mapping(deposit_addresses, selected)
         if cfg.wallets_file.exists():
             source_lines = cfg.wallets_file.read_text(encoding="utf-8-sig").splitlines()
@@ -4062,8 +4072,9 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
                 if source != wallet.lower():
                     raise ValueError(f"wallets.txt line {line_idx + 1} does not match wallet numbering; remove blank/comment/invalid lines before depositing")
         network_name = chain_label.split("|", 1)[0].strip()
-        print(f"\nOKX: {symbol}, {network_name} -> {network_name}; chain_id={chain_id}. Без бриджа.")
-        print(f"Адреса: {okx_deposit_file.resolve()}")
+        exchange_name = "OKX" if okx_deposit_file is not None else "Exchange"
+        print(f"\n{exchange_name}: {symbol}, {network_name} -> {network_name}; chain_id={chain_id}. Без бриджа.")
+        print(f"Адреса: {address_file.resolve()}")
         print("Проверьте в OKX: депозит этого актива в выбранной сети доступен, адреса верны, сумма не ниже минимума.")
         print("Поддерживаются только нативные монеты сети (в Base: ETH, не USDC/WETH).")
         for line_idx, _, _ in selected:
@@ -4091,7 +4102,7 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             "[EXCHANGE_DEPOSIT] wallet %s",
             _wallet_record_progress_label(order_idx, len(selected), wallet_idx, len(wallet_key_records), wallet),
         )
-        deposit_address = (deposit_addresses[wallet_idx] if okx_deposit_file is not None
+        deposit_address = (deposit_addresses[wallet_idx] if strict_mapping
                            else _deposit_address_for_wallet(deposit_addresses, wallet_idx))
         if not _is_valid_evm_address(deposit_address):
             failed += 1
@@ -4138,7 +4149,7 @@ def run_exchange_deposit_once(cfg: BotConfig, logger: logging.Logger, state: Bot
             if amount_mode == "2":
                 amount = _random_okx_decimal_between(min_amount, max_amount)
             elif amount_mode == "3":
-                amount = (spendable * percent_amount / Decimal("100")).quantize(Decimal("0.00000001"))
+                amount = spendable * percent_amount / Decimal("100")
             else:
                 amount = fixed_amount
             if not amount.is_finite() or amount < 0 or amount > spendable:

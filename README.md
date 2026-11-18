@@ -695,6 +695,15 @@ not confirmation that OKX credited the account. Menu 20 remains available.
 
 Offline tests: `python -m unittest test_okx_deposits -v`.
 
+Taiko mainnet (native ETH) is network option `6` in both deposit menus.
+To send the full spendable amount, choose amount mode `3` and enter `100`.
+The gas reserve and the bot's $1 minimum still apply. Taiko uses its own
+wallet-indexed address file: `okx_deposit_addresses_taiko.txt` for menu 19
+or `exchange_deposit_addresses_taiko.txt` for menu 20 (the configured filename
+stem plus `_taiko.txt`). There is no fallback to another network's addresses
+and no bridge. Use only an exchange that explicitly offers ETH deposits on
+Taiko and check its deposit minimum before sending.
+
 ## Disclaimer
 
 Проект предоставляется как есть. Вы сами отвечаете за приватные ключи, транзакции, комиссии, выставленные цены, offers, торговые решения и последствия использования бота.

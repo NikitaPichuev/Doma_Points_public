@@ -102,6 +102,24 @@ class DepositTests(unittest.TestCase):
         self.run_deposit()
         self.assertEqual(self.client.send_native.call_args.args[1], int(Decimal("0.99998") * 10**18))
 
+    def test_taiko_never_falls_back_to_other_network_addresses(self):
+        self.ns["input"] = Mock(return_value="6")
+        with self.assertRaisesRegex(ValueError, "Taiko-specific"):
+            self.run_deposit()
+        self.client.send_native.assert_not_called()
+        self.ns["_build_exec_client_for_chain_rpcs"].assert_not_called()
+
+    def test_taiko_uses_own_file_and_spendable_eth(self):
+        self.path.with_name("okx_deposit_addresses_taiko.txt").write_text(B + "\n" + A + "\n")
+        self.setUpInputs(mode="3", amount="100")
+        self.ns["input"] = Mock(side_effect=["6", "3"])
+        self.client.get_native_balance.return_value = Decimal("0.000900009")
+        self.run_deposit()
+        self.assertEqual([c.args for c in self.client.send_native.call_args_list],
+                         [(A, 880009000000000), (B, 880009000000000)])
+        self.assertEqual(self.ns["_build_exec_client_for_chain_rpcs"].call_args.args[4], 167000)
+        self.ns["_fetch_deposit_native_price_usd"].assert_called_with("ETH", None)
+
     def test_insufficient_balance_no_send(self):
         self.client.get_native_balance.return_value = Decimal("0.00001")
         self.run_deposit()
