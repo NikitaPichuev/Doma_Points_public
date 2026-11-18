@@ -3379,7 +3379,73 @@ def run_bridge_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> 
     )
 
 
+def run_defi_exit_once(cfg: BotConfig, logger: logging.Logger, state: BotState, protocol: str) -> None:
+    from defi_exit import NETWORKS, prepare_exit, send_exit
+
+    chain_id, rpc_urls = NETWORKS[protocol]
+    live = input("Режим [1: проверка, 2: вывести, Enter: проверка]: ").strip()
+    if live not in {"", "1", "2"}:
+        raise ValueError("Invalid DeFi exit mode")
+    execute = live == "2" and not cfg.dry_run and not cfg.paper_mode and cfg.enable_execution
+    records = _build_wallet_key_records(cfg, logger, "DEFI_EXIT")
+    if not records:
+        raise RuntimeError("No wallets configured for DeFi exit")
+    selected, _, total = _apply_wallet_start_selection(records)
+    logger.info("[DEFI_EXIT] %s | chain=%s | execution=%s | proceeds stay on wallet",
+                protocol, chain_id, execute)
+
+    def run_wallet(order_idx, record, _wallet_state):
+        line_idx, wallet, key = record
+        label = f"wallet#{line_idx + 1}"
+        try:
+            proxies, skip = _proxy_for_line(cfg, line_idx, logger, "DEFI_EXIT")
+            if skip:
+                return 0, 0, 1, []
+            logger.info("[DEFI_EXIT] %s", _wallet_record_progress_label(order_idx, len(selected), line_idx, total, wallet))
+            client = _build_exec_client_for_chain_rpcs(
+                cfg, logger, wallet, key, chain_id, list(rpc_urls), proxies, "[DEFI_EXIT]",
+            )
+            plan, reason = prepare_exit(client, protocol, wallet)
+            if plan is None:
+                logger.info("[DEFI_EXIT] %s skipped: %s", label, reason)
+                return 0, 0, 1, []
+            if not execute:
+                logger.info("[DEFI_EXIT] %s ready | shares_raw=%s | no transaction sent", label, plan.shares)
+                return 0, 0, 1, []
+            tx_hash = send_exit(client, plan)
+            logger.info("[DEFI_EXIT] %s tx=%s", label, tx_hash)
+            status = _wait_tx_receipt_result(client, tx_hash)
+            if status == "success" and plan.position_balance.call() == 0:
+                return 1, 0, 0, []
+            logger.warning("[DEFI_EXIT] %s exit not verified | receipt=%s | tx=%s", label, status, tx_hash)
+        except Exception as exc:
+            logger.warning("[DEFI_EXIT] %s failed: %s", label, exc)
+        return 0, 1, 0, [label]
+
+    success = failed = skipped = 0
+    failed_labels = []
+    for ok, bad, skipped_count, labels in _run_quest_wallet_workers(
+        selected, state, logger, run_wallet, wallets_per_worker=10, max_workers=6, mode_tag="DEFI_EXIT",
+    ):
+        success += ok
+        failed += bad
+        skipped += skipped_count
+        failed_labels.extend(labels)
+    _print_mode_summary("DEFI_EXIT", len(selected), success, failed, skipped, failed_labels)
+
+
 def run_close_position_once(cfg: BotConfig, logger: logging.Logger, state: BotState) -> None:
+    print("\nЗакрытие позиций:")
+    print("1) Doma: позиции ликвидности")
+    print("2) Mendi / Linea: USDC без долга")
+    print("3) Stargate V1 / Base: свободные LP USDbC")
+    print("4) Назад")
+    choice = input("Выберите [1-4]: ").strip()
+    if choice in {"2", "3"}:
+        run_defi_exit_once(cfg, logger, state, {"2": "mendi", "3": "stargate"}[choice])
+        return
+    if choice != "1":
+        return
     _ = state
     success_wallets = 0
     failed_wallets = 0

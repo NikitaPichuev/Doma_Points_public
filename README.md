@@ -715,6 +715,16 @@ USD floor. Both menus process wallets without inter-wallet sleeps, using
 one worker per 10 selected wallets (rounded up, maximum 6). Duplicate
 source addresses are rejected before any transfer.
 
+### DeFi exits (menu 3)
+
+Select Mendi / Linea to redeem unstaked meUSDC only if all markets in that
+comptroller report zero debt. Select Stargate V1 / Base for unstaked USDbC
+LP, only when a complete immediate local redemption simulates successfully.
+Check mode is the default; live mode requires an explicit selection and
+honors the execution flags. Receipts and remaining position balances are
+checked. Proceeds stay on the source wallet and network. No bridge, exchange
+deposit, staking withdrawal, debt repayment, or Voltz exit is performed.
+
 ## Disclaimer
 
 Проект предоставляется как есть. Вы сами отвечаете за приватные ключи, транзакции, комиссии, выставленные цены, offers, торговые решения и последствия использования бота.
