@@ -3,8 +3,11 @@ import ast
 import os
 import re
 import tempfile
+import threading
 import unittest
-from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
+from decimal import Decimal, getcontext, localcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -23,12 +26,15 @@ class DepositTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "okx_deposit_addresses.txt"
         self.path.write_text(A + "\n" + B + "\n")
         names = {"_load_okx_deposit_addresses", "_validate_okx_deposit_mapping", "_is_valid_evm_address",
-                 "run_okx_transfers_once", "run_exchange_deposit_once", "_l2_deposit_networks"}
+                 "run_okx_transfers_once", "run_exchange_deposit_once", "_l2_deposit_networks",
+                 "_run_quest_wallet_workers"}
         tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8-sig"))
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
         self.assertEqual(len(nodes), len(names))
         module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
         self.ns = dict(Path=Path, Decimal=Decimal, re=re, print=Mock(), time=NS(sleep=Mock()), random=NS(uniform=Mock(return_value=0)))
+        self.ns.update(ThreadPoolExecutor=ThreadPoolExecutor, as_completed=as_completed,
+                       deepcopy=deepcopy, getcontext=getcontext, localcontext=localcontext)
         exec(compile(ast.fix_missing_locations(module), "main.py", "exec"), self.ns)
         self.cfg = NS(okx_deposit_addresses_file=self.path, wallets_file=Path(self.tmp.name) / "wallets.txt",
                       dry_run=False, paper_mode=False, enable_execution=True)
@@ -46,7 +52,8 @@ class DepositTests(unittest.TestCase):
             _print_mode_summary=Mock(), input=Mock(side_effect=["1", "1"]))
 
     def run_deposit(self):
-        self.ns["run_exchange_deposit_once"](self.cfg, Mock(), NS(), okx_deposit_file=self.path)
+        state = NS(daily_volume_usd=Decimal("0"), last_tx_hash="", last_error="")
+        self.ns["run_exchange_deposit_once"](self.cfg, Mock(), state, okx_deposit_file=self.path)
 
     def test_base_random_wallet_order_preserves_destination_mapping(self):
         self.run_deposit()
@@ -107,6 +114,48 @@ class DepositTests(unittest.TestCase):
             self.run_deposit()
         self.client.send_native.assert_not_called()
         self.ns["_build_exec_client_for_chain_rpcs"].assert_not_called()
+
+    def test_opbnb_requires_its_own_address_file(self):
+        self.ns["input"] = Mock(return_value="7")
+        with self.assertRaisesRegex(ValueError, "opBNB-specific"):
+            self.run_deposit()
+        self.client.send_native.assert_not_called()
+
+    def test_opbnb_sends_native_bnb_from_chain_204_below_one_dollar(self):
+        self.path.with_name("okx_deposit_addresses_opbnb.txt").write_text(B + "\n" + A + "\n")
+        self.setUpInputs(mode="3", amount="100")
+        self.ns["input"] = Mock(side_effect=["7", "3"])
+        self.client.get_native_balance.return_value = Decimal("0.000011")
+        self.run_deposit()
+        self.assertEqual([call.args for call in self.client.send_native.call_args_list],
+                         [(A, 10**12), (B, 10**12)])
+        self.assertEqual(self.ns["_build_exec_client_for_chain_rpcs"].call_args.args[4], 204)
+
+    def test_duplicate_source_rejected_before_any_send(self):
+        self.ns["_build_wallet_key_records"].return_value = [(0, W1, "fake"), (1, W1, "fake")]
+        with self.assertRaisesRegex(ValueError, "Duplicate wallets"):
+            self.run_deposit()
+        self.client.send_native.assert_not_called()
+
+    def test_parallel_deposits_keep_line_mapping(self):
+        records = [(i, f"0x{i+1:040x}", "fake") for i in range(11)]
+        addresses = [f"0x{i+100:040x}" for i in range(11)]
+        self.path.write_text("\n".join(addresses))
+        self.ns["_build_wallet_key_records"].return_value = records
+        self.ns["_prompt_end_wallet_number"].return_value = 11
+        barrier = threading.Barrier(2, timeout=5)
+        sent = {}
+        def client_for_wallet(_cfg, _logger, wallet, *_args, **_kwargs):
+            def send(address, _amount):
+                if wallet in {records[-1][1], records[-2][1]}:
+                    barrier.wait()
+                sent[wallet] = address
+                return "tx-test"
+            return NS(get_native_balance=lambda: Decimal("1"), send_native=send)
+        self.ns["_build_exec_client_for_chain_rpcs"].side_effect = client_for_wallet
+        self.run_deposit()
+        self.assertEqual(sent, {wallet: addresses[i] for i, wallet, _ in records})
+        self.ns["time"].sleep.assert_not_called()
 
     def test_taiko_uses_own_file_and_spendable_eth(self):
         self.path.with_name("okx_deposit_addresses_taiko.txt").write_text(B + "\n" + A + "\n")

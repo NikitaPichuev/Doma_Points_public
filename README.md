@@ -706,6 +706,15 @@ stem plus `_taiko.txt`). There is no fallback to another network's addresses
 and no bridge. Use only an exchange that explicitly offers ETH deposits on
 Taiko and check its deposit minimum before sending.
 
+opBNB mainnet (native BNB) is network option `7` in both deposit menus.
+Use the corresponding `okx_deposit_addresses_opbnb.txt` or
+`exchange_deposit_addresses_opbnb.txt` file, indexed by wallet line.
+Use only deposit addresses explicitly issued for BNB on opBNB, not BSC.
+The 100% mode leaves a 0.00001 BNB gas reserve for opBNB; there is no local
+USD floor. Both menus process wallets without inter-wallet sleeps, using
+one worker per 10 selected wallets (rounded up, maximum 6). Duplicate
+source addresses are rejected before any transfer.
+
 ## Disclaimer
 
 Проект предоставляется как есть. Вы сами отвечаете за приватные ключи, транзакции, комиссии, выставленные цены, offers, торговые решения и последствия использования бота.
